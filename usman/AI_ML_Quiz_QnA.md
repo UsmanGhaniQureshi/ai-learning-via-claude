@@ -279,4 +279,96 @@
 
 ---
 
+## Topic 9: Neural Networks
+
+### Quiz Q&A
+
+**Q1.** In a neural network, which layer receives the raw data — Input, Hidden, or Output?
+> **My Answer:** the input layer ✅
+
+**Q2.** A neural network has gone through ALL 50,000 training images once. How many epochs is that?
+> **My Answer:** Only one epoch. ✅
+
+**Q3.** What does an Activation Function do?
+> **My Answer:** It decide on the final output is it ok to pass to further or not. ✅
+> **Tutor's note:** Correct concept! Small sharpening — it doesn't just work at the final output. It works at EVERY neuron in EVERY layer. Each neuron has its own bouncer deciding "is this signal worth passing to the NEXT layer?"
+
+---
+
+## Topic 10: Math Foundations for ML
+
+### My Questions & Clarifications
+
+**My Question 1:** "Before starting math foundations, why do we need math? And why vectors, dot product, derivatives, gradient — can't there be others?"
+> **Tutor's Explanation:** ML didn't invent new math. It picked the best EXISTING tools: Vectors (convert data to numbers — ML's language), Dot Product (compare two things — similarity score), Derivatives (find which weight is wrong), Gradient Descent (fix the weights step by step). There IS more math in advanced ML (matrices, probability, statistics) but these 4 are the foundation every model uses.
+
+**My Question 2:** "Why were vectors and dot products specifically chosen for ML?"
+> **Tutor's Explanation:** Computers only understand numbers. Vectors = converting anything to a list of numbers (existed 200+ years in physics/math). Once everything is numbers, you need to compare them — dot product gives a similarity score. Could other methods be used? Yes — Euclidean distance, cosine similarity — but they're ALL based on the same idea. Dot product is the building block. ML didn't invent the hammer, it just used the best tool for the job.
+
+**My Question 3:** "We have data, convert to vectors, model recommends, if wrong we adjust — but how does it work for OTHER users? Model trains per user?"
+> **Tutor's Explanation:** NO — model doesn't train per user. It trains ONCE on MILLIONS of users' data and discovers GENERAL patterns like "young males who watch Action also like Thriller (85%)." Any new user comes → model matches to existing patterns → recommends. Like a senior waiter who served 50,000 customers — doesn't remember each person, but learned TYPES of people and what they want.
+
+**My Question 4:** "I understand the examples but how are things happening internally?"
+> **Tutor's Explanation:** Walked through movie recommendation with actual numbers:
+> - Users as vectors: User A = [5,1,3,5], User B = [1,5,4,1]
+> - Dot product to compare: User C vs A = 27 (similar!), C vs B = 17 (less similar)
+> - Model has weights (importance numbers) — Gender weight = 0.8, Age weight = 0.5, etc.
+> - Multiply each feature × weight → add up → get prediction
+> - Before training: weights are random garbage → terrible predictions
+> - Each round: predict → error → derivatives find which weights are wrong → adjust all weights → repeat
+> - After 500 rounds: weights settle at good values → accurate predictions for ANY user
+
+**My Question 5:** "So it means getting the model right is crucial, else we face problems?"
+> **Tutor's Explanation:** Yes! Bad model = wrong predictions = useless or dangerous. 3 main reasons models go wrong: (1) Bad data — garbage in = garbage out, (2) Not enough data, (3) Bad training settings. Biggest danger = Overfitting — model memorizes training data instead of learning patterns. Like a student who memorizes practice questions word-by-word but fails the real exam.
+
+**My Question 6:** "We read each output and decide if it's ok or not? Won't that be difficult for 1000 entries?"
+> **Tutor's Explanation:** You DON'T manually check each output. You split data BEFORE training: 80% for training, 20% for testing. Test data already has correct answers → computer compares predictions vs answers automatically → gives accuracy score. No human reads anything. Even 100 million entries — computer checks all in seconds.
+
+**My Question 7:** "How does testing work for unsupervised where there are no labeled outputs?"
+> **Tutor's Explanation:** Each type tests differently:
+> - Supervised: Split data, computer compares predictions vs answers (automatic)
+> - Unsupervised: Check if groups make sense (human spot-checks groups, not each entry) + math similarity score
+> - Reinforcement: Measure performance (win rate, score, crashes)
+
+### Quiz Q&A
+
+**Q1.** [3 bedrooms, 1200 sqft, 2 bathrooms, 10 years]. What is this list called?
+> **My Answer:** Its called the vector ✅
+
+**Q2.** Gradient descent — reaching top or bottom? Why?
+> **My Answer:** Its bottom, because we are narrowing down the error less error means more accurate result. ✅
+
+**Q3.** Learning rate too big — what goes wrong?
+> **My Answer:** It will effect the outcomes on both way it either goes to too high or even too low value might be less than ✅
+> **Tutor's note:** Right idea! More precisely — the model overshoots. Jumps over the correct answer back and forth, never settling down. Like turning steering wheel too hard — car zigzags forever.
+
+**Q4.** Model scores 99% on training but 30% on new test data. What problem is this?
+> **My Answer:** Due to some wrong data (or model train on such data that has so much garbage in it). ❌
+> **Correct Answer:** This is **Overfitting**, not bad data. The model memorized the training data instead of learning patterns. Like a student who memorized practice questions word-by-word but can't solve slightly different exam questions. Bad data would cause low accuracy on BOTH training and test data.
+
+---
+
+## Topic 11: How Math Connects to ML
+
+### My Questions & Clarifications
+
+**My Question 1:** "That's too math, I ended up getting lost. How can I grab the stuff?"
+> **Tutor's Explanation:** Stripped away the numbers and told the story as a new real estate agent analogy: Day 1 = guess randomly, boss says WRONG, learn from it. Day 2 = adjust thinking, guess better. After 1000 houses = expert. ML does the same: model starts dumb, each round guess → wrong → adjust weights → guess better → after 1000 rounds = trained. The math is just the computer's version of what your brain does naturally.
+
+**My Question 2:** "Please provide resources — YT videos, articles, courses — as this is the main backbone."
+> **Tutor:** Added comprehensive resources to resources.md including: 3Blue1Brown series, StatQuest, CodeBasics, CampusX (Hindi), Andrew Ng's Coursera course, Udemy courses, Google's ML Crash Course, and R2D3 visual article.
+
+### Quiz Q&A (Pending)
+
+**Q1.** The model learned older houses are cheaper. Did a human teach it this, or did it figure out from data?
+> **My Answer:** *(pending)*
+
+**Q2.** Model trained on only 5 houses instead of 1000. Will it predict well? Why?
+> **My Answer:** *(pending)*
+
+**Q3.** 99% accurate on training data, 30% on new data. What's this called?
+> **My Answer:** *(pending)*
+
+---
+
 <!-- Future quiz Q&A will be added below -->
