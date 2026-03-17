@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "Bash(python create_docx.py)",
+      "Bash(python update_docx.py)",
+      "Bash(rm update_docx.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python update_docx.py)",
+      "Bash(pip install:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python create_ppt.py)",
+      "Bash(rm create_ppt.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python rebuild_all.py)",
+      "Bash(rm rebuild_all.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python rebuild_docs.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python rebuild_ppt.py)"
+    ]
+  }
+}
