@@ -643,4 +643,102 @@ You don't need to understand engine combustion to drive a car:
 
 ---
 
+## 12. Problem Understanding & Model Selection
+
+### Simple Definition
+Before building anything, you need to understand the problem, pick the right ML type, and choose the best model. This is the most important skill — picking the wrong model wastes weeks of work.
+
+### The 5 Questions to Ask First
+| # | Question | Example (ExamGuard) |
+|:--|:---------|:-------------------|
+| 1 | **What is my goal?** | Detect cheating through cameras |
+| 2 | **What data do I have?** | Labeled video clips + unlabeled live feeds |
+| 3 | **What does my answer look like?** | "Cheating" or "Normal" (word = classification) |
+| 4 | **How much data?** | 10,000+ video clips = deep learning territory |
+| 5 | **Real-time needed?** | YES — live camera feeds = need fast models |
+
+### Decision Flowchart — Pick the ML Type
+```
+Do I have LABELED data?
+  ├── YES → Answer is WORD? → CLASSIFICATION
+  │         Answer is NUMBER? → REGRESSION
+  │
+  ├── NO labels → Find groups? → CLUSTERING
+  │               Spot weird? → ANOMALY DETECTION
+  │
+  └── Goal + Feedback? → REINFORCEMENT LEARNING
+```
+
+### Model Selection Cheat Sheet
+
+**Classification (answer = WORD):**
+| Situation | Best Model | Why |
+|:----------|:----------|:----|
+| Small data, simple | Logistic Regression | Fast, explainable |
+| Need to explain reasoning | Decision Tree | Step-by-step logic |
+| Best accuracy needed | Random Forest | Many trees vote |
+| Clear boundary between groups | SVM | Best dividing line |
+| Image/Video data | CNN (Deep Learning) | Only option for images |
+| Text data | Transformer / LLM | Only option for language |
+| Behavior over time | LSTM / RNN | Understands time sequences |
+
+**Regression (answer = NUMBER):**
+| Situation | Best Model | Why |
+|:----------|:----------|:----|
+| Simple straight-line relationship | Linear Regression | Fast, explainable |
+| Curved relationship | Polynomial Regression | Captures curves |
+| Complex, many features | Random Forest Regression | Handles complexity |
+| Massive data | Neural Network | Most powerful |
+
+**Unsupervised (no labels):**
+| Situation | Best Model | Why |
+|:----------|:----------|:----|
+| Group similar things | K-Means | Simple, fast |
+| Don't know how many groups | DBSCAN | Auto-finds groups |
+| Spot frauds/outliers | Isolation Forest | Great at finding odd ones |
+| Learn "normal" pattern | Autoencoder | Compressed normal baseline |
+
+### The 6 Expert Tricks
+
+**Trick 1: Start SIMPLE, go complex only if needed**
+Try Logistic Regression first → if low accuracy → Random Forest → still low → Neural Network. Simple models are faster, easier to fix, sometimes work just as well.
+
+**Trick 2: Data size determines model complexity**
+- < 1,000 rows → Simple models (Logistic Regression, Decision Tree)
+- 1,000 - 100,000 → Medium (Random Forest, SVM, XGBoost)
+- 100,000+ → Deep Learning worth it
+- Images/Video → Deep Learning (no choice)
+
+**Trick 3: Check if someone already solved it**
+Most problems have proven approaches — YOLO for object detection, Naive Bayes for spam, Collaborative Filtering for recommendations. Don't reinvent the wheel.
+
+**Trick 4: Transfer Learning — Don't train from scratch**
+Take a model someone else trained on millions of images → fine-tune with YOUR small dataset → works amazingly well. 90% of real projects use this.
+
+**Trick 5: Map each sub-problem separately (ExamGuard example)**
+```
+Detect phone → Object Detection → YOLO
+Student looking left? → Classification → CNN
+Normal behavior? → Anomaly Detection → Autoencoder
+Group behaviors → Clustering → K-Means
+When to alert? → RL → Custom reward system
+Behavior over time → Sequence → LSTM
+```
+
+**Trick 6: Always test multiple models**
+Try 3-4 models on same data, pick the one with best accuracy + acceptable speed.
+
+### Mini Summary
+- ALWAYS understand the problem before picking a model
+- 5 questions: goal, data type, answer type, data size, real-time?
+- Pick ML type first (supervised/unsupervised/RL) based on data
+- Pick specific model based on data size and problem type
+- Start simple → go complex only if needed
+- Use transfer learning — don't train from scratch
+- Test multiple models → pick best
+
+> 📝 *Quiz Q&A for this topic → see [AI_ML_Quiz_QnA.md](AI_ML_Quiz_QnA.md)*
+
+---
+
 <!-- Future topics will be added below as new sections -->

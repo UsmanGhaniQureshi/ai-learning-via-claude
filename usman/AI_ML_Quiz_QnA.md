@@ -358,16 +358,32 @@
 **My Question 2:** "Please provide resources — YT videos, articles, courses — as this is the main backbone."
 > **Tutor:** Added comprehensive resources to resources.md including: 3Blue1Brown series, StatQuest, CodeBasics, CampusX (Hindi), Andrew Ng's Coursera course, Udemy courses, Google's ML Crash Course, and R2D3 visual article.
 
-### Quiz Q&A (Pending)
+### Quiz Q&A
 
 **Q1.** The model learned older houses are cheaper. Did a human teach it this, or did it figure out from data?
-> **My Answer:** *(pending)*
+> **My Answer:** It basically learned from the data where it notice that old house sold cheaper than new houses. ✅
 
 **Q2.** Model trained on only 5 houses instead of 1000. Will it predict well? Why?
-> **My Answer:** *(pending)*
+> **My Answer:** Not at all, it does predict but 101% sure that prediction always leads to destruction. ✅
+> **Tutor's note:** Correct! 5 houses = too few patterns. Like a real estate agent who saw only 5 houses trying to predict prices for the entire city — weak intuition, bad predictions.
 
 **Q3.** 99% accurate on training data, 30% on new data. What's this called?
-> **My Answer:** *(pending)*
+> **My Answer:** That sound strange 99% accuracy, its must be the issue with the data or the threshold we use for training. ❌
+> **Correct Answer:** This is **Overfitting**. Bad data = low on BOTH training AND test. Overfitting = high training + low test = memorized, didn't learn. Like student who memorized practice questions word-by-word but fails slightly different exam. Remember: Overfitting = good student, bad exam score. Bad data = bad everything.
+
+---
+
+## Topic 12: Problem Understanding & Model Selection
+
+### Quiz Q&A (Pending)
+
+**Q1.** You want to predict whether an email is spam or not. You have 5000 labeled emails. What ML type and what model would you start with?
+
+**Q2.** You have security camera footage and want to spot unusual behavior but you have NO labeled data. What ML type? What model?
+
+**Q3.** For ExamGuard — why use YOLO for phone detection instead of training a CNN from scratch?
+
+**Q4.** Your Random Forest gives 82% accuracy. Should you immediately switch to Deep Learning?
 
 ---
 
