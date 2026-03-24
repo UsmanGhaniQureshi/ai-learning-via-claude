@@ -35,12 +35,20 @@ Dot Product = (90×88) + (85×82) + (70×72) = 19,930 (HIGH = similar!)
 
 **Important note:** For a fair comparison, vectors should be normalized (scaled to same length) first. Raw dot product can be misleading if one vector has much bigger numbers. In practice, ML libraries handle this automatically.
 
+**Normalization explained:** Normalization = scaling all values to the same range (0 to 1). Why? House size = 1200, age = 5. Without normalization, size dominates just because its numbers are bigger. After normalization: size = 0.6, age = 0.5 — fair comparison. The model can now judge features by their actual importance, not their scale.
+
 **When used:** Recommendations (Netflix/Spotify), KNN, search engines, clustering — whenever comparing two data points.
 
 ### 3. Derivatives — "If I change THIS, how much does THAT change?"
 **Samosa Shop Analogy:** Price Rs 10 → sell 100. Price Rs 15 → sell 80. Derivative = "4 fewer samosas per Rs 1 increase." That rate of change IS the derivative.
 
 **In ML:** "If I change Weight #347 slightly, does the error go UP or DOWN? By how much?" Derivatives tell the model exactly which weights to change and in which direction.
+
+**Worked Example with Numbers:**
+Model predicted house = Rs 20 lakhs. Actual = Rs 50 lakhs. Error = 30.
+Derivative says: "If you increase size weight by 0.01, error drops by 15."
+"If you increase age weight by 0.01, error drops by 3."
+So size weight is the bigger problem — fix it more!
 
 **When used:** Every wrong guess during training — thousands of times.
 
@@ -53,7 +61,23 @@ Error = 500 → adjust weights → 300 → adjust → 100 → adjust → 2 → T
 
 **Learning Rate** = step size. Too big → overshoot the valley, zigzag forever. Too small → takes forever. Just right → reaches bottom efficiently.
 
+**Worked Example — One Weight Update:**
+```
+Weight = 0.5, Learning Rate = 0.1, Gradient = 2.0
+New Weight = 0.5 - (0.1 × 2.0) = 0.5 - 0.2 = 0.3
+```
+That's one step. Repeat 1000 times.
+
 **When used:** THE training method. Every model uses this to learn.
+
+### Local Minima — Getting Stuck in the Wrong Valley
+What if there are multiple valleys? You might get stuck in a shallow valley instead of finding the deepest one. Analogy: blindfolded, you reached A valley but not THE deepest. This is called a **local minimum** (vs the **global minimum** which is the true best answer). Solutions: random restarts (try from different starting points), momentum (keep rolling past small bumps).
+
+### SGD — Faster Gradient Descent in Practice
+In practice, gradient descent doesn't process ALL data at once (too slow). Instead:
+- **SGD (Stochastic Gradient Descent)** = updates weights after each single example. Fast but noisy.
+- **Mini-batch Gradient Descent** = updates after small groups (32 or 64 examples). Best of both worlds.
+Much faster than full-batch, works just as well.
 
 ### How All 4 Connect
 ```
@@ -101,6 +125,12 @@ Model **memorizes** training data instead of learning patterns. Like a student w
 - Good model learns the **pattern**, not the exact data
 - Bad data = low accuracy on BOTH training and test
 - Overfitting = high training accuracy but low test accuracy
+
+### Underfitting — The Opposite Problem
+**Underfitting** = model is too SIMPLE to capture patterns. Like a student who studied for 5 minutes — doesn't know enough.
+- Low accuracy on training data AND test data = **Underfitting!**
+- Overfitting = memorized. Underfitting = didn't learn enough. Good model = balanced.
+- Causes: too few layers, not enough training time, too few features
 
 ### Why Getting the Model Right Matters
 | Bad data | → garbage in = garbage out (wrong predictions everywhere) |

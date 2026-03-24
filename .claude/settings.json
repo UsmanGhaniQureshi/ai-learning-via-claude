@@ -55,7 +55,10 @@
       "Bash(rm -f notify-slack.js .env .env.example)",
       "Bash(rm -f .git/hooks/post-commit)",
       "Bash(rm -rf node_modules)",
-      "Bash(rm -f package.json package-lock.json)"
+      "Bash(rm -f package.json package-lock.json)",
+      "Bash(PYTHONIOENCODING=utf-8 python rebuild.py)",
+      "Bash(rm rebuild.py)",
+      "Bash(python -c \"import pptx; print\\(pptx.__version__\\)\")"
     ]
   }
 }

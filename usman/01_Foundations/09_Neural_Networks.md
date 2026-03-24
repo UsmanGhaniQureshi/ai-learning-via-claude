@@ -33,12 +33,23 @@ Inspired by brain neurons (~86 billion in your brain). Each neuron receives sign
 | **Node/Neuron** | One unit in a layer that processes data |
 | **Epoch** | One complete pass through ALL training data |
 | **Activation Function** | A filter at EVERY neuron that decides "Is this signal important enough to pass forward?" |
-| **Backpropagation** | After a wrong guess, the error flows BACKWARD through all layers so each layer knows how much it contributed to the mistake — this is HOW weights get adjusted |
-| **Loss Function** | The math formula that measures HOW WRONG the guess was (big loss = very wrong, small loss = almost right). Different problems use different loss formulas |
+| **Bias** | A constant number added at each neuron that shifts the output. Like a starting point before weights are applied. Example: even if all inputs are zero, bias allows the neuron to still output something |
+| **Backpropagation** | After a wrong guess, the error flows BACKWARD through all layers so each layer knows how much it contributed to the mistake — this is HOW weights get adjusted (see also Topic 10 for the derivative math that makes this possible) |
+| **Loss Function** | The math formula that measures HOW WRONG the guess was (big loss = very wrong, small loss = almost right). Different problems use different loss formulas. Common ones: **MSE (Mean Squared Error)** = average of (predicted - actual)² — used for regression (predicting numbers). **Cross-Entropy** = measures how far predicted probabilities are from actual labels — used for classification (predicting categories) |
 | **Parameters vs Hyperparameters** | **Parameters** = things the MODEL learns (weights, biases). **Hyperparameters** = things YOU set before training (learning rate, number of layers, epochs) |
 
 ### Activation Function — The Bouncer Analogy
 Like a bouncer at a club — not everyone gets in. Each neuron has a bouncer that checks: "Is this information important enough to pass to the next layer?" If yes → pass through. If no → blocked. Works at EVERY neuron in EVERY layer, not just the final output.
+
+### Common Activation Functions
+| Function | What It Does | Where Used |
+|:---------|:-------------|:-----------|
+| **ReLU** | If positive, pass through. If negative, output zero. | Most common in hidden layers |
+| **Sigmoid** | Squashes output to 0-1 range. | Used for probability (yes/no predictions) |
+| **Softmax** | Converts outputs to probabilities that add up to 1. Example: dog 80%, cat 15%, bird 5%. | Used for multi-class classification (output layer) |
+
+### Forward Propagation vs Backpropagation
+Forward propagation = data flows FORWARD through layers to make a prediction. Backpropagation = error flows BACKWARD to fix weights. They're a pair: forward makes the guess, backward fixes the mistake.
 
 ### Backpropagation — The Blame Game Analogy
 Model guesses "Cat" but the answer was "Dog." Error = BIG! Now the model needs to figure out which layers/weights caused this mistake.
@@ -70,6 +81,17 @@ A **feature** is one piece of information about your data. It's what the model u
 | Photo | Each pixel value (a 100x100 photo = 10,000 features!) |
 
 **Feature Engineering** = choosing or creating the BEST features for your model. Good features = good model. Bad features = garbage results.
+
+**Example:** You have 'date of birth'. Create a new feature 'age' = today - date_of_birth. Now the model can use age directly instead of figuring out the connection from raw dates.
+
+### Types of Neural Networks
+Not all neural networks are the same — different architectures are designed for different data types:
+
+| Type | Best For | Key Idea |
+|:-----|:---------|:---------|
+| **CNN (Convolutional Neural Network)** | Images | Scans images in small patches to detect edges, shapes, objects. (Covered in Topic 06) |
+| **RNN / LSTM (Recurrent Neural Network / Long Short-Term Memory)** | Sequences over time | Processes data one step at a time, remembering previous steps. Used for text, speech, time series |
+| **Transformer** | Text, language, everything modern | Processes ALL words at once instead of one by one. The architecture behind ChatGPT/Claude. Most important architecture in modern AI |
 
 ### Mini Summary
 - Neural Network = layers of connected nodes that process data step by step

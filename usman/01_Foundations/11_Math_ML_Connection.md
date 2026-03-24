@@ -27,6 +27,52 @@ Step 6: REPEAT     → Go back to Step 2 with next house
 ... after 1000 rounds → model is trained!
 ```
 
+### Worked Numerical Example — The Full Cycle (Using MSE Loss)
+
+Let's trace the COMPLETE math with actual numbers:
+
+```
+House = [1000 sqft, 5 years old]
+Starting weights: size = 0.01, age = 0.01, bias = 10
+```
+
+**Round 1:**
+```
+Prediction = (1000 × 0.01) + (5 × 0.01) + 10 = 10 + 0.05 + 10 = 20.05
+Actual price = 50 lakhs
+Loss (MSE) = (50 - 20.05)² = (29.95)² = 897
+```
+That's a BIG error. Derivatives tell us which weights to fix:
+```
+size_gradient  = -2 × 1000 × 29.95 → size needs a big increase
+age_gradient   = -2 × 5 × 29.95   → age needs a small increase
+```
+Update weights (gradient descent):
+```
+size_weight = 0.01  → 0.018  (big jump — size matters more)
+age_weight  = 0.01  → 0.012  (small jump)
+bias        = 10    → 13     (adjusted too)
+```
+
+**Round 2:**
+```
+Prediction = (1000 × 0.018) + (5 × 0.012) + 13 = 18 + 0.06 + 13 = 31.06
+Actual = 50. Error = 18.94. BETTER!
+```
+
+After hundreds more rounds, the prediction gets closer and closer to 50.
+
+> **Note:** The loss function used here is **MSE (Mean Squared Error)** — the standard choice for regression problems. The gradients are found through **backpropagation** (see Topic 09) which sends the error backward through the network to calculate how much each weight contributed.
+
+### Convergence — How Do You Know When to Stop?
+When the loss barely changes anymore:
+```
+Round 498: loss = 0.31
+Round 499: loss = 0.30
+Round 500: loss = 0.30
+```
+The loss "converged" — stopped improving. Training done. The model has learned the best weights it can find.
+
 ### Key Discovery: Model Learns Rules Nobody Taught It
 - After training, model discovers: bigger house = more expensive (positive weight)
 - Also discovers: older house = cheaper (NEGATIVE weight — nobody programmed this!)

@@ -6,7 +6,7 @@
 
 ---
 
-## Topics 1-4: Intelligence, AI, Types, Traditional vs ML
+## Topics 1-5: Understanding AI & ML (Intelligence, AI, Types, Traditional vs ML, Hierarchy)
 
 ### CGP Grey — How Machines Learn
 - **What:** Excellent animated explanation of how AI/ML works at a high level
@@ -20,7 +20,7 @@
 
 ---
 
-## Topics 5-6: AI Hierarchy, Neural Networks
+## Topics 6-8: Types of ML (Supervised, Unsupervised, Reinforcement)
 
 ### 3Blue1Brown — Neural Networks Series (THE BEST visual explanation)
 - **What:** 4-part series that visually explains neural networks — weights, layers, activation, backpropagation
@@ -39,7 +39,7 @@
 
 ---
 
-## Topics 7-8: Math Foundations, Math-ML Connection
+## Topics 9-11: How It Works Inside (Neural Networks, Math Foundations, Math-ML Connection)
 
 ### 3Blue1Brown — Essence of Linear Algebra
 - **What:** Visual series on vectors, dot products, matrices — the math ML uses
@@ -58,7 +58,7 @@
 
 ---
 
-## Topic 9: Supervised Learning + Models
+## Supervised Learning — Models + Practice
 
 ### StatQuest — Machine Learning Fundamentals Playlist
 - **What:** Individual videos for EVERY supervised model — Logistic Regression, Decision Trees, Random Forest, SVM, KNN
@@ -75,9 +75,19 @@
 - **Why watch:** Great animations, short videos, beginner-friendly
 - **Search:** "Normalized Nerd [model name]"
 
+### Feature Engineering for Machine Learning
+- **What:** How to create, select, and transform features to improve model performance
+- **Why watch:** The single biggest factor in model accuracy — often more important than which model you pick
+- **Search:** "Feature Engineering for Machine Learning"
+
+### StatQuest — Precision, Recall, F1-Score, ROC & AUC
+- **What:** Clear visual explanations of all evaluation metrics — when accuracy lies and what to use instead
+- **Why watch:** You MUST understand these to know if your model is actually good, especially for imbalanced data
+- **Search:** "StatQuest precision recall F1"
+
 ---
 
-## Topic 10: Unsupervised Learning + Models
+## Unsupervised Learning — Models + Practice
 
 ### StatQuest — K-Means Clustering
 - **What:** Step-by-step K-Means with visual animation
@@ -91,9 +101,14 @@
 - **What:** Clear explanations of clustering and anomaly detection
 - **Search:** "Serrano Academy unsupervised learning"
 
+### StatQuest — PCA (Principal Component Analysis)
+- **What:** Step-by-step visual explanation of how PCA reduces dimensions while keeping important patterns
+- **Why watch:** PCA is everywhere — from face recognition to genomics. This makes it click.
+- **Search:** "StatQuest PCA main ideas"
+
 ---
 
-## Topic 11: Reinforcement Learning
+## Reinforcement Learning
 
 ### StatQuest — Reinforcement Learning Basics
 - **What:** Agent, environment, reward, penalty explained simply
@@ -122,6 +137,11 @@
 - **What:** Google's free ML course — concise, visual, interactive
 - **Why watch:** Shorter than Andrew Ng, great for quick understanding
 - **Link:** [developers.google.com/machine-learning/crash-course](https://developers.google.com/machine-learning/crash-course)
+
+### Fast.ai — Practical Deep Learning for Coders
+- **What:** One of the best free deep learning courses — top-down, code-first approach
+- **Why watch:** You build real models from day 1 and learn theory as needed. Created by Jeremy Howard (Kaggle #1).
+- **Link:** [course.fast.ai](https://course.fast.ai)
 
 ### CampusX — Machine Learning (Hindi)
 - **What:** Complete ML course in Hindi — theory + coding
