@@ -207,4 +207,4 @@ The MOST important concept in RL:
 ---
 
 > 📝 *Quiz Q&A → see [../AI_ML_Quiz_QnA.md](../AI_ML_Quiz_QnA.md)*
-> 📂 *Detailed examples → see [../04_Reinforcement/](../04_Reinforcement/)*
+> 📂 *Detailed examples → see [../03_Deep_Dives/Reinforcement/](../03_Deep_Dives/Reinforcement/)*

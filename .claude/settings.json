@@ -58,7 +58,11 @@
       "Bash(rm -f package.json package-lock.json)",
       "Bash(PYTHONIOENCODING=utf-8 python rebuild.py)",
       "Bash(rm rebuild.py)",
-      "Bash(python -c \"import pptx; print\\(pptx.__version__\\)\")"
+      "Bash(python -c \"import pptx; print\\(pptx.__version__\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python build_ppt.py)"
+    ],
+    "additionalDirectories": [
+      "\\dev"
     ]
   }
 }

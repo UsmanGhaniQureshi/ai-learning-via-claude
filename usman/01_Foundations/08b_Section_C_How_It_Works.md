@@ -99,10 +99,10 @@ You've completed ALL 11 foundation topics! You now understand:
 **Where to go next:**
 | Folder | What's There |
 |:-------|:------------|
-| [02_Supervised/](../02_Supervised/) | Deep dive into each classification & regression model |
-| [03_Unsupervised/](../03_Unsupervised/) | Clustering & anomaly detection models in detail |
-| [04_Reinforcement/](../04_Reinforcement/) | RL examples & when to use it |
-| [05_Model_Selection/](../05_Model_Selection/) | How to choose the right model (10 real case examples) |
+| [02_Model_Selection/](../02_Model_Selection/) | How to choose the right model (10 real case examples) |
+| [03_Deep_Dives/Supervised/](../03_Deep_Dives/Supervised/) | Deep dive into each classification & regression model |
+| [03_Deep_Dives/Unsupervised/](../03_Deep_Dives/Unsupervised/) | Clustering & anomaly detection models in detail |
+| [03_Deep_Dives/Reinforcement/](../03_Deep_Dives/Reinforcement/) | RL detailed examples & resources |
 | [06_ExamGuard_Project/](../06_ExamGuard_Project/) | Your implementation roadmap — 8 phases from zero to working system |
 
 ---

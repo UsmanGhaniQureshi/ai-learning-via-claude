@@ -474,4 +474,4 @@ A simple 2x2 table showing what your model got right and wrong:
 ---
 
 > 📝 *Quiz Q&A → see [../AI_ML_Quiz_QnA.md](../AI_ML_Quiz_QnA.md)*
-> 📂 *Detailed model files → see [../02_Supervised/](../02_Supervised/)*
+> 📂 *Detailed model files → see [../03_Deep_Dives/Supervised/](../03_Deep_Dives/Supervised/)*

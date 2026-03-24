@@ -212,4 +212,4 @@ I have DATA but NO LABELS.
 ---
 
 > 📝 *Quiz Q&A → see [../AI_ML_Quiz_QnA.md](../AI_ML_Quiz_QnA.md)*
-> 📂 *Detailed model files → see [../03_Unsupervised/](../03_Unsupervised/)*
+> 📂 *Detailed model files → see [../03_Deep_Dives/Unsupervised/](../03_Deep_Dives/Unsupervised/)*
