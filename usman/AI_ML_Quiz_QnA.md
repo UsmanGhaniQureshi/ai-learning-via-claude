@@ -373,17 +373,83 @@
 
 ---
 
-## Topic 12: Problem Understanding & Model Selection
+## Topic 12: Problem Understanding & The 3 Questions
 
-### Quiz Q&A (Pending)
+### My Questions & Clarifications
 
-**Q1.** You want to predict whether an email is spam or not. You have 5000 labeled emails. What ML type and what model would you start with?
+**My Question 1:** "What if I just know the problem and have no data?"
+> **Tutor's Explanation:** You don't need data to CHOOSE the model. You need the PROBLEM. The problem tells you the model. The model tells you what data to collect. Flow: PROBLEM → ANSWER TYPE → DATA NEEDED → SOURCE → AMOUNT → MODEL.
 
-**Q2.** You have security camera footage and want to spot unusual behavior but you have NO labeled data. What ML type? What model?
+**My Question 2:** "Real world problems are not straightforward like spam/not spam. How to handle messy problems?"
+> **Tutor's Explanation:** Forget WORD/NUMBER/GROUPS. Instead: Watch what a HUMAN does → ask 3 questions: Q1 What data? Q2 How thinking? Q3 Past examples? The thinking style tells you the ML type. "I recognize this" = Supervised. "Something feels off" = Anomaly. "Balance tradeoffs" = RL. "Group similar things" = Clustering.
 
-**Q3.** For ExamGuard — why use YOLO for phone detection instead of training a CNN from scratch?
+**My Question 3:** "I can only rely on public datasets and pre-trained models. How do I know the data is accurate? How to add more? How to extend models?"
+> **Tutor's Explanation:** 5 checks before using data: Size, Look at 30 samples, Relevance to YOUR situation, Balance, Trust (downloads/ratings). Pre-trained models: do 10-photo test from YOUR setup. Fine-tune with 200-500 of your photos. Extend: add new labeled data (e.g., chit images) + retrain.
 
-**Q4.** Your Random Forest gives 82% accuracy. Should you immediately switch to Deep Learning?
+**My Question 4:** "Different models need different data? How does a multi-model system work?"
+> **Tutor's Explanation:** Real AI systems = multiple independent models + regular Python code connecting them. Each model gets its OWN data. ExamGuard: Phone Detector (YOLO, images) + Gaze Tracker (MediaPipe, face video) + Behavior Monitor (Autoencoder, body video) + Alert Decision (RL, scores from other modules). Build ONE module at a time. Connector is regular if/else code, NOT ML.
+
+**My Question 5:** "The 3 Questions framework and practice problems — where should this live?"
+> **Tutor:** Created separate file `02_The_3_Questions.md` as the bridge between problem understanding and data collection. This is THE core skill.
+
+### Quiz Q&A — Problem Decomposition Practice
+
+**Problem A:** School principal: "Students are failing. Help struggling students BEFORE they fail."
+
+> **My Answer:** Principle must look into the students old results or the recent test conducting by the teacher, also make a list of the subjects where many students struggle to pass the test. Increase time on that particular subject if many fails in the same test. Make a list of topics+Subject. Add extra hours or do survey — maybe the fault is in the teacher. Necessary checks: Student Reviews, Student old tests.
+>
+> **Tutor's Feedback:** ✅ Found the right data sources. Partially applied 3 Questions — didn't separate into specific tasks with Q1/Q2/Q3 each. Here's the full decomposition:
+> - "Will this student fail?" → NUMBERS (marks, attendance) → Predicting pass/fail → YES labels → **Classification**
+> - "How many marks?" → NUMBERS → Predicting amount → YES labels → **Regression**
+> - "Which subjects struggle most?" → NUMBERS (fail rates) → Finding patterns → Could be **Clustering** or just a **simple database query** (not ML!)
+> - "Is the teacher the problem?" → TEXT (surveys) → Categorizing feedback → YES labels → **Text Classification**
+> - "If fail_rate > 60% for same subject → flag" → This is a **simple rule**, NOT ML!
+> Smart catch about teacher surveys — sometimes the answer is human investigation, not ML.
+
+**Problem B:** Warehouse: "Reduce delivery errors."
+
+> **My Answer:** List out the best companies with highest success delivery rates then contact them.
+>
+> **Tutor's Feedback:** ❌ This is a business solution, not ML! The question was about using AI to reduce errors in YOUR warehouse. Need to watch the HUMAN PICKER:
+> - Picker reads order, picks item → "Is this the right item?" → IMAGES → **Classification/CNN**
+> - Scans barcode → "Does barcode match?" → **NOT ML — simple rule!**
+> - Notices damaged product → IMAGES → "Box looks crushed" → **Supervised → CNN**
+> - Predicts which orders will have errors → NUMBERS (order size, picker experience, time) → **Classification**
+> - Routes trucks efficiently → JUDGMENT (balancing time vs cost) → **RL**
+> Key lesson: When someone says "reduce errors," don't think about hiring — think about what the PERSON doing the work actually DOES step by step.
+
+**Problem C:** Social media: "Detect fake accounts."
+
+> **My Answer:** Detect multiple accounts from same location/IP/device. Newly created accounts sending bulk requests (fake). Newly created accounts posting multiple ads.
+>
+> **Tutor's Feedback:** ✅ EXCELLENT! Best answer of the 4. Correctly identified:
+> - Same IP/device/location → NUMBERS → "Multiple accounts from same source = suspicious" → **Anomaly Detection → Isolation Forest**
+> - Bulk requests from new account → NUMBERS → "Normal users don't send 500 requests in first hour" → **Anomaly Detection**
+> - Multiple ads from new account → NUMBERS → "10 ads in first day = not normal" → **Anomaly Detection**
+> Most fake account detection IS anomaly detection — can't label every type of fake, but you know what "normal" looks like. Could also add: stolen profile photo (CNN), automated bio text (Text Classification).
+
+**Problem D:** Farming: "Maximize crop yield."
+
+> **My Answer:** Weather, Land, Fertilizers, Seed he is going to use.
+>
+> **Tutor's Feedback:** ✅ Listed the right factors. Partially applied — listed data but not specific tasks with Q1/Q2/Q3. Full decomposition:
+> - "How much will I harvest?" → NUMBERS (weather, land, fertilizer, seed) → Predicting amount → YES labels → **Regression**
+> - "Which crop to plant?" → NUMBERS (soil, season, water, market price) → Predicting category → YES labels → **Classification**
+> - "Is crop diseased?" → IMAGES (leaf photos) → "Yellow spots = fungus" → YES labels → **Supervised → CNN**
+> - "How much water today?" → NUMBERS + JUDGMENT → Balance: too much = rot, too little = drought → **RL**
+> - "Something wrong with soil in section 3?" → NUMBERS (sensors: pH, moisture) → Doesn't match normal → **Anomaly Detection**
+
+### Score Card
+
+| Problem | Found right data? | Applied 3 Questions? | Identified ML type? |
+|:---|:---|:---|:---|
+| A: Students | ✅ YES | ⚠️ Partially | ⚠️ Mixed |
+| B: Warehouse | ❌ Business solution | ❌ Need to watch human | ❌ Missed |
+| C: Fake accounts | ✅ EXCELLENT | ✅ YES | ✅ Anomaly Detection |
+| D: Farming | ✅ Good factors | ⚠️ Partially | ⚠️ Partially |
+
+**Best answer: Problem C** — naturally thought about normal vs suspicious without prompting. That's the exact skill!
+**Needs practice: Problem B** — learn to observe the WORKER, not think about business strategy.
 
 ---
 

@@ -110,8 +110,8 @@ AI isn't just in your phone — it's quietly transforming every major industry:
 
 - **Topic 01** — AI mimics the SAME 4 pillars of human intelligence (Observe → Learn → Decide → Adapt). See [01_What_is_Intelligence.md](01_What_is_Intelligence.md).
 - **Topic 03** — Now that you know WHAT AI is, learn about the 3 TYPES of AI (Narrow, General, Super). See [03_Types_of_AI.md](03_Types_of_AI.md).
-- **Topic 04** — How is AI different from traditional programming? That's the key question answered next. See [04_AI_vs_Traditional_Programming.md](04_AI_vs_Traditional_Programming.md).
-- **Topic 05** — Where does AI sit in the bigger picture? The AI → ML → DL hierarchy explains it. See [05_AI_ML_DL_Hierarchy.md](05_AI_ML_DL_Hierarchy.md).
+- **Topic 04** — How is AI different from traditional programming? That's the key question answered next. See [04_Traditional_vs_ML.md](04_Traditional_vs_ML.md).
+- **Topic 05** — Where does AI sit in the bigger picture? The AI → ML → DL hierarchy explains it. See [05_AI_Hierarchy.md](05_AI_Hierarchy.md).
 
 ---
 
