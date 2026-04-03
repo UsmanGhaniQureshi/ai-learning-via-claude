@@ -1,0 +1,16 @@
+# Virtual environment — don't upload to GitHub (each person creates their own)
+examguard_env/
+
+# YOLO model files (downloaded automatically)
+*.pt
+
+# Test images (generated during testing)
+test_photo.jpg
+test_photo_detected.jpg
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
