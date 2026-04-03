@@ -141,7 +141,8 @@
       "Bash(mv feedback_pacing.md 04_feedback_pacing.md)",
       "Read(//c/Users/DELL/.claude/projects/d--AI-Learning/memory/**)",
       "Bash(rm -f user_usman.md project_examguard_status.md feedback_teaching.md feedback_pacing.md)",
-      "Bash(cp \"d:/AI Learning/.claude/memory/\"*.md .)"
+      "Bash(cp \"d:/AI Learning/.claude/memory/\"*.md .)",
+      "Bash(ls -d \"d:/AI Learning/usman/implementation/\"*/)"
     ],
     "additionalDirectories": [
       "\\dev",
