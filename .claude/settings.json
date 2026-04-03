@@ -131,11 +131,22 @@
       "Bash(\"d:/AI Learning/usman/implementation/examguard_env/Scripts/python\" -c \"import imageio_ffmpeg; print\\(imageio_ffmpeg.get_ffmpeg_exe\\(\\)\\)\")",
       "Bash('d:/AI Learning/usman/implementation/examguard_env/Scripts/python' -c ':*)",
       "Bash(npx vite:*)",
-      "Bash(\"d:/AI Learning/usman/implementation/examguard_env/Scripts/python\" -c \"import mediapipe; print\\(mediapipe.__version__\\)\")"
+      "Bash(\"d:/AI Learning/usman/implementation/examguard_env/Scripts/python\" -c \"import mediapipe; print\\(mediapipe.__version__\\)\")",
+      "Bash(explorer \"C:\\\\Users\\\\DELL\\\\.claude\\\\projects\\\\d--AI-Learning\\\\memory\")",
+      "Bash(mkdir -p \"d:/AI Learning/.claude/memory\")",
+      "Bash(cp \"C:/Users/DELL/.claude/projects/d--AI-Learning/memory/\"* \"d:/AI Learning/.claude/memory/\")",
+      "Bash(mv user_usman.md 01_user_usman.md)",
+      "Bash(mv project_examguard_status.md 02_project_examguard_status.md)",
+      "Bash(mv feedback_teaching.md 03_feedback_teaching.md)",
+      "Bash(mv feedback_pacing.md 04_feedback_pacing.md)",
+      "Read(//c/Users/DELL/.claude/projects/d--AI-Learning/memory/**)",
+      "Bash(rm -f user_usman.md project_examguard_status.md feedback_teaching.md feedback_pacing.md)",
+      "Bash(cp \"d:/AI Learning/.claude/memory/\"*.md .)"
     ],
     "additionalDirectories": [
       "\\dev",
-      "d:\\AI Learning\\usman\\implementation"
+      "d:\\AI Learning\\usman\\implementation",
+      "d:\\AI Learning\\.claude\\memory"
     ]
   }
 }
