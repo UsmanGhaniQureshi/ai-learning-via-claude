@@ -142,12 +142,39 @@
       "Read(//c/Users/DELL/.claude/projects/d--AI-Learning/memory/**)",
       "Bash(rm -f user_usman.md project_examguard_status.md feedback_teaching.md feedback_pacing.md)",
       "Bash(cp \"d:/AI Learning/.claude/memory/\"*.md .)",
-      "Bash(ls -d \"d:/AI Learning/usman/implementation/\"*/)"
+      "Bash(ls -d \"d:/AI Learning/usman/implementation/\"*/)",
+      "Bash(mkdir -p \"d:/AI Learning/usman/implementation/project-2-confidence-detector\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/01_Foundations\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/02_Core_Detection_Engines\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/03_System_Integration\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/04_Polish_Advanced\")",
+      "Bash(mv 01_Browser_Hardware_Access.md 01_Camera_and_Mic_Access.md)",
+      "Bash(mv 03_Computer_Vision_Browser.md 03_Computer_Vision.md)",
+      "Bash(mv 04_NLP_Basics.md 04_NLP_Text_Analysis.md)",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/00_Overview\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/01_Phase_Hardware_Access\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/02_Phase_Speech_and_Audio\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/03_Phase_Face_Expression\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/07_Confidence_Detector_Project/04_Phase_NLP_Text_Analysis\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/implementation/project-2-confidence-detector/backend\")",
+      "Bash(mkdir -p \"d:/AI Learning/usman/implementation/project-2-confidence-detector/frontend\")",
+      "Bash(python -m venv detector_env)",
+      "Bash(detector_env/Scripts/pip install:*)",
+      "Bash(cp \"d:/AI Learning/usman/implementation/project-1-exam-guard/02_behavior_detection/01_head_direction/face_landmarker.task\" \"d:/AI Learning/usman/implementation/project-2-confidence-detector/backend/\")",
+      "Bash(cp \"d:/AI Learning/usman/implementation/project-1-exam-guard/02_behavior_detection/03_body_turning/pose_landmarker.task\" \"d:/AI Learning/usman/implementation/project-2-confidence-detector/backend/\")",
+      "Bash('d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/python' -c ':*)",
+      "WebSearch",
+      "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/pip\" list --format=columns)",
+      "Bash(python generate_docs.py)",
+      "Bash(python -c ':*)",
+      "Bash(python generate_pptx.py)",
+      "Bash(^-\" || ls -lh \"d:\\\\AI Learning\\\\usman\\\\\")"
     ],
     "additionalDirectories": [
       "\\dev",
       "d:\\AI Learning\\usman\\implementation",
-      "d:\\AI Learning\\.claude\\memory"
+      "d:\\AI Learning\\.claude\\memory",
+      "d:\\AI Learning\\usman\\implementation\\project-2-confidence-detector"
     ]
   }
 }

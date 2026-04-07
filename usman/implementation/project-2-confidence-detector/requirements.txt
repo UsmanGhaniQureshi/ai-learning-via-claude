@@ -1,0 +1,9 @@
+fastapi==0.135.3
+uvicorn==0.44.0
+python-multipart==0.0.24
+mediapipe==0.10.33
+opencv-python==4.13.0.92
+numpy==2.4.4
+vosk==0.3.45
+imageio-ffmpeg==0.6.0
+sounddevice==0.5.5
