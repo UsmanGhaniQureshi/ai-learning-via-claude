@@ -122,13 +122,14 @@ function App() {
 
           {results && (
             <div className="results">
-              {/* Overall Score */}
+              {/* Overall Score — labeled as estimated */}
               <div className="overall-score" style={{ borderColor: scoreColor(results.overall_confidence) }}>
                 <div className="score-number" style={{ color: scoreColor(results.overall_confidence) }}>
                   {results.overall_confidence}
                 </div>
                 <div className="score-label">{scoreLabel(results.overall_confidence)}</div>
-                <div className="score-subtitle">Overall Confidence Score</div>
+                <div className="score-subtitle">Estimated Confidence Score</div>
+                <div className="score-note">Based on face signals + speech patterns. Uses heuristic weights — treat as a relative guide, not absolute measurement.</div>
               </div>
 
               {/* Score Breakdown */}

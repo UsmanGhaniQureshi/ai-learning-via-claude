@@ -42,3 +42,8 @@ package-lock.json
 
 # Secrets
 .env
+vosk-model/
+vosk-model-small-backup/
+uploads/
+detector_env/
+dist/

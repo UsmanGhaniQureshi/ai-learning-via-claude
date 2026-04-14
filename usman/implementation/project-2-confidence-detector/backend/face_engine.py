@@ -48,6 +48,11 @@ class FaceEngine:
         # Expression smoothing
         self.expr_history = deque(maxlen=10)
 
+        # Baseline calibration — first 30 frames establish "your normal"
+        self.baseline = None
+        self.calibration_frames = []
+        self.CALIBRATION_COUNT = 30  # ~1 second at 30fps
+
     def _get_blendshape(self, blendshapes, name):
         """Get a blendshape score by name. Returns 0.0 if not found."""
         for bs in blendshapes:
@@ -57,53 +62,108 @@ class FaceEngine:
 
     def _detect_expression(self, blendshapes):
         """Detect expression using blendshapes (52 direct Action Unit scores).
-        Much more reliable than manual landmark distance calculations."""
+        Uses BASELINE CALIBRATION — first ~1 second of the session records your
+        personal resting face values. All expressions are detected as DEVIATIONS
+        from YOUR baseline, not absolute thresholds."""
 
         bs = {b.category_name: b.score for b in blendshapes}
 
-        # Smile: mouth corners pull up + optional cheek raise
-        smile_l = bs.get('mouthSmileLeft', 0)
-        smile_r = bs.get('mouthSmileRight', 0)
-        smile = (smile_l + smile_r) / 2
+        # Extract signals that change meaningfully across expressions
+        signals = {
+            'squint': (bs.get('eyeSquintLeft', 0) + bs.get('eyeSquintRight', 0)) / 2,
+            'brow_down': (bs.get('browDownLeft', 0) + bs.get('browDownRight', 0)) / 2,
+            'mouth_shrug': bs.get('mouthShrugLower', 0),
+            'mouth_pucker': bs.get('mouthPucker', 0),
+            'smile': (bs.get('mouthSmileLeft', 0) + bs.get('mouthSmileRight', 0)) / 2,
+            'mouth_frown': (bs.get('mouthFrownLeft', 0) + bs.get('mouthFrownRight', 0)) / 2,
+            'jaw_open': bs.get('jawOpen', 0),
+            'blink': (bs.get('eyeBlinkLeft', 0) + bs.get('eyeBlinkRight', 0)) / 2,
+        }
 
-        # Tension: brows down + mouth press/frown
-        brow_down = (bs.get('browDownLeft', 0) + bs.get('browDownRight', 0)) / 2
-        mouth_press = (bs.get('mouthPressLeft', 0) + bs.get('mouthPressRight', 0)) / 2
-        mouth_frown = (bs.get('mouthFrownLeft', 0) + bs.get('mouthFrownRight', 0)) / 2
+        # === CALIBRATION PHASE ===
+        if self.baseline is None:
+            self.calibration_frames.append(signals)
+            if len(self.calibration_frames) >= self.CALIBRATION_COUNT:
+                # Calculate baseline as average of first N frames
+                self.baseline = {}
+                for key in signals:
+                    values = [f[key] for f in self.calibration_frames]
+                    self.baseline[key] = np.mean(values)
+                self.calibration_frames = []
+            return 'calibrating', 0, signals
 
-        # Worry/surprise: brows up + eyes wide
-        brow_up = bs.get('browInnerUp', 0)
-        eye_wide = (bs.get('eyeWideLeft', 0) + bs.get('eyeWideRight', 0)) / 2
+        # === DETECTION PHASE — measure deviations from baseline ===
+        # Positive deviation = signal went UP from your normal
+        # Negative deviation = signal went DOWN from your normal
+        dev = {key: signals[key] - self.baseline[key] for key in signals}
 
-        # Talking: jaw open
-        jaw_open = bs.get('jawOpen', 0)
+        squint = signals['squint']
+        brow_down = signals['brow_down']
+        mouth_pucker = signals['mouth_pucker']
+        mouth_frown = signals['mouth_frown']
+        mouth_shrug = signals['mouth_shrug']
+        smile = signals['smile']
+        jaw_open = signals['jaw_open']
 
-        # Classify — thresholds tuned from real video (stock presenter, jaw_open 0.01-0.05)
-        if smile > 0.08:
-            expression = 'smiling'
-            intensity = min(100, int(smile * 300))
-        elif mouth_frown > 0.12 and mouth_press > 0.08:
-            expression = 'tense'
-            intensity = min(100, int((mouth_frown + mouth_press) * 150))
-        elif brow_up > 0.25 and eye_wide > 0.15:
-            expression = 'worried'
-            intensity = min(100, int((brow_up + eye_wide) * 150))
-        elif jaw_open > 0.02:
-            # Real speaking jaw values: 0.01-0.05. Old threshold 0.15 was way too high.
+        # === Classify using DEVIATIONS from YOUR baseline ===
+        # Key insight from testing: squint and browDown are the most responsive signals
+        # Use the RATIO between them to distinguish expressions
+
+        sq_dev = dev['squint']
+        bd_dev = dev['brow_down']
+        pk_dev = dev['mouth_pucker']
+        fr_dev = dev['mouth_frown']
+        sh_dev = dev['mouth_shrug']
+        jaw_dev = dev['jaw_open']
+
+        # Total face movement (how much is the face changing from neutral?)
+        total_movement = abs(sq_dev) + abs(bd_dev) + abs(pk_dev) + abs(sh_dev)
+
+        # Surprised: squint DROPS + browDown RISES + mouth opens
+        if sq_dev < -0.08 and bd_dev > 0.08:
+            expression = 'surprised'
+            intensity = min(100, int(total_movement * 150))
+
+        # Happy/Smiling: squint rises significantly + browDown rises less
+        # The key: when smiling, cheeks push UP (squint rises) and face relaxes
+        elif sq_dev > 0.05 and fr_dev < 0.005 and pk_dev < 0.03:
+            expression = 'happy'
+            intensity = min(100, int(sq_dev * 300))
+
+        # Angry: browDown rises significantly + pucker/tension increases
+        elif bd_dev > 0.15 and (pk_dev > 0.02 or sq_dev > 0.05):
+            expression = 'angry'
+            intensity = min(100, int(bd_dev * 150))
+
+        # Sad: frown increases OR squint drops without browDown spike
+        elif fr_dev > 0.005 or (sq_dev < -0.05 and abs(bd_dev) < 0.10):
+            expression = 'sad'
+            intensity = min(100, int(max(abs(fr_dev) * 3000, abs(sq_dev) * 200)))
+
+        # Speaking: jaw opens
+        elif jaw_open > 0.02 or jaw_dev > 0.01:
             expression = 'speaking'
             intensity = 0
+
+        # Focused: browDown rises moderately, everything else stable
+        elif bd_dev > 0.08 and abs(sq_dev) < 0.05 and abs(pk_dev) < 0.02:
+            expression = 'focused'
+            intensity = min(100, int(bd_dev * 200))
+
+        # Neutral: face close to baseline (total movement small)
         else:
             expression = 'neutral'
             intensity = 0
 
         return expression, intensity, {
             'smile': round(smile, 3),
+            'squint': round(squint, 3),
             'brow_down': round(brow_down, 3),
             'mouth_frown': round(mouth_frown, 3),
-            'mouth_press': round(mouth_press, 3),
-            'brow_up': round(brow_up, 3),
-            'eye_wide': round(eye_wide, 3),
+            'mouth_pucker': round(mouth_pucker, 3),
+            'mouth_shrug': round(mouth_shrug, 3),
             'jaw_open': round(jaw_open, 3),
+            'calibrated': self.baseline is not None,
         }
 
     def _detect_eye_contact(self, blendshapes):
@@ -274,31 +334,50 @@ class FaceEngine:
         radius = max(30, min(int(ear_dist * max(w, h) * 0.5), 150))
 
         # === CONFIDENCE SCORING ===
-        # Multiple positive signals stacking = higher confidence
-        score = 45  # starting baseline
+        # Key principle: NOT SPEAKING = max ~50 (you're not presenting!)
+        # SPEAKING + good signals = 60-90+
+        # SPEAKING + bad signals = 20-40
+        is_active = smooth_expr in ('speaking', 'happy')
 
-        # Expression: biggest swing factor
-        if smooth_expr == 'smiling':
-            score += 25
+        # Base depends on whether you're actively presenting
+        score = 35 if is_active else 25  # silent baseline is LOW
+
+        # Expression: biggest swing
+        if smooth_expr == 'happy':
+            score += 30
         elif smooth_expr == 'speaking':
-            score += 15   # actively presenting = strong positive
-        elif smooth_expr == 'tense':
-            score -= 20
-        elif smooth_expr == 'worried':
-            score -= 10
-        # neutral = no change
-
-        # Eye contact (strongest signal for audience perception)
-        if eye_pct > 80:
             score += 20
-        elif eye_pct > 60:
-            score += 12
-        elif eye_pct > 30:
-            score += 5
-        elif eye_pct < 15:
+        elif smooth_expr == 'focused':
+            score += 10
+        elif smooth_expr == 'neutral':
+            score += 0   # not presenting = no bonus
+        elif smooth_expr == 'surprised':
+            score -= 5
+        elif smooth_expr == 'sad':
             score -= 15
+        elif smooth_expr == 'angry':
+            score -= 20
+        elif smooth_expr == 'calibrating':
+            score = 50  # show 50 during calibration
 
-        # Blink rate (only penalize abnormal)
+        # Eye contact — only counts significantly when SPEAKING
+        if is_active:
+            if eye_pct > 80:
+                score += 20
+            elif eye_pct > 60:
+                score += 12
+            elif eye_pct > 30:
+                score += 5
+            elif eye_pct < 15:
+                score -= 15
+        else:
+            # Silent: eye contact gives minor bonus only
+            if eye_pct > 70:
+                score += 8
+            elif eye_pct < 20:
+                score -= 5
+
+        # Blink rate
         if blink_rate > 35:
             score -= 10
         elif blink_rate > 25:
@@ -306,25 +385,36 @@ class FaceEngine:
 
         # Posture
         if body['posture'] == 'upright':
-            score += 8
+            score += 5
         elif body['posture'] == 'tilted':
             score -= 5
         elif body['posture'] == 'slouching':
             score -= 12
 
-        # Fidgeting (penalize excessive)
+        # Fidgeting
         if body['fidget_score'] > 50:
             score -= 10
         elif body['fidget_score'] > 25:
             score -= 5
 
-        # Hand gestures (positive signal — good presenters gesture)
-        if body['hand_position'] == 'raised (gesturing)':
-            score += 7
-        elif body['hand_position'] == 'mid-level':
-            score += 3
+        # Hand gestures (only bonus when speaking)
+        if is_active:
+            if body['hand_position'] == 'raised (gesturing)':
+                score += 7
+            elif body['hand_position'] == 'mid-level':
+                score += 3
 
         confidence = max(0, min(100, score))
+
+        # Build transparent breakdown string
+        parts = [f"base:{35 if is_active else 25}"]
+        if smooth_expr != 'neutral' and smooth_expr != 'calibrating':
+            expr_val = {
+                'happy': '+30', 'speaking': '+20', 'focused': '+10',
+                'surprised': '-5', 'sad': '-15', 'angry': '-20'
+            }.get(smooth_expr, '+0')
+            parts.append(f"expr:{expr_val}")
+        parts.append(f"eye:{'+' if eye_pct > 30 else ''}{score - (35 if is_active else 25)}")
 
         return {
             'face_detected': True,
@@ -343,6 +433,7 @@ class FaceEngine:
             'hands_visible': body['hands_visible'],
             'hand_position': body['hand_position'],
             'confidence_score': confidence,
+            'score_breakdown': ' '.join(parts) + f' = {confidence}',
         }
 
     def draw_overlay(self, frame, result):
@@ -369,28 +460,45 @@ class FaceEngine:
         # Face circle
         cv2.circle(frame, (fx, fy), r, c, 2)
 
-        # Labels on left side
+        # Labels — orange text on dark background for visibility
         x_label = 10
         y_start = 40
+        ORANGE = (0, 165, 255)
+        LIGHT_ORANGE = (0, 200, 255)
+        GRAY = (150, 150, 150)
 
-        cv2.putText(frame, f"Expression: {result['expression']}", (x_label, y_start),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # Dark background panel
+        cv2.rectangle(frame, (0, 30), (350, y_start + 165), (0, 0, 0), -1)
+        cv2.rectangle(frame, (0, 30), (350, y_start + 165), (50, 50, 50), 1)
+
+        # Measured values (these are REAL)
+        cv2.putText(frame, "-- Measured (real) --", (x_label, y_start),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, GRAY, 1)
         cv2.putText(frame, f"Eye Contact: {result['eye_contact_pct']}% ({result['gaze_direction']})",
-                    (x_label, y_start + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    (x_label, y_start + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LIGHT_ORANGE, 1)
         cv2.putText(frame, f"Blink Rate: {result['blink_rate']}/min",
-                    (x_label, y_start + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    (x_label, y_start + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LIGHT_ORANGE, 1)
         cv2.putText(frame, f"Posture: {result['posture']}",
-                    (x_label, y_start + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    (x_label, y_start + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LIGHT_ORANGE, 1)
         cv2.putText(frame, f"Fidget: {result['fidget_score']}",
-                    (x_label, y_start + 88), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    (x_label, y_start + 78), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LIGHT_ORANGE, 1)
         cv2.putText(frame, f"Hands: {result['hand_position']}",
-                    (x_label, y_start + 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    (x_label, y_start + 98), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LIGHT_ORANGE, 1)
 
-        # Confidence bar at top
+        # Estimated values (these use guessed thresholds)
+        cv2.putText(frame, "-- Estimated --", (x_label, y_start + 122),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, GRAY, 1)
+        cv2.putText(frame, f"Expression: {result['expression']} (est.)",
+                    (x_label, y_start + 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ORANGE, 2)
+        # Show score breakdown
+        cv2.putText(frame, f"Score: {result.get('score_breakdown', '')}",
+                    (x_label, y_start + 160), cv2.FONT_HERSHEY_SIMPLEX, 0.4, GRAY, 1)
+
+        # Confidence bar at top — labeled as "Estimated"
         bar_w = int(score * w / 100)
         cv2.rectangle(frame, (0, 0), (w, 28), (30, 30, 30), -1)
         cv2.rectangle(frame, (0, 0), (bar_w, 28), c, -1)
-        cv2.putText(frame, f"Confidence: {score}/100", (10, 20),
+        cv2.putText(frame, f"Est. Confidence: {score}/100", (10, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         return frame
@@ -401,3 +509,5 @@ class FaceEngine:
         self.eye_contact_hist.clear()
         self.pose_history.clear()
         self.expr_history.clear()
+        self.baseline = None
+        self.calibration_frames = []

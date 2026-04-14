@@ -168,7 +168,9 @@
       "Bash(python generate_docs.py)",
       "Bash(python -c ':*)",
       "Bash(python generate_pptx.py)",
-      "Bash(^-\" || ls -lh \"d:\\\\AI Learning\\\\usman\\\\\")"
+      "Bash(^-\" || ls -lh \"d:\\\\AI Learning\\\\usman\\\\\")",
+      "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/pip\" install deepface tf-keras)",
+      "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/pip\" install fer)"
     ],
     "additionalDirectories": [
       "\\dev",

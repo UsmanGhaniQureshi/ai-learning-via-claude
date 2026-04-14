@@ -78,6 +78,7 @@ header p { color: #888; margin-top: 5px; }
 .score-number { font-size: 4rem; font-weight: bold; }
 .score-label { font-size: 1.3rem; margin-top: 5px; color: #fff; }
 .score-subtitle { font-size: 0.85rem; color: #888; margin-top: 5px; }
+.score-note { font-size: 0.7rem; color: #555; margin-top: 8px; max-width: 400px; margin-left: auto; margin-right: auto; line-height: 1.4; }
 
 /* Score Breakdown */
 .score-breakdown { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
