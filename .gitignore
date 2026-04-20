@@ -47,3 +47,5 @@ vosk-model-small-backup/
 uploads/
 detector_env/
 dist/
+# Added by code-review-graph
+.code-review-graph/
