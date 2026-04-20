@@ -40,6 +40,25 @@ header p { color: #888; margin-top: 5px; }
 .section h2 { margin-bottom: 15px; color: #7c4dff; }
 .subtitle { color: #888; margin-bottom: 15px; font-size: 0.9rem; }
 
+/* WebSocket status */
+.ws-status { font-size: 0.8rem; margin-left: 8px; }
+.ws-status.connected { color: #00c853; }
+.ws-status.disconnected { color: #ffd600; }
+
+/* Live Layout — video + gauge side by side */
+.live-layout {
+  display: flex; gap: 20px; align-items: flex-start; margin-bottom: 20px;
+}
+.live-layout .video-box { flex: 1; }
+.live-score-panel {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  min-width: 200px;
+}
+.mic-indicator {
+  font-size: 0.8rem; color: #00c853; padding: 4px 10px;
+  background: rgba(0,200,83,0.1); border-radius: 12px;
+}
+
 /* Live Feed */
 .video-box { background: #111; border-radius: 8px; overflow: hidden; border: 1px solid #333; }
 .video-box img { width: 100%; display: block; }
@@ -70,7 +89,118 @@ header p { color: #888; margin-top: 5px; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* Overall Score */
+/* ============================================
+   SCORE GAUGE
+   ============================================ */
+.score-gauge {
+  position: relative; display: inline-block;
+}
+.gauge-center {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+}
+.gauge-number { font-size: 2.5rem; font-weight: bold; line-height: 1; }
+.gauge-label { font-size: 0.8rem; color: #aaa; margin-top: 2px; }
+
+/* Upload score section */
+.upload-score-section {
+  text-align: center; padding: 20px; margin-bottom: 20px;
+  background: #151520; border-radius: 12px;
+}
+.score-note { font-size: 0.7rem; color: #555; margin-top: 8px; max-width: 400px; margin-left: auto; margin-right: auto; line-height: 1.4; }
+
+/* ============================================
+   SIGNAL BARS
+   ============================================ */
+.signal-bars {
+  background: #151520; border-radius: 10px; padding: 16px;
+  margin-bottom: 20px;
+}
+.signal-row {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 8px;
+}
+.signal-row:last-child { margin-bottom: 0; }
+.signal-label {
+  width: 140px; font-size: 0.8rem; color: #ccc;
+  display: flex; align-items: center; gap: 4px;
+}
+.signal-weight { color: #555; font-size: 0.7rem; }
+.signal-bar-bg {
+  flex: 1; height: 12px; background: #1a1a2e;
+  border-radius: 6px; overflow: hidden;
+}
+.signal-bar-fill {
+  height: 100%; border-radius: 6px;
+  min-width: 2px;
+}
+.signal-value {
+  width: 30px; text-align: right; font-weight: bold;
+  font-size: 0.85rem;
+}
+
+/* ============================================
+   FEEDBACK TIPS
+   ============================================ */
+.feedback-tips {
+  background: #151520; border-radius: 10px; padding: 16px;
+  margin-bottom: 20px; border-left: 3px solid #7c4dff;
+}
+.feedback-tips h4 { color: #7c4dff; margin-bottom: 10px; font-size: 0.9rem; }
+.feedback-tips ul { list-style: none; }
+.tip-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 0; font-size: 0.85rem; color: #ccc;
+  animation: tipFadeIn 0.3s ease;
+}
+.tip-icon { font-size: 1.1rem; }
+@keyframes tipFadeIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
+
+/* ============================================
+   SESSION GRAPH
+   ============================================ */
+.session-graph {
+  background: #151520; border-radius: 10px; padding: 16px;
+  margin-bottom: 20px;
+}
+.session-graph h4 { color: #7c4dff; margin-bottom: 10px; font-size: 0.9rem; }
+.graph-canvas {
+  width: 100%; height: auto; border-radius: 6px;
+  border: 1px solid #222;
+}
+
+/* ============================================
+   PERMISSION SCREEN
+   ============================================ */
+.permission-screen {
+  text-align: center; padding: 40px; background: #151520;
+  border-radius: 12px; border: 2px solid #333;
+}
+.permission-icon { font-size: 3rem; margin-bottom: 15px; }
+.permission-screen h3 { color: #ff6d00; margin-bottom: 10px; }
+.permission-screen p { color: #aaa; margin-bottom: 15px; font-size: 0.9rem; }
+.permission-error { color: #ff1744; font-size: 0.85rem; background: rgba(255,23,68,0.1); padding: 8px; border-radius: 6px; }
+.permission-steps { text-align: left; max-width: 350px; margin: 0 auto 20px; }
+.permission-steps h4 { color: #ccc; margin-bottom: 8px; }
+.permission-steps ol { padding-left: 20px; color: #aaa; font-size: 0.85rem; line-height: 1.8; }
+.retry-btn {
+  padding: 10px 24px; background: #7c4dff; color: #fff;
+  border: none; border-radius: 6px; cursor: pointer; font-weight: bold;
+}
+.retry-btn:hover { background: #6c3ddf; }
+
+/* ============================================
+   LIVE TRANSCRIPT
+   ============================================ */
+.live-transcript { margin-bottom: 20px; }
+.live-transcript h4 { color: #7c4dff; margin-bottom: 8px; font-size: 0.9rem; }
+
+/* ============================================
+   LEGACY / EXISTING STYLES (kept for upload mode)
+   ============================================ */
+
+/* Overall Score (legacy for upload) */
 .overall-score {
   text-align: center; padding: 30px; background: #151520;
   border-radius: 12px; border: 3px solid; margin-bottom: 20px;
@@ -78,7 +208,6 @@ header p { color: #888; margin-top: 5px; }
 .score-number { font-size: 4rem; font-weight: bold; }
 .score-label { font-size: 1.3rem; margin-top: 5px; color: #fff; }
 .score-subtitle { font-size: 0.85rem; color: #888; margin-top: 5px; }
-.score-note { font-size: 0.7rem; color: #555; margin-top: 8px; max-width: 400px; margin-left: auto; margin-right: auto; line-height: 1.4; }
 
 /* Score Breakdown */
 .score-breakdown { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
@@ -102,7 +231,7 @@ header p { color: #888; margin-top: 5px; }
 .speech-stat strong { display: block; font-size: 1.3rem; margin-bottom: 3px; }
 .speech-stat span { font-size: 0.75rem; color: #aaa; }
 
-.filler-list { font-size: 0.85rem; color: #aaa; }
+.filler-list { font-size: 0.85rem; color: #aaa; margin-bottom: 8px; }
 .filler-label { color: #ff6d00; }
 .filler-tag {
   display: inline-block; background: #2a1a1a; color: #ff6d00;
@@ -112,6 +241,7 @@ header p { color: #888; margin-top: 5px; }
   display: inline-block; background: #1a1a2a; color: #ffd600;
   padding: 2px 8px; border-radius: 10px; margin: 2px 3px; font-size: 0.8rem;
 }
+.silence-info { font-size: 0.85rem; color: #aaa; }
 
 /* Video Result */
 .video-result { margin-bottom: 20px; }
@@ -158,3 +288,151 @@ header p { color: #888; margin-top: 5px; }
   border-radius: 6px; cursor: pointer; font-weight: bold;
 }
 .upload-another:hover { background: #6c3ddf; }
+
+/* ============================================
+   ANALYZER PAGE
+   ============================================ */
+.analyzer-page { padding: 10px 0; }
+.analyzer-header { margin-bottom: 20px; }
+.analyzer-header h2 { color: #7c4dff; }
+.analyzer-header p { color: #888; font-size: 0.9rem; }
+.analyzer-error {
+  color: #ff1744; background: rgba(255,23,68,0.1);
+  padding: 10px 16px; border-radius: 8px; margin-bottom: 15px;
+}
+.analyzer-input {
+  display: flex; gap: 20px; align-items: center; justify-content: center;
+  padding: 30px 0; flex-wrap: wrap;
+}
+.analyzer-divider { color: #555; font-size: 0.9rem; }
+.record-btn {
+  display: flex; align-items: center; gap: 8px;
+  padding: 16px 28px; background: #151520; border: 2px solid #ff1744;
+  color: #ff1744; border-radius: 12px; cursor: pointer;
+  font-size: 1rem; font-weight: bold; transition: all 0.2s;
+}
+.record-btn:hover { background: rgba(255,23,68,0.1); }
+.record-dot {
+  width: 12px; height: 12px; background: #ff1744;
+  border-radius: 50%; display: inline-block;
+}
+.analyzer-recording { text-align: center; padding: 30px; }
+.recording-indicator {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  font-size: 1.2rem; color: #ff1744; margin-bottom: 20px;
+}
+.recording-pulse {
+  width: 14px; height: 14px; background: #ff1744;
+  border-radius: 50%; animation: pulse 1s ease infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.3); }
+}
+.stop-btn {
+  padding: 12px 24px; background: #ff1744; color: #fff;
+  border: none; border-radius: 8px; cursor: pointer;
+  font-size: 1rem; font-weight: bold;
+}
+.stop-btn:hover { background: #d50000; }
+
+/* ============================================
+   SESSION REPORT
+   ============================================ */
+.session-report { margin-top: 10px; }
+.report-header {
+  display: flex; gap: 20px; align-items: center;
+  justify-content: center; flex-wrap: wrap;
+  margin-bottom: 20px; padding: 20px;
+  background: #151520; border-radius: 12px;
+}
+.report-grade {
+  border: 3px solid; border-radius: 12px; padding: 15px 25px;
+  text-align: center;
+}
+.grade-letter { font-size: 3rem; font-weight: bold; display: block; }
+.grade-label { font-size: 0.85rem; color: #aaa; }
+.report-stats {
+  display: flex; gap: 15px; flex-wrap: wrap;
+}
+.stat-item {
+  text-align: center; padding: 8px 12px;
+  background: #1a1a2e; border-radius: 8px;
+}
+.stat-item strong { display: block; font-size: 1.3rem; color: #fff; }
+.stat-item span { font-size: 0.75rem; color: #888; }
+.report-note {
+  font-size: 0.8rem; color: #888; text-align: center;
+  padding: 8px; margin-bottom: 15px;
+  background: rgba(124,77,255,0.05); border-radius: 6px;
+}
+.report-section {
+  background: #151520; border-radius: 10px; padding: 16px;
+  margin-bottom: 15px;
+}
+.report-section h3 { color: #7c4dff; margin-bottom: 10px; font-size: 1rem; }
+.report-error { color: #ff1744; text-align: center; padding: 20px; }
+
+/* Filler breakdown */
+.filler-breakdown { }
+.filler-total { margin-bottom: 8px; font-size: 0.9rem; }
+.filler-total strong { color: #ff6d00; font-size: 1.2rem; }
+.acoustic-note { color: #888; font-size: 0.8rem; margin-left: 6px; }
+.filler-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+
+/* Pace stats */
+.pace-stats { display: flex; gap: 12px; flex-wrap: wrap; }
+.pace-item {
+  text-align: center; padding: 10px 14px;
+  background: #1a1a2e; border-radius: 8px; flex: 1; min-width: 70px;
+}
+.pace-item strong { display: block; font-size: 1.2rem; color: #fff; }
+.pace-item span { font-size: 0.75rem; color: #888; }
+.pace-item.good strong { color: #00c853; }
+.pace-item.warn strong { color: #ffd600; }
+
+/* Insights & Actions */
+.insights-list { list-style: none; }
+.insights-list li {
+  padding: 8px 0; border-bottom: 1px solid #1a1a2e;
+  font-size: 0.9rem; color: #ccc; line-height: 1.5;
+}
+.insights-list li:last-child { border-bottom: none; }
+.action-section { border-left: 3px solid #00c853; }
+.action-list { list-style: none; }
+.action-list li {
+  padding: 8px 0; font-size: 0.9rem; color: #ccc; line-height: 1.5;
+}
+
+/* Transcript View */
+.transcript-view {
+  max-height: 300px; overflow-y: auto; padding: 12px;
+  background: #0d0d1a; border-radius: 8px; border: 1px solid #222;
+}
+.transcript-text { font-size: 0.9rem; line-height: 1.7; color: #ccc; }
+.word-normal { }
+.word-filler {
+  color: #ff1744; background: rgba(255,23,68,0.15);
+  padding: 1px 4px; border-radius: 3px; font-weight: bold;
+}
+.transcript-empty { color: #555; font-size: 0.9rem; }
+
+/* Report actions */
+.report-actions { display: flex; gap: 12px; justify-content: center; margin-top: 15px; }
+.report-btn {
+  padding: 10px 20px; background: #7c4dff; color: #fff;
+  border: none; border-radius: 6px; cursor: pointer; font-weight: bold;
+}
+.report-btn:hover { background: #6c3ddf; }
+.report-btn.secondary { background: #333; }
+.report-btn.secondary:hover { background: #444; }
+
+/* Responsive */
+@media (max-width: 700px) {
+  .live-layout { flex-direction: column; }
+  .live-score-panel { width: 100%; flex-direction: row; justify-content: center; }
+  .signal-label { width: 100px; }
+  .mode-select { flex-direction: column; align-items: center; }
+  .analyzer-input { flex-direction: column; }
+  .report-header { flex-direction: column; }
+}

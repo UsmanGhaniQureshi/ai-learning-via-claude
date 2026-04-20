@@ -7,6 +7,7 @@ from vosk import Model, KaldiRecognizer
 import re
 from collections import deque
 import time
+from audio_analyzer import AudioAnalyzer
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'vosk-model')
 
@@ -68,16 +69,19 @@ class SpeechEngine:
         if self.recognizer is None:
             return None
 
-        if self.recognizer.AcceptWaveform(audio_data):
-            result = json.loads(self.recognizer.Result())
-            text = result.get('text', '').strip()
-            if text:
-                return self._analyze_text(text, is_final=True)
-        else:
-            partial = json.loads(self.recognizer.PartialResult())
-            text = partial.get('partial', '').strip()
-            if text:
-                return {'type': 'interim', 'text': text}
+        try:
+            if self.recognizer.AcceptWaveform(audio_data):
+                result = json.loads(self.recognizer.Result())
+                text = result.get('text', '').strip()
+                if text:
+                    return self._analyze_text(text, is_final=True)
+            else:
+                partial = json.loads(self.recognizer.PartialResult())
+                text = partial.get('partial', '').strip()
+                if text:
+                    return {'type': 'interim', 'text': text}
+        except Exception:
+            pass
 
         return None
 
@@ -85,26 +89,47 @@ class SpeechEngine:
         """Process an entire audio file. Returns full analysis."""
         wf = wave.open(filepath, 'rb')
         if wf.getnchannels() != 1 or wf.getsampwidth() != 2:
-            return {'error': 'Audio must be mono 16-bit PCM WAV'}
+            return [{'error': 'Audio must be mono 16-bit PCM WAV'}]
 
         rate = wf.getframerate()
         rec = KaldiRecognizer(self.model, rate)
         rec.SetWords(True)
 
         self.reset()
-        self.start_time = 0
+        # FIX: Track elapsed time from audio frames, not wall clock
+        self._file_mode = True
+        self._file_sample_rate = rate
+        self._file_samples_read = 0
+        self.start_time = time.time()  # Still needed for get_summary
+
+        # Audio analyzer for volume/pitch/silence
+        audio_analyzer = AudioAnalyzer(sample_rate=rate)
+        audio_analyzer.start()
 
         results = []
         while True:
             data = wf.readframes(4000)
             if len(data) == 0:
                 break
+
+            self._file_samples_read += 4000
+
+            # Analyze audio chunk for volume/pitch
+            try:
+                audio_result = audio_analyzer.analyze_chunk(data, sample_rate=rate)
+            except Exception:
+                audio_result = None
+
             if rec.AcceptWaveform(data):
                 r = json.loads(rec.Result())
                 text = r.get('text', '').strip()
                 if text:
                     analysis = self._analyze_text(text, is_final=True)
                     if analysis:
+                        if audio_result:
+                            analysis['voice_steadiness'] = audio_result.get('voice_steadiness')
+                            analysis['pitch_hz'] = audio_result.get('pitch_hz')
+                            analysis['rms'] = audio_result.get('rms')
                         results.append(analysis)
 
         # Final result
@@ -116,6 +141,11 @@ class SpeechEngine:
                 results.append(analysis)
 
         wf.close()
+
+        # Attach audio summary
+        self._audio_summary = audio_analyzer.get_summary()
+        self._file_mode = False
+
         return results
 
     def _analyze_text(self, text, is_final=False):
@@ -162,7 +192,11 @@ class SpeechEngine:
                 reps_in_chunk += 1
 
         # Pace calculation
-        elapsed = time.time() - self.start_time if self.start_time else 1
+        # FIX: Use audio-based elapsed time in file mode to avoid epoch time bug
+        if getattr(self, '_file_mode', False) and self._file_sample_rate > 0:
+            elapsed = self._file_samples_read / self._file_sample_rate
+        else:
+            elapsed = time.time() - self.start_time if self.start_time else 1
         if elapsed < 1:
             elapsed = 1
         wpm = int((self.total_words / elapsed) * 60)
@@ -219,7 +253,10 @@ class SpeechEngine:
         wpm = int((self.total_words / elapsed) * 60) if elapsed > 0 else 0
         filler_rate = (self.filler_count / self.total_words * 100) if self.total_words > 0 else 0
 
-        return {
+        # Include audio analysis if available
+        audio_summary = getattr(self, '_audio_summary', None)
+
+        summary = {
             'full_transcript': ' '.join(self.full_transcript),
             'duration': round(elapsed, 1),
             'total_words': self.total_words,
@@ -232,6 +269,15 @@ class SpeechEngine:
             'hedge_phrases': self.hedge_phrases_found,
         }
 
+        if audio_summary:
+            summary['voice_steadiness'] = audio_summary.get('voice_steadiness', 50)
+            summary['volume_consistency'] = audio_summary.get('volume_consistency', 50)
+            summary['pitch_score'] = audio_summary.get('pitch_score', 50)
+            summary['silence_gaps'] = audio_summary.get('silence_gaps', [])
+            summary['silence_gap_count'] = audio_summary.get('silence_gap_count', 0)
+
+        return summary
+
     def reset(self):
         self.full_transcript = []
         self.word_timestamps = []
@@ -243,3 +289,7 @@ class SpeechEngine:
         self.hedge_phrases_found = []
         self.start_time = None
         self.last_words.clear()
+        self._file_mode = False
+        self._file_sample_rate = 16000
+        self._file_samples_read = 0
+        self._audio_summary = None

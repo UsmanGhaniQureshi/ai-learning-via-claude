@@ -6,7 +6,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 import math
 import os
-from collections import deque
+from collections import deque, Counter
 
 FACE_MODEL = os.path.join(os.path.dirname(__file__), 'face_landmarker.task')
 POSE_MODEL = os.path.join(os.path.dirname(__file__), 'pose_landmarker.task')
@@ -289,23 +289,80 @@ class FaceEngine:
             'hand_position': hand_position,
         }
 
+    def _detect_tension(self, blendshapes):
+        """Detect facial tension from brow furrow, mouth tension, and jaw clench.
+        Returns tension_score 0-100 (0=relaxed, 100=very tense)."""
+        bs = {b.category_name: b.score for b in blendshapes}
+
+        # Brow furrow: browDown signals concentration/tension
+        brow_down = (bs.get('browDownLeft', 0) + bs.get('browDownRight', 0)) / 2
+
+        # Mouth tension: pucker + frown indicate stress
+        mouth_pucker = bs.get('mouthPucker', 0)
+        mouth_frown = (bs.get('mouthFrownLeft', 0) + bs.get('mouthFrownRight', 0)) / 2
+
+        # Jaw clench
+        jaw_clench = bs.get('jawForward', 0)
+
+        # Compute deviations from baseline if available
+        if self.baseline:
+            brow_dev = max(0, brow_down - self.baseline.get('brow_down', 0))
+            pucker_dev = max(0, mouth_pucker - self.baseline.get('mouth_pucker', 0))
+            frown_dev = max(0, mouth_frown - self.baseline.get('mouth_frown', 0))
+        else:
+            brow_dev = brow_down
+            pucker_dev = mouth_pucker
+            frown_dev = mouth_frown
+
+        # Weighted tension: brow furrow is the strongest anxiety signal
+        tension = (brow_dev * 400 + pucker_dev * 200 + frown_dev * 300 + jaw_clench * 100)
+        return max(0, min(100, int(tension)))
+
+    def _detect_face_turned_away(self, face_landmarks, w, h):
+        """Detect if face is turned significantly away from camera.
+        Uses nose tip position relative to face bounding box center."""
+        if not face_landmarks:
+            return True
+
+        fl = face_landmarks
+        # Nose tip (landmark 1), left ear (234), right ear (454)
+        nose_x = fl[1].x
+        left_ear_x = fl[234].x
+        right_ear_x = fl[454].x
+
+        face_center_x = (left_ear_x + right_ear_x) / 2
+        face_width = abs(right_ear_x - left_ear_x)
+
+        if face_width < 0.01:
+            return True
+
+        # How far nose is from center relative to face width
+        offset_ratio = abs(nose_x - face_center_x) / face_width
+        return offset_ratio > 0.25  # Face turned >~25% = looking away
+
     def process_frame(self, frame, timestamp):
         """Process one frame. Returns complete analysis dict."""
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mi = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
 
-        # Face detection + blendshapes
-        face_r = self.face_lm.detect(mi)
+        # Face detection + blendshapes (wrapped in try/except for robustness)
+        try:
+            face_r = self.face_lm.detect(mi)
+        except Exception:
+            return None
         if not face_r.face_landmarks:
             return None
 
         fl = face_r.face_landmarks[0]
         blendshapes = face_r.face_blendshapes[0] if face_r.face_blendshapes else []
 
-        # Pose detection
-        pose_r = self.pose_lm.detect(mi)
-        pose_landmarks = pose_r.pose_landmarks if pose_r.pose_landmarks else None
+        # Pose detection (wrapped in try/except for robustness)
+        try:
+            pose_r = self.pose_lm.detect(mi)
+            pose_landmarks = pose_r.pose_landmarks if pose_r.pose_landmarks else None
+        except Exception:
+            pose_landmarks = None
 
         # Expression from blendshapes
         expression, expr_intensity, expr_details = self._detect_expression(blendshapes)
@@ -313,7 +370,6 @@ class FaceEngine:
 
         # Smoothed expression (most common in last 10 frames)
         if self.expr_history:
-            from collections import Counter
             smooth_expr = Counter(self.expr_history).most_common(1)[0][0]
         else:
             smooth_expr = expression
@@ -326,6 +382,12 @@ class FaceEngine:
 
         # Body language from pose
         body = self._detect_posture(pose_landmarks, w, h)
+
+        # Facial tension (anxiety/stress signal)
+        tension_score = self._detect_tension(blendshapes)
+
+        # Face turned away detection
+        face_turned = self._detect_face_turned_away(fl, w, h)
 
         # Face position for overlay
         face_x = int(fl[4].x * w)
@@ -427,6 +489,8 @@ class FaceEngine:
             'eye_contact_pct': eye_pct,
             'gaze_direction': gaze_dir,
             'blink_rate': blink_rate,
+            'tension_score': tension_score,
+            'face_turned_away': face_turned,
             'posture': body['posture'],
             'shoulder_tilt': body['shoulder_tilt'],
             'fidget_score': body['fidget_score'],

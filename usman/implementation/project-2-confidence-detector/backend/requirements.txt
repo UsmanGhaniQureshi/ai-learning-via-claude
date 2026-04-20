@@ -6,8 +6,8 @@ torch==2.3.0
 torchaudio==2.3.0
 silero-vad>=5.1
 librosa==0.10.2
-scipy>=1.13.0
-numpy>=2.0.0
+scipy==1.13.0
+numpy==1.26.4
 vosk==0.3.45
 mediapipe==0.10.33
 opencv-python==4.13.0.92
