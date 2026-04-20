@@ -1,8 +1,9 @@
 import { useState, useRef } from 'react'
 import SessionReport from '../components/SessionReport'
 import { AnalyzerRecorder } from '../components/AnalyzerRecorder'
+import { API_BASE } from '../config'
 
-const API = 'http://localhost:8000'
+const API = API_BASE
 
 /**
  * Standalone Speech Analyzer page.

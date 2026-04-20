@@ -2,7 +2,9 @@
  * AnalyzerRecorder — audio-only recorder for the /analyzer page.
  * No camera permission needed. Completely independent of live session.
  */
-const API = 'http://localhost:8000'
+import { API_BASE } from '../config'
+
+const API = API_BASE
 
 export class AnalyzerRecorder {
   constructor() {

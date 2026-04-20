@@ -1,0 +1,42 @@
+Recommended AI/ML Courses
+Beginner-Friendly Courses
+Google Machine Learning Crash Course: Practical and focuses on core concepts with simple exercises. "for a beginner friendly foundation, you can look at the google machine learning crash course...it is practical and focuses on core concepts with simple exercises."
+
+Khan Academy's Introduction to Machine Learning: Free and covers the basics. "Another good option is the 'Introduction to Machine Learning' course on Khan Academy, which is also free."
+
+Simplilearn's Free Machine Learning Course: Covers core concepts like supervised and unsupervised learning, regression, and classification with practical exercises and projects. "If you want a free, complete, beginner-friendly course, you can check out the Free Machine Learning Course by Simplilearn."
+
+Intermediate to Advanced Courses
+Andrew Ng's Machine Learning Specialization on Coursera: A solid starting point with both free audit and certified options. "Check out Coursera's Machine Learning course by Andrew Ng. It's free to audit, and many people say it's a solid starting point."
+
+DeepLearning.AI Courses: Offer a range of specializations including "Generative AI with LLMs" and "Machine Learning Specialization." "DeepLearning AI courses: Math for Machine Learning & Data Science and the Machine Learning Specialization."
+
+fast.ai’s Practical Deep Learning for Coders: Focuses on practical, coding-focused applications rather than pure academics. "For a developer switching to AI/ML with limited weekend time, fast.ai’s Practical Deep Learning for Coders is often the best starting point."
+
+LogicMojo's AI/ML Program: Mentor-led project reviews and a structured approach covering Python, stats, regression, DL, CNNs, NLP, LLMs, LangChain, and Hugging Face. "Recently went through LogicMojo's AI/ML program and what work for me was the mentor led project reviews and how they cover topics in more structured way."
+
+Specialized and Advanced Topics
+Andrej Karpathy’s Zero to Hero Series on YouTube: Covers bigram models to GPT architecture, everything coded from scratch. "Honestly, Andrej Karpathy’s zero to hero series on youtube is fantastic!"
+
+Stanford University's Introduction to Statistical Learning with Applications in Python (ISLP): Best in classical machine learning with a Stanford certification option. "Introduction to Statistical Learning with applications in Python (ISLP) Stanford University (2024) is the best in classical machine learning."
+
+Hugging Face NLP Course: Focuses on practical tooling for Natural Language Processing. "Hugging Face NLP course after that for practical tooling."
+
+Free Resources and Communities
+Jupyter Notebooks by Chrisvdweth: Covers many AI/ML topics in detail with concrete examples using PyTorch. "We have a range Jupyter notebooks that cover many topics you are interested in great detail."
+
+GitHub Repo by Bishwaghimire: Provides a structured roadmap with book PDFs, university courses, and YouTube best resources. "If you want structured roadmap to learn AI ML then you can try this GitHub repo."
+
+Kaggle Learn: Offers short, practical tutorials and mini-courses for working with real data. "Then, join Kaggle and complete all of their mini-courses (free)."
+
+Certifications
+Professional Certificate in AI and Machine Learning by Simplilearn: Offered in partnership with Purdue University, covers core topics and tools with real-world projects. "Professional Certificate in AI and Machine Learning by Simplilearn, offered in partnership with Purdue University."
+
+Communities for Further Learning
+r/learnmachinelearning
+
+r/ArtificialInteligence
+
+r/Btechtards
+
+These communities are great places to ask more specific questions, share your progress, and get feedback from fellow learners and professionals in the field.

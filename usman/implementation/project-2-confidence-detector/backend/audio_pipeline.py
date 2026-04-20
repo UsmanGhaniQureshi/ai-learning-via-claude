@@ -5,32 +5,95 @@ faster-whisper for transcription with word timestamps.
 """
 import numpy as np
 import time
+import threading
 from collections import deque
 
-# ── Lazy-loaded models (singleton pattern) ──────────────────────────
+# ── Lazy-loaded models (singleton pattern, thread-safe) ─────────────
 _vad_model = None
 _whisper_model = None
+_vad_lock = threading.Lock()
+_whisper_lock = threading.Lock()
 
 
 def get_vad():
-    """Load Silero VAD model (once)."""
+    """Load Silero VAD model (once). Thread-safe."""
     global _vad_model
-    if _vad_model is None:
-        import torch
-        _vad_model, _ = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
-            trust_repo=True,
-        )
+    # Fast path: already loaded
+    if _vad_model is not None:
+        return _vad_model
+    with _vad_lock:
+        # Re-check inside lock (double-checked locking)
+        if _vad_model is None:
+            import torch
+            _vad_model, _ = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                trust_repo=True,
+            )
     return _vad_model
 
 
 def get_whisper():
-    """Load faster-whisper model (once). Uses tiny.en for speed."""
+    """Load faster-whisper model (once).
+
+    Environment variables:
+      WHISPER_MODEL (default: "distil-small.en")
+        Options:
+          tiny.en           — 40MB, fast CPU, poor accuracy
+          base.en           — 75MB, CPU-friendly, OK accuracy
+          small.en          — 250MB, slow CPU but accurate
+          distil-small.en   — 166MB, ~2x faster than small.en, same accuracy  ★
+          medium.en         — 770MB, GPU required for speed
+          large-v3          — 1.5GB, GPU required, best accuracy
+
+      WHISPER_DEVICE (default: "auto")
+        auto | cpu | cuda
+
+      WHISPER_COMPUTE (default: auto-selected)
+        int8       — CPU optimized (default on CPU)
+        int8_float16 — CPU + some float16 layers
+        float16    — GPU default
+        float32    — highest quality, slowest
+
+    Production recommendations:
+      - AWS CPU instance (t3.large+):  WHISPER_MODEL=distil-small.en
+      - AWS GPU instance (g4dn.xlarge): WHISPER_MODEL=small.en WHISPER_DEVICE=cuda
+    """
     global _whisper_model
-    if _whisper_model is None:
+    # Fast path: already loaded
+    if _whisper_model is not None:
+        return _whisper_model
+    with _whisper_lock:
+        # Re-check inside lock (double-checked locking)
+        if _whisper_model is not None:
+            return _whisper_model
+
         from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+        import os
+
+        model_size = os.environ.get("WHISPER_MODEL", "distil-small.en")
+        device = os.environ.get("WHISPER_DEVICE", "auto")
+
+        # Auto-detect device
+        if device == "auto":
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                device = "cpu"
+
+        # Auto-select compute type
+        default_compute = "float16" if device == "cuda" else "int8"
+        compute_type = os.environ.get("WHISPER_COMPUTE", default_compute)
+
+        print(f"[Whisper] Loading {model_size} on {device} ({compute_type})...")
+        _whisper_model = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type,
+            num_workers=1,
+        )
+        print(f"[Whisper] Model ready.")
     return _whisper_model
 
 
@@ -39,6 +102,21 @@ LEXICAL_FILLERS = {
     "um", "uh", "like", "so", "basically", "literally", "actually",
     "right", "okay", "you know", "i mean", "kind of", "sort of", "well",
 }
+
+# ── Hallucination phrases that Whisper emits on silence/noise ───────
+# Whisper's training set is heavy with YouTube clips, so given near-silent
+# audio it falls back on stock closing phrases. Drop any segment whose
+# normalised text matches one of these.
+HALLUCINATION_BLACKLIST = {
+    "thank you", "thanks", "thanks for watching",
+    "thank you for watching", "thank you so much",
+    "please subscribe", "bye", "bye bye", "you", ".", "you.", "",
+}
+
+
+def _normalise_phrase(text: str) -> str:
+    """Lowercase, strip surrounding whitespace and trailing punctuation."""
+    return text.strip().lower().rstrip(".,!?").strip()
 
 
 # ── Acoustic filler detection (from raw audio, NOT text) ────────────
@@ -176,21 +254,47 @@ def transcribe_chunk(audio, sr=16000):
     Transcribe audio with faster-whisper.
     word_timestamps=True + condition_on_previous_text=False
     to preserve fillers that Whisper normally suppresses.
+
+    Hallucination guards:
+    - vad_filter=True: skip silent regions (prevents "thanks for watching" hallucinations)
+    - no_speech_threshold=0.6: reject chunks model thinks are silent
+    - log_prob_threshold=-1.0: reject low-confidence transcriptions
+    - compression_ratio_threshold=2.4: reject repetitive hallucinations
+    - Reject low-probability words at the output stage
     """
     whisper = get_whisper()
-    segments, _ = whisper.transcribe(
+    segments, info = whisper.transcribe(
         audio, language="en",
         word_timestamps=True,
         condition_on_previous_text=False,
-        vad_filter=False,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 700, "threshold": 0.6},
+        no_speech_threshold=0.85,
+        log_prob_threshold=-0.7,
+        compression_ratio_threshold=2.2,
+        initial_prompt="",
         temperature=0.0,
     )
 
     words = []
     for seg in segments:
+        # Reject low-quality segments (likely hallucinations on silence/noise)
+        if hasattr(seg, 'compression_ratio') and seg.compression_ratio > 2.2:
+            continue
+        if hasattr(seg, 'avg_logprob') and seg.avg_logprob < -0.7:
+            continue
+        if hasattr(seg, 'no_speech_prob') and seg.no_speech_prob > 0.6:
+            continue
+        # Reject blacklisted hallucination phrases
+        seg_text = _normalise_phrase(getattr(seg, 'text', ''))
+        if seg_text in HALLUCINATION_BLACKLIST:
+            continue
         for w in (seg.words or []):
             word = w.word.strip().lower().strip(".,!?")
             if not word:
+                continue
+            # Reject very low probability words (likely hallucinations)
+            if w.probability < 0.3:
                 continue
             words.append({
                 "word": word,
@@ -268,11 +372,21 @@ class AudioPipeline:
         acoustic_fillers = detect_filler_sounds_acoustic(audio, sr)
         self.total_acoustic_fillers.extend(acoustic_fillers)
 
-        # 5. Whisper transcription with word timestamps
-        try:
-            words = transcribe_chunk(audio, sr)
-        except Exception:
-            words = []
+        # 5. Whisper transcription — ONLY if VAD detected meaningful speech.
+        # Strict gate: most webcams have an ambient noise floor that easily
+        # cleared the previous (voiced_s>=0.4, rms>0.005) check, which led
+        # to padded silence being fed into Whisper and hallucinated as
+        # "thank you for watching". With voiced_s>=0.8s of a 3s chunk and
+        # rms>0.012, real speech still passes while breathing/typing/HVAC
+        # do not. Skip Whisper entirely on failure.
+        words = []
+        rms_energy = features['rms']
+        has_meaningful_speech = voiced_s >= 0.8 and rms_energy > 0.012
+        if has_meaningful_speech:
+            try:
+                words = transcribe_chunk(audio, sr)
+            except Exception:
+                words = []
         self.total_words.extend(words)
 
         # 6. Count lexical fillers in this chunk

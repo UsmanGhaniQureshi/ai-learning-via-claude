@@ -4,11 +4,24 @@ Zero latency impact on the live analysis pipeline.
 """
 import wave
 import threading
+import json
+from datetime import datetime, timezone
 import numpy as np
 from pathlib import Path
 
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
 RECORDINGS_DIR.mkdir(exist_ok=True)
+
+
+def _parse_started_at(session_id: str):
+    """Parse started_at ISO string from session_{epoch_ms} format if possible."""
+    if session_id.startswith("session_"):
+        try:
+            epoch_ms = int(session_id[len("session_"):])
+            return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).isoformat()
+        except ValueError:
+            return None
+    return None
 
 
 class SessionAudioRecorder:
@@ -55,15 +68,57 @@ class SessionAudioRecorder:
 
     @staticmethod
     def list_recordings():
-        """List all recorded sessions."""
-        recordings = []
-        for f in RECORDINGS_DIR.glob("*_audio.wav"):
-            session_id = f.stem.replace("_audio", "")
-            size_mb = round(f.stat().st_size / 1e6, 2)
-            recordings.append({
-                "session_id": session_id,
-                "filename": f.name,
-                "path": str(f),
-                "size_mb": size_mb,
+        """List all recorded sessions by unioning audio/video/report stems.
+
+        Each entry returns browser-loadable URLs (not disk paths) plus
+        duration_s and score from the saved report JSON when available.
+        Partial sessions (missing video, missing report, etc.) are listed
+        gracefully without raising.
+        """
+        sessions = {}
+        suffixes = (
+            ("_audio.wav", "audio"),
+            ("_video.webm", "video"),
+            ("_report.json", "report"),
+        )
+        for f in RECORDINGS_DIR.iterdir():
+            if not f.is_file():
+                continue
+            sid = None
+            kind = None
+            for suffix, k in suffixes:
+                if f.name.endswith(suffix):
+                    sid = f.name[: -len(suffix)]
+                    kind = k
+                    break
+            if not sid:
+                continue
+            entry = sessions.setdefault(sid, {
+                "session_id": sid,
+                "started_at": _parse_started_at(sid),
+                "duration_s": None,
+                "score": None,
+                "has_video": False,
+                "has_audio": False,
+                "has_report": False,
+                "video_url": f"/api/recordings/{sid}/video",
+                "audio_url": f"/api/recordings/{sid}/audio",
+                "report_url": f"/api/report/{sid}",
             })
-        return sorted(recordings, key=lambda x: x['filename'], reverse=True)
+            if kind == "audio":
+                entry["has_audio"] = True
+            elif kind == "video":
+                entry["has_video"] = True
+            elif kind == "report":
+                entry["has_report"] = True
+                try:
+                    report = json.loads(f.read_text())
+                    entry["duration_s"] = report.get("duration_s")
+                    entry["score"] = report.get("avg_score")
+                except Exception:
+                    pass
+        return sorted(
+            sessions.values(),
+            key=lambda x: x.get("started_at") or x["session_id"],
+            reverse=True,
+        )

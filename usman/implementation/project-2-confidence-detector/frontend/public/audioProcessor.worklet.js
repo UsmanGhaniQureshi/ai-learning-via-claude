@@ -2,8 +2,9 @@
  * AudioWorklet processor — captures 20ms audio frames at 16kHz.
  * Never blocks the main thread.
  *
- * USAGE: This is an upgrade path for useAudioCapture.js which currently uses
- * the deprecated ScriptProcessorNode. To switch to AudioWorklet:
+ * USAGE: This is an upgrade path for the live audio capture in
+ * hooks/useLiveSession.js, which currently uses the deprecated
+ * ScriptProcessorNode. To switch to AudioWorklet:
  *   const ctx = new AudioContext({ sampleRate: 16000 });
  *   await ctx.audioWorklet.addModule('/audioProcessor.worklet.js');
  *   const workletNode = new AudioWorkletNode(ctx, 'audio-processor');

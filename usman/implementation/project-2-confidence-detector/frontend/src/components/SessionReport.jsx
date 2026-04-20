@@ -2,12 +2,23 @@ import ScoreGauge from './ScoreGauge'
 import SignalBars from './SignalBars'
 import SessionGraph from './SessionGraph'
 import TranscriptView from './TranscriptView'
+import { API_BASE } from '../config'
 
 /**
  * Shared report UI — used by both live session post-report and standalone analyzer.
  * Expects a `report` prop matching the generate_post_session_report() output.
+ *
+ * showRecording: when true, render the saved video from report.recording.video_url
+ * inside the report. Set true from contexts without their own preview (e.g.
+ * the History page); leave false when the parent (LiveSession) already shows
+ * the recording above the report so we don't double-render.
  */
-export default function SessionReport({ report, onDownloadJSON, onCopyTranscript }) {
+export default function SessionReport({
+  report,
+  onDownloadJSON,
+  onCopyTranscript,
+  showRecording = false,
+}) {
   if (!report) return null
   if (report.error) return <div className="report-error">{report.error}</div>
 
@@ -15,8 +26,12 @@ export default function SessionReport({ report, onDownloadJSON, onCopyTranscript
     avg_score, peak_score, lowest_score, grade, grade_label,
     signal_averages, filler_breakdown, total_fillers, acoustic_fillers,
     pace, insights, action_items, timeline, transcript, duration_s,
-    weakest_signal, note, session_id,
+    weakest_signal, note, session_id, recording,
   } = report
+
+  const recordingVideoUrl = recording?.video_url
+    ? `${API_BASE}${recording.video_url}`
+    : null
 
   // Convert signal_averages to the format SignalBars expects
   const barScores = {
@@ -59,6 +74,19 @@ export default function SessionReport({ report, onDownloadJSON, onCopyTranscript
       </div>
 
       {note && <div className="report-note">{note}</div>}
+
+      {showRecording && recordingVideoUrl && (
+        <div className="report-section">
+          <video
+            src={recordingVideoUrl}
+            controls
+            playsInline
+            preload="metadata"
+            className="processed-video"
+            style={{ width: '100%', borderRadius: 8 }}
+          />
+        </div>
+      )}
 
       {/* Signal Bars */}
       <div className="report-section">

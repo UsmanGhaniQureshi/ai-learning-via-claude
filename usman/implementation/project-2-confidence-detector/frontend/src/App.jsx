@@ -1,113 +1,35 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import './App.css'
+import { API_BASE } from './config'
 import ScoreGauge from './components/ScoreGauge'
 import SignalBars from './components/SignalBars'
 import FeedbackTips from './components/FeedbackTips'
-import SessionGraph from './components/SessionGraph'
-import PermissionScreen from './components/PermissionScreen'
-import useWebSocket from './hooks/useWebSocket'
-import useAudioCapture from './hooks/useAudioCapture'
-import { SessionVideoRecorder } from './components/VideoRecorder'
+import PlaybackReview from './components/PlaybackReview'
+import LiveSession from './pages/LiveSession'
 import Analyzer from './pages/Analyzer'
-
-const API = 'http://localhost:8000'
+import History from './pages/History'
 
 function App() {
-  // Hash-based routing: #/analyzer goes to standalone analyzer page
   const [mode, setMode] = useState(() => {
     if (window.location.hash === '#/analyzer') return 'analyzer'
     return null
   })
   const [uploading, setUploading] = useState(false)
   const [results, setResults] = useState(null)
-  const [permissionDenied, setPermissionDenied] = useState(false)
-  const [scoreHistory, setScoreHistory] = useState([])
-  const [isRecording, setIsRecording] = useState(false)
-  const sessionStart = useRef(null)
-  const videoRecorderRef = useRef(null)
+  const [uploadPreviewUrl, setUploadPreviewUrl] = useState(null)
 
-  // WebSocket for live mode
-  const { scores, isConnected, transcript, tips, sendAudio } = useWebSocket()
-
-  // Audio capture for live mode — sends chunks to WebSocket
-  const { isCapturing, error: audioError, hasPermission } = useAudioCapture(
-    sendAudio,
-    mode === 'live'
-  )
-
-  // Track permission denial
+  // Revoke the blob URL whenever it changes or on unmount — avoids leaks.
   useEffect(() => {
-    if (hasPermission === false) setPermissionDenied(true)
-    if (hasPermission === true) setPermissionDenied(false)
-  }, [hasPermission])
-
-  // Build score history for graph
-  useEffect(() => {
-    if (scores && scores.total != null && mode === 'live') {
-      if (!sessionStart.current) sessionStart.current = Date.now()
-      const elapsed = (Date.now() - sessionStart.current) / 1000
-      setScoreHistory(prev => [...prev, { time: elapsed, score: scores.total }])
-    }
-  }, [scores, mode])
-
-  const stopCamera = () => {
-    fetch(`${API}/api/stop-live`).catch(() => {})
-  }
-
-  // Start video recording when live mode activates
-  const startVideoRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-      const recorder = new SessionVideoRecorder()
-      await recorder.start(stream)
-      videoRecorderRef.current = { recorder, stream }
-      setIsRecording(true)
-    } catch (e) {
-      // Video recording is optional — don't block if it fails
-    }
-  }, [])
-
-  // Stop video recording and upload
-  const stopVideoRecording = useCallback(async () => {
-    const ref = videoRecorderRef.current
-    if (!ref) return
-    setIsRecording(false)
-    try {
-      const blob = await ref.recorder.stop()
-      // Stop the stream tracks
-      ref.stream.getTracks().forEach(t => t.stop())
-      if (blob) {
-        const sessionId = `live_${Date.now()}`
-        ref.recorder.blob = blob
-        await ref.recorder.uploadToServer(sessionId)
-      }
-    } catch (e) {
-      // Upload failure is non-critical
-    }
-    videoRecorderRef.current = null
-  }, [])
-
-  useEffect(() => {
-    if (mode === 'live') {
-      startVideoRecording()
-    }
-    if (mode !== 'live') return
-    const handleUnload = () => { stopCamera(); stopVideoRecording() }
-    window.addEventListener('beforeunload', handleUnload)
     return () => {
-      window.removeEventListener('beforeunload', handleUnload)
-      stopCamera()
-      stopVideoRecording()
+      if (uploadPreviewUrl) URL.revokeObjectURL(uploadPreviewUrl)
     }
-  }, [mode, startVideoRecording, stopVideoRecording])
+  }, [uploadPreviewUrl])
 
   const handleBack = () => {
-    stopVideoRecording()
     setMode(null)
     setResults(null)
-    setScoreHistory([])
-    sessionStart.current = null
-    setPermissionDenied(false)
+    setUploadPreviewUrl(null)
+    window.location.hash = ''
   }
 
   const handleUpload = async (e) => {
@@ -115,20 +37,28 @@ function App() {
     if (!file) return
     setUploading(true)
     setResults(null)
+    // Show the local blob while the backend processes — swapping to the
+    // server's overlay video only when results arrive. Assigning a fresh
+    // URL here triggers the useEffect cleanup for any previous one.
+    setUploadPreviewUrl(URL.createObjectURL(file))
     const formData = new FormData()
     formData.append('file', file)
     try {
-      const res = await fetch(`${API}/api/upload`, { method: 'POST', body: formData })
+      const res = await fetch(`${API_BASE}/api/upload`, { method: 'POST', body: formData })
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: 'Upload failed' }))
         alert(err.error || 'Upload failed')
+        setUploadPreviewUrl(null)
         setUploading(false)
         return
       }
       const data = await res.json()
       setResults(data)
+      // Server has the overlay version now — drop the raw blob.
+      setUploadPreviewUrl(null)
     } catch (err) {
-      alert('Cannot connect to backend. Run: python main.py')
+      alert('Cannot connect to backend.')
+      setUploadPreviewUrl(null)
     }
     setUploading(false)
   }
@@ -150,7 +80,7 @@ function App() {
   return (
     <div className="app">
       <header>
-        <h1>Confidence Detector v1.0</h1>
+        <h1>Confidence Detector</h1>
         <p>AI Presentation Coaching — Real-time Feedback</p>
       </header>
 
@@ -171,11 +101,16 @@ function App() {
             <h3>Speech Analyzer</h3>
             <p>Test your speech — no camera needed</p>
           </button>
+          <button className="mode-btn" onClick={() => setMode('history')}>
+            <span className="icon">&#x1F4DA;</span>
+            <h3>Library</h3>
+            <p>Browse and replay past sessions</p>
+          </button>
         </div>
       )}
 
       {mode && (
-        <button className="back-btn" onClick={() => { handleBack(); window.location.hash = '' }}>
+        <button className="back-btn" onClick={handleBack}>
           &larr; Back
         </button>
       )}
@@ -184,69 +119,10 @@ function App() {
       {mode === 'analyzer' && <Analyzer />}
 
       {/* == LIVE MODE == */}
-      {mode === 'live' && (
-        <div className="section">
-          <h2>Live Practice Session</h2>
-          <p className="subtitle">
-            Present in front of your camera — see confidence feedback in real-time
-            {isConnected && <span className="ws-status connected"> &bull; Connected</span>}
-            {!isConnected && <span className="ws-status disconnected"> &bull; Connecting...</span>}
-          </p>
+      {mode === 'live' && <LiveSession />}
 
-          {permissionDenied ? (
-            <PermissionScreen
-              error={audioError}
-              onRetry={() => {
-                setPermissionDenied(false)
-                setMode(null)
-                setTimeout(() => setMode('live'), 100)
-              }}
-            />
-          ) : (
-            <>
-              {/* Video + Score Gauge side by side */}
-              <div className="live-layout">
-                <div className="video-box">
-                  <img src={`${API}/api/live`} alt="Live feed" />
-                </div>
-                <div className="live-score-panel">
-                  <ScoreGauge
-                    score={scores?.total ?? 50}
-                    label={scoreLabel(scores?.total)}
-                    size={180}
-                  />
-                  {isCapturing && <div className="mic-indicator">&#x1F3A4; Mic active</div>}
-                  {isRecording && <div className="mic-indicator">&#x1F534; Recording</div>}
-                </div>
-              </div>
-
-              {/* Signal Bars */}
-              {scores && <SignalBars scores={scores} />}
-
-              {/* Feedback Tips */}
-              <FeedbackTips tips={tips} />
-
-              {/* Live Transcript */}
-              {transcript && (
-                <div className="live-transcript">
-                  <h4>Live Transcript</h4>
-                  <div className="transcript-box">{transcript}</div>
-                </div>
-              )}
-
-              {/* Session Graph */}
-              {scoreHistory.length > 2 && <SessionGraph history={scoreHistory} />}
-
-              {/* Legend */}
-              <div className="legend">
-                <span className="legend-item"><span className="dot green"></span> Confident (71+)</span>
-                <span className="legend-item"><span className="dot yellow"></span> Moderate (41-70)</span>
-                <span className="legend-item"><span className="dot red"></span> Low (&lt;40)</span>
-              </div>
-            </>
-          )}
-        </div>
-      )}
+      {/* == HISTORY MODE == */}
+      {mode === 'history' && <History />}
 
       {/* == UPLOAD MODE == */}
       {mode === 'upload' && (
@@ -265,14 +141,43 @@ function App() {
 
           {uploading && (
             <div className="processing">
+              {uploadPreviewUrl && (
+                <video
+                  src={uploadPreviewUrl}
+                  autoPlay
+                  loop
+                  muted
+                  playsInline
+                  controls
+                  className="processed-video"
+                  style={{ width: '100%', marginBottom: 16, borderRadius: 8 }}
+                />
+              )}
               <div className="spinner"></div>
               <p>Processing video — analyzing face expressions and speech...</p>
-              <p className="small">This may take a moment for longer videos</p>
+              <p className="small">This may take a moment for longer videos. Unmute the preview to hear your audio.</p>
             </div>
           )}
 
           {results && (
             <div className="results">
+              {results.no_face_detected && (
+                <div className="session-error">
+                  No face was detected in this video. Face-based scores
+                  (eye contact, expression) defaulted to neutral and may not
+                  reflect the speaker.
+                </div>
+              )}
+              {results.audio_extraction_error && (
+                <div className="session-error">
+                  Audio could not be extracted: {results.audio_extraction_error}
+                </div>
+              )}
+              {results.video_encode_error && (
+                <div className="session-error">
+                  Video re-encode failed: {results.video_encode_error}
+                </div>
+              )}
               {/* Overall Score Gauge */}
               <div className="upload-score-section">
                 <ScoreGauge
@@ -291,7 +196,7 @@ function App() {
               {/* Feedback Tips */}
               {results.tips && <FeedbackTips tips={results.tips} />}
 
-              {/* Score Breakdown Cards (legacy) */}
+              {/* Score Breakdown Cards */}
               <div className="score-breakdown">
                 <div className="breakdown-card">
                   <strong style={{ color: scoreColor(results.face_confidence) }}>{results.face_confidence}</strong>
@@ -336,14 +241,6 @@ function App() {
                       <strong>{results.speech_summary.average_wpm}</strong>
                       <span>Words/Min</span>
                     </div>
-                    {results.speech_summary.voice_steadiness != null && (
-                      <div className="speech-stat">
-                        <strong style={{ color: scoreColor(results.speech_summary.voice_steadiness) }}>
-                          {results.speech_summary.voice_steadiness}
-                        </strong>
-                        <span>Voice Steadiness</span>
-                      </div>
-                    )}
                   </div>
                   {results.speech_summary.filler_words && results.speech_summary.filler_words.length > 0 && (
                     <div className="filler-list">
@@ -353,23 +250,16 @@ function App() {
                       ))}
                     </div>
                   )}
-                  {results.speech_summary.silence_gaps && results.speech_summary.silence_gaps.length > 0 && (
-                    <div className="silence-info">
-                      <span className="filler-label">Silence gaps (&gt;2s): </span>
-                      <span>{results.speech_summary.silence_gap_count} detected</span>
-                    </div>
-                  )}
                 </div>
               )}
 
-              {/* Processed Video */}
+              {/* Synced playback: video + live score + word-level transcript */}
               {results.processed_video && (
-                <div className="video-result">
-                  <h3>Processed Video with Overlays</h3>
-                  <video controls width="100%" className="processed-video">
-                    <source src={`${API}/api/video/${results.processed_video}`} type="video/mp4" />
-                  </video>
-                </div>
+                <PlaybackReview
+                  processedVideo={results.processed_video}
+                  faceTimeline={results.face_timeline}
+                  speechTimeline={results.speech_timeline}
+                />
               )}
 
               {/* Face Timeline */}
@@ -387,48 +277,10 @@ function App() {
                         <span className="eye-contact">Eye: {entry.eye_contact_pct}%</span>
                       </div>
                       {entry.evidence_frame && (
-                        <img src={`${API}/api/evidence/${entry.evidence_frame}`} alt={`Frame at ${entry.time_display}`} className="evidence" />
+                        <img src={`${API_BASE}/api/evidence/${entry.evidence_frame}`} alt={`Frame at ${entry.time_display}`} className="evidence" />
                       )}
                     </div>
                   ))}
-                </div>
-              )}
-
-              {/* Speech Timeline */}
-              {results.speech_timeline && results.speech_timeline.length > 0 && (
-                <div className="timeline-section">
-                  <h3>Speech Timeline — What You Said</h3>
-                  {results.speech_timeline.map((entry, i) => (
-                    <div key={i} className="speech-card" style={{ borderLeft: `4px solid ${scoreColor(entry.speech_score)}` }}>
-                      <div className="speech-top">
-                        <span className="time">{Math.floor(entry.timestamp / 60)}:{String(Math.floor(entry.timestamp % 60)).padStart(2, '0')}</span>
-                        <span className="timeline-score" style={{ color: scoreColor(entry.speech_score) }}>
-                          Speech: {entry.speech_score}/100
-                        </span>
-                      </div>
-                      <div className="speech-text">{entry.text}</div>
-                      {entry.fillers.length > 0 && (
-                        <div className="speech-issues">
-                          Fillers: {entry.fillers.map((f, j) => <span key={j} className="filler-tag">{f}</span>)}
-                        </div>
-                      )}
-                      {entry.hedges.length > 0 && (
-                        <div className="speech-issues">
-                          Hedging: {entry.hedges.map((h, j) => <span key={j} className="hedge-tag">{h}</span>)}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Full Transcript */}
-              {results.speech_summary && results.speech_summary.full_transcript && (
-                <div className="transcript-section">
-                  <h3>Full Transcript</h3>
-                  <div className="transcript-box">
-                    {results.speech_summary.full_transcript}
-                  </div>
                 </div>
               )}
 
