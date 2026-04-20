@@ -12,3 +12,7 @@ mediapipe>=0.10.33
 opencv-python>=4.13.0.92
 imageio-ffmpeg>=0.6.0
 sounddevice>=0.5.5
+sqlalchemy>=2.0.30
+alembic>=1.13.0
+psycopg[binary]>=3.2.0
+python-dotenv>=1.0.0

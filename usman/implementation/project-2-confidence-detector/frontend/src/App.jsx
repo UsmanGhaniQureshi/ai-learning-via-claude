@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react'
+import { useState, useRef } from 'react'
 import './App.css'
 import { API_BASE } from './config'
 import ScoreGauge from './components/ScoreGauge'
 import SignalBars from './components/SignalBars'
 import FeedbackTips from './components/FeedbackTips'
 import PlaybackReview from './components/PlaybackReview'
+import useTimelineThumbnails from './components/TimelineThumbnails'
 import LiveSession from './pages/LiveSession'
 import Analyzer from './pages/Analyzer'
 import History from './pages/History'
@@ -16,19 +17,21 @@ function App() {
   })
   const [uploading, setUploading] = useState(false)
   const [results, setResults] = useState(null)
-  const [uploadPreviewUrl, setUploadPreviewUrl] = useState(null)
+  const playbackRef = useRef(null)
 
-  // Revoke the blob URL whenever it changes or on unmount — avoids leaks.
-  useEffect(() => {
-    return () => {
-      if (uploadPreviewUrl) URL.revokeObjectURL(uploadPreviewUrl)
-    }
-  }, [uploadPreviewUrl])
+  // Client-side thumbnails for the Face Timeline. Captures frames from
+  // the already-loaded processed video — no backend call, no disk files.
+  const faceTimeline = results?.face_timeline || []
+  const timelineThumbs = useTimelineThumbnails(
+    results?.processed_video
+      ? `${API_BASE}/api/video/${results.processed_video}`
+      : null,
+    faceTimeline.map((e) => e.timestamp),
+  )
 
   const handleBack = () => {
     setMode(null)
     setResults(null)
-    setUploadPreviewUrl(null)
     window.location.hash = ''
   }
 
@@ -37,10 +40,6 @@ function App() {
     if (!file) return
     setUploading(true)
     setResults(null)
-    // Show the local blob while the backend processes — swapping to the
-    // server's overlay video only when results arrive. Assigning a fresh
-    // URL here triggers the useEffect cleanup for any previous one.
-    setUploadPreviewUrl(URL.createObjectURL(file))
     const formData = new FormData()
     formData.append('file', file)
     try {
@@ -48,17 +47,13 @@ function App() {
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: 'Upload failed' }))
         alert(err.error || 'Upload failed')
-        setUploadPreviewUrl(null)
         setUploading(false)
         return
       }
       const data = await res.json()
       setResults(data)
-      // Server has the overlay version now — drop the raw blob.
-      setUploadPreviewUrl(null)
     } catch (err) {
       alert('Cannot connect to backend.')
-      setUploadPreviewUrl(null)
     }
     setUploading(false)
   }
@@ -141,21 +136,9 @@ function App() {
 
           {uploading && (
             <div className="processing">
-              {uploadPreviewUrl && (
-                <video
-                  src={uploadPreviewUrl}
-                  autoPlay
-                  loop
-                  muted
-                  playsInline
-                  controls
-                  className="processed-video"
-                  style={{ width: '100%', marginBottom: 16, borderRadius: 8 }}
-                />
-              )}
               <div className="spinner"></div>
-              <p>Processing video — analyzing face expressions and speech...</p>
-              <p className="small">This may take a moment for longer videos. Unmute the preview to hear your audio.</p>
+              <p>Processing video — analyzing face expressions and speech…</p>
+              <p className="small">This may take a moment for longer videos.</p>
             </div>
           )}
 
@@ -256,6 +239,7 @@ function App() {
               {/* Synced playback: video + live score + word-level transcript */}
               {results.processed_video && (
                 <PlaybackReview
+                  ref={playbackRef}
                   processedVideo={results.processed_video}
                   faceTimeline={results.face_timeline}
                   speechTimeline={results.speech_timeline}
@@ -269,16 +253,29 @@ function App() {
                   {results.face_timeline.map((entry, i) => (
                     <div key={i} className="timeline-card" style={{ borderLeft: `4px solid ${scoreColor(entry.face_confidence)}` }}>
                       <div className="timeline-top">
+                        {timelineThumbs[entry.timestamp] ? (
+                          <img
+                            src={timelineThumbs[entry.timestamp]}
+                            alt={`Frame at ${entry.time_display}`}
+                            className="timeline-thumb"
+                          />
+                        ) : (
+                          <div className="timeline-thumb timeline-thumb-placeholder" />
+                        )}
                         <span className="time">{entry.time_display}</span>
                         <span className="expression">{entry.expression}</span>
                         <span className="timeline-score" style={{ color: scoreColor(entry.face_confidence) }}>
                           Face: {entry.face_confidence}/100
                         </span>
                         <span className="eye-contact">Eye: {entry.eye_contact_pct}%</span>
+                        <button
+                          className="timeline-jump"
+                          onClick={() => playbackRef.current?.seekTo(entry.timestamp)}
+                          title={`Jump video to ${entry.time_display}`}
+                        >
+                          ▶ Jump
+                        </button>
                       </div>
-                      {entry.evidence_frame && (
-                        <img src={`${API_BASE}/api/evidence/${entry.evidence_frame}`} alt={`Frame at ${entry.time_display}`} className="evidence" />
-                      )}
                     </div>
                   ))}
                 </div>

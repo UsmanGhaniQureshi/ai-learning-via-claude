@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useMemo } from 'react'
+import { useEffect, useRef, useState, useMemo, forwardRef, useImperativeHandle } from 'react'
 import { API_BASE } from '../config'
 
 /**
@@ -14,11 +14,31 @@ import { API_BASE } from '../config'
  *
  * All data comes from the /api/upload response (face_timeline +
  * speech_timeline.words with absolute timestamps).
+ *
+ * Exposes an imperative `seekTo(seconds)` method via ref — the parent's
+ * Face Timeline "Jump" buttons call it to seek this video and scroll it
+ * into view without needing to own the DOM ref.
  */
-export default function PlaybackReview({ processedVideo, faceTimeline, speechTimeline }) {
+const PlaybackReview = forwardRef(function PlaybackReview(
+  { processedVideo, faceTimeline, speechTimeline },
+  ref,
+) {
   const videoRef = useRef(null)
+  const rootRef = useRef(null)
   const transcriptContainerRef = useRef(null)
   const activeWordRef = useRef(null)
+
+  useImperativeHandle(ref, () => ({
+    seekTo(seconds) {
+      const video = videoRef.current
+      if (!video) return
+      video.currentTime = Math.max(0, seconds)
+      video.play().catch(() => {})
+      if (rootRef.current) {
+        rootRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }
+    },
+  }), [])
   const [currentFace, setCurrentFace] = useState(null)
   const [currentSpeech, setCurrentSpeech] = useState(null)
   const [currentWordIdx, setCurrentWordIdx] = useState(-1)
@@ -97,7 +117,7 @@ export default function PlaybackReview({ processedVideo, faceTimeline, speechTim
   if (!processedVideo) return null
 
   return (
-    <div className="playback-review">
+    <div className="playback-review" ref={rootRef}>
       <h3>Playback Review</h3>
       <p className="pb-subtitle">
         Play the video — scores and transcript sync to the current moment.
@@ -176,4 +196,6 @@ export default function PlaybackReview({ processedVideo, faceTimeline, speechTim
       )}
     </div>
   )
-}
+})
+
+export default PlaybackReview

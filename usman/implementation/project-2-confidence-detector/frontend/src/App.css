@@ -261,7 +261,37 @@ header p { color: #888; margin-top: 5px; }
 .expression { color: #aaa; font-size: 0.9rem; }
 .timeline-score { font-weight: bold; }
 .eye-contact { color: #888; font-size: 0.85rem; }
-.evidence { width: 100%; border-radius: 6px; margin-top: 8px; border: 1px solid #333; }
+.timeline-jump {
+  background: transparent;
+  color: #7c4dff;
+  border: 1px solid #7c4dff;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  margin-left: auto;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.timeline-jump:hover { background: #7c4dff; color: #fff; }
+
+.timeline-thumb {
+  width: 100px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid #333;
+  background: #1a1a24;
+  flex-shrink: 0;
+}
+.timeline-thumb-placeholder {
+  background: linear-gradient(90deg, #1a1a24 0%, #22222e 50%, #1a1a24 100%);
+  background-size: 200% 100%;
+  animation: timeline-thumb-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes timeline-thumb-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
 
 /* Speech Timeline */
 .speech-card {
