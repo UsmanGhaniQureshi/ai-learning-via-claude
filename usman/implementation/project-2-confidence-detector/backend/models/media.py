@@ -40,6 +40,13 @@ class Media(Base):
     score_avg: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     score_grade: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
 
+    # SHA-256 of the uploaded file bytes. Used to dedupe re-uploads of the
+    # same video — when a hit occurs, the upload handler returns the
+    # existing row's result instead of reprocessing.
+    content_sha256: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+
     # Full session report blob (session mode only). Sidesteps hand-
     # reconstructing the rich report shape the frontend already consumes.
     # media_segments still exists for future queryable analytics.

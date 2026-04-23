@@ -1,125 +1,281 @@
-# Confidence Detector v1.0
+# Confidence Detector v2.0
 
-AI-powered presentation confidence analysis. Get real-time feedback on your eye contact, voice, speech, facial expression, and posture while practicing presentations.
+AI-powered presentation confidence analysis. Three modes:
 
-## What It Does
+1. **Live Practice** — webcam + microphone with real-time confidence scoring
+   and a synced replay after you stop.
+2. **Analyze Recording** — upload a pre-recorded video and get back a full
+   report with a Poised-style playback view (video + live score panel +
+   word-level transcript synced to `video.currentTime`).
+3. **Speech Analyzer** — audio-only analysis, no camera needed.
+4. **Library** — browse and replay every past session.
 
-- **Live Practice:** Webcam + microphone analysis with real-time confidence scoring via WebSocket
-- **Video Upload:** Upload a recorded presentation for full analysis with speech transcription
-- **6 Signal Sources:** Eye contact, voice steadiness, speech pace, filler words, facial tension, posture
-- **Weighted Scoring:** Evidence-based formula with rolling 5-second average
-- **Live Feedback:** Contextual tips like "Maintain eye contact" and "Reduce filler words"
+Scoring uses six signals (eye contact, voice steadiness, speech pace,
+filler words, vocal variety, expression) with a weighted formula and a
+rolling 5-second average.
+
+---
+
+## Prerequisites
+
+| | Requirement | Notes |
+|---|---|---|
+| **OS** | Windows / macOS / Linux | Tested on Windows 11. |
+| **Python** | 3.10+ | 3.10 is what the pinned venv under `detector_env/` uses. |
+| **Node.js** | 18+ | Vite 8 + React 19. |
+| **FFmpeg** | on `PATH` **or** installed via `imageio-ffmpeg` (pulled in by `requirements.txt`) | Used for audio extraction and video re-encoding. |
+| **PostgreSQL** | 15+ | Phase 2 stores media + per-moment analysis in Postgres. |
+
+---
+
+## One-time setup
+
+### 1. Clone and create a Python venv
+
+From the project root (`project-2-confidence-detector/`):
+
+```bash
+# Create the venv
+python -m venv detector_env
+
+# Activate it
+#   Windows PowerShell
+detector_env\Scripts\Activate.ps1
+#   Windows Git Bash / WSL
+source detector_env/Scripts/activate
+#   macOS / Linux
+source detector_env/bin/activate
+
+# Install all Python deps
+pip install -r requirements.txt
+```
+
+### 2. Install and start Postgres
+
+Download Postgres from postgresql.org (use the EDB installer on Windows).
+Remember the `postgres` superuser password you set during install.
+
+Open **SQL Shell (psql)** (or `psql -U postgres` from a terminal) and run:
+
+```sql
+CREATE DATABASE confidence_detector_app;
+\q
+```
+
+Verify you can connect:
+
+```bash
+psql -U postgres -d confidence_detector_app -h localhost
+# type \q to exit
+```
+
+### 3. Create `backend/.env`
+
+Copy the template from the project root and fill in real values:
+
+```bash
+cp .env.example backend/.env
+```
+
+Open `backend/.env` and set at minimum:
+
+```
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=confidence_detector_app
+DB_USER=postgres
+DB_PASSWORD=postgres
+```
+
+(Change the password to whatever you set in Postgres.)
+
+### 4. Apply database migrations
+
+With the venv still active:
+
+```bash
+cd backend
+alembic upgrade head
+cd ..
+```
+
+This creates the `media` and `media_segments` tables. You only need to
+run this again when migrations change — see [backend/README.md](backend/README.md)
+for the day-to-day Alembic workflow.
+
+### 5. Install frontend dependencies
+
+```bash
+cd frontend
+npm install
+cd ..
+```
+
+---
+
+## Run the app
+
+Two terminals, venv active in the backend one.
+
+**Terminal 1 — backend**
+
+```bash
+# With detector_env active, from the project root:
+cd backend
+python main.py
+```
+
+First run preloads the Whisper + Silero VAD models — expect 30–60 s
+before "Application startup complete." appears. Backend listens on
+`http://localhost:8000` (Docs at `/docs`).
+
+**Terminal 2 — frontend**
+
+```bash
+cd frontend
+npm run dev
+```
+
+Vite dev server listens on `http://localhost:5173`.
+
+Open `http://localhost:5173` in Chrome/Edge/Firefox. The four mode cards
+(Live Practice / Analyze Recording / Speech Analyzer / Library) appear
+on the home screen.
+
+---
 
 ## Architecture
 
 ```
 Browser (React + Vite)
-  |
-  |--- GET /api/live -------> MJPEG video stream (OpenCV frames with overlays)
-  |--- WS  /ws/live -------> WebSocket: sends mic audio, receives score JSON every 500ms
-  |--- POST /api/upload ----> Synchronous video analysis, returns full JSON report
-  |
+  │
+  │── WS  /ws/session/{id}  ──── live audio + face scores; receives per-chunk JSON
+  │── POST /api/upload      ──── upload a video, returns full report JSON
+  │── POST /api/analyze-audio ── audio-only analysis
+  │── POST /api/session/upload-video ── saves live-session MediaRecorder blob
+  │── GET  /api/recordings         ── Library list
+  │── GET  /api/recordings/{id}/video ── playback for a past session
+  │── GET  /api/report/{id}        ── full session report
+  │
 FastAPI Backend (Python)
-  |
-  |--- FaceEngine ---------> MediaPipe FaceLandmarker (52 blendshapes) + PoseLandmarker
-  |--- SpeechEngine -------> Vosk STT (filler words, hedges, WPM)
-  |--- AudioAnalyzer ------> NumPy (pitch via autocorrelation, volume RMS, silence gaps)
-  |--- ScoringEngine ------> Weighted formula with rolling average
+  │
+  ├── FaceEngine      ── MediaPipe FaceLandmarker (52 blendshapes) + PoseLandmarker
+  ├── AudioPipeline   ── faster-whisper + Silero VAD + PYIN pitch + acoustic fillers
+  ├── ScoringEngine   ── weighted formula + rolling average + contextual tips
+  ├── SessionRecorder ── directory helpers + Library query (DB-backed)
+  │
+  └── SQLAlchemy 2.0 + Alembic → PostgreSQL
+       ├── media           — one row per media item (+ cached score + report JSONB)
+       └── media_segments  — one row per analysis moment (face / speech / word)
 ```
 
-## Scoring Formula
+Files and segments per media item on disk:
+
+| Mode | What lands on disk |
+|---|---|
+| **Upload** | `backend/uploads/{filename}` (source) + `backend/uploads/web_{upload_id}.mp4` (browser-friendly re-encode with the overlay and the original audio spliced in). **No** evidence JPEGs. |
+| **Live session** | `backend/recordings/{session_id}_video.webm` (MediaRecorder blob). **No** separate audio WAV, **no** report JSON file (both live in Postgres now). |
+| **Analyzer** | Temp file in OS tempdir, deleted after processing. |
+
+---
+
+## Scoring
 
 ```
 Confidence (0-100) =
-  Eye Contact Score      x 0.25 +
-  Voice Steadiness Score x 0.25 +
-  Speech Pace Score      x 0.20 +
-  Filler Word Score      x 0.15 +
-  Facial Tension Score   x 0.10 +
-  Posture Score          x 0.05
+  Voice Steadiness   × 0.22 +
+  Eye Contact        × 0.22 +
+  Speech Pace        × 0.18 +
+  Filler Words       × 0.18 +
+  Vocal Variety      × 0.12 +
+  Expression         × 0.08
 ```
 
-Each sub-score is 0-100. Smoothed with a 5-second rolling average. Updates every 500ms.
+Six sub-scores, each 0–100. Smoothed with a 10-entry rolling window
+(≈5 s at 500 ms updates).
 
-## Run Locally
+---
 
-### Prerequisites
-- Python 3.10+
-- Node.js 18+
-- FFmpeg installed and in PATH
+## Environment variables
 
-### Backend
-```bash
-cd backend
-pip install -r ../requirements.txt
-python main.py
-# API at http://localhost:8000
-# Docs at http://localhost:8000/docs
-```
-
-### Frontend
-```bash
-cd frontend
-npm install
-npm run dev
-# UI at http://localhost:5173
-```
-
-### First Run
-Models (MediaPipe + Vosk) are included in the repo. If missing, run:
-```bash
-bash scripts/download_models.sh backend/
-```
-
-## Deploy with Docker
-
-```bash
-cp .env.example .env
-docker-compose up --build
-# Frontend: http://localhost:5173
-# Backend:  http://localhost:8000
-```
-
-## Deploy on Render
-
-1. Push repo to GitHub
-2. Connect repo on render.com
-3. Render auto-detects `render.yaml` and creates both services
-4. Set environment variables in Render dashboard if needed
-
-## Deploy on Railway
-
-1. Push repo to GitHub
-2. Connect repo on railway.app
-3. Railway auto-detects `railway.json`
-4. Deploy frontend separately as a static site from `frontend/`
-
-## Environment Variables
+Only the database variables are strictly required. Everything else has a
+sensible default.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `8000` | Backend server port |
-| `CORS_ORIGINS` | `*` | Comma-separated allowed origins |
-| `MEDIAPIPE_FACE_MODEL` | `./face_landmarker.task` | Path to face model |
-| `MEDIAPIPE_POSE_MODEL` | `./pose_landmarker.task` | Path to pose model |
-| `VOSK_MODEL_PATH` | `./vosk-model` | Path to Vosk speech model |
+|---|---|---|
+| `DB_HOST` | `localhost` | **Required.** Postgres host. |
+| `DB_PORT` | `5432` | Postgres port. |
+| `DB_NAME` | `confidence_detector_app` | **Required.** Database name. |
+| `DB_USER` | `postgres` | **Required.** DB user. |
+| `DB_PASSWORD` | `postgres` | **Required.** DB password. |
+| `PORT` | `8000` | Backend HTTP port. |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins. |
+| `WHISPER_MODEL` | `distil-small.en` | Any faster-whisper model slug. |
+| `WHISPER_DEVICE` | `auto` | `auto` / `cpu` / `cuda`. |
+| `HF_TOKEN` | *(unset)* | Only needed if you hit HuggingFace download rate limits. |
 
-## API Endpoints
+---
+
+## API endpoints (current)
 
 | Method | Path | Description |
-|--------|------|-------------|
-| GET | `/` | API status |
-| GET | `/health` | Health check (for deployment platforms) |
-| GET | `/api/live` | MJPEG webcam stream |
-| GET | `/api/stop-live` | Release webcam |
-| WS | `/ws/live` | WebSocket: send audio, receive scores |
-| POST | `/api/upload` | Upload video for analysis |
-| GET | `/api/video/{name}` | Serve processed video |
-| GET | `/api/evidence/{name}` | Serve evidence frame |
+|---|---|---|
+| `GET` | `/` | API status. |
+| `GET` | `/health` | Readiness check — `ready: true` once models load. |
+| `POST` | `/api/upload` | Analyse an uploaded video. Returns the full JSON report. |
+| `POST` | `/api/analyze-audio` | Audio-only analysis. Stateless — no DB write. |
+| `WS` | `/ws/session/{session_id}` | Live practice session stream. |
+| `POST` | `/api/session/upload-video` | Save the MediaRecorder blob after a live session. |
+| `GET` | `/api/recordings` | Library list (DB-backed). |
+| `GET` | `/api/recordings/{session_id}/video` | Stream the saved session video. |
+| `GET` | `/api/report/{session_id}` | Full session report (DB-backed). |
+| `GET` | `/api/video/{filename}` | Serve the processed upload mp4. |
 
-## Tech Stack
+Endpoints from v1.0 that no longer exist: `/api/live`, `/api/stop-live`,
+`/ws/live`, `/api/evidence/{filename}`.
 
-- **Backend:** Python, FastAPI, MediaPipe, Vosk, OpenCV, NumPy
-- **Frontend:** React 19, Vite 8
-- **Models:** MediaPipe FaceLandmarker + PoseLandmarker, Vosk small-en-us
-- **All free and open-source — no paid APIs**
+---
+
+## Tech stack
+
+- **Backend:** Python 3.10, FastAPI, SQLAlchemy 2.0, Alembic, psycopg 3,
+  MediaPipe, OpenCV, faster-whisper, Silero VAD, librosa, PyTorch 2.4+.
+- **Database:** PostgreSQL 15+.
+- **Frontend:** React 19, Vite 8, MediaPipe FaceLandmarker (browser-side).
+- **Models:** MediaPipe Face + Pose Landmarker (bundled), faster-whisper
+  `distil-small.en` (downloaded on first run, ~166 MB), Silero VAD
+  (downloaded on first run via `torch.hub`).
+
+All free and open-source. No paid APIs.
+
+---
+
+## Troubleshooting
+
+**Backend won't start — `OperationalError: connection refused`**
+Postgres isn't running, or your `DB_HOST`/`DB_PORT` in `backend/.env`
+are wrong. Start the service: `net start postgresql-x64-17` (Windows) or
+`brew services start postgresql@16` (macOS).
+
+**Alembic error: `Target database is not up to date`**
+Someone added a migration. Run `cd backend && alembic upgrade head`.
+
+**`ModuleNotFoundError: No module named 'db'` when running `alembic`**
+You're running `alembic` from the project root. It needs to run from
+`backend/`. `cd backend` first.
+
+**First upload takes forever**
+The `faster-whisper` model downloads on first use (~166 MB). Subsequent
+uploads are fast.
+
+**`A module that was compiled using NumPy 1.x ...` warning on startup**
+Old torch/torchaudio against new NumPy. Fix: `pip install --upgrade "torch>=2.4" "torchaudio>=2.4"`.
+
+---
+
+## Further docs
+
+- [backend/README.md](backend/README.md) — day-to-day Alembic workflow,
+  endpoint table, project layout, troubleshooting specific to the backend.
+- [AUDIT_REPORT_V2.md](AUDIT_REPORT_V2.md) — full audit + design decisions
+  that shaped the current architecture.

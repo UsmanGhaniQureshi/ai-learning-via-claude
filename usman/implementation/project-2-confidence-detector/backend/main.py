@@ -16,7 +16,9 @@ try:
 except ImportError:
     pass
 
+import base64
 import cv2
+import hashlib
 import time
 import shutil
 import subprocess
@@ -28,7 +30,8 @@ import tempfile
 import numpy as np
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi import Request
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from face_engine import FaceEngine
 from scoring_engine import ScoringEngine, generate_tips
@@ -36,6 +39,8 @@ from audio_pipeline import AudioPipeline, get_whisper, get_vad
 from signal_scorer import SignalScorer
 from session_recorder import list_recordings as _list_session_recordings, RECORDINGS_DIR
 from report_generator import generate_post_session_report
+from sqlalchemy import select
+
 from db import SessionLocal
 from models import Media, MediaSegment
 
@@ -70,6 +75,7 @@ def _persist_media_and_segments(
     face_timeline: list[dict],
     speech_timeline: list[dict],
     report_json: dict | None = None,
+    content_sha256: str | None = None,
 ) -> None:
     """Dual-write helper — called from upload + session paths.
 
@@ -92,6 +98,7 @@ def _persist_media_and_segments(
             score_avg=score_avg,
             score_grade=grade,
             report_json=report_json,
+            content_sha256=content_sha256,
         )
         db.add(media)
         db.flush()
@@ -238,9 +245,29 @@ async def upload_video(file: UploadFile = File(...)):
     audio_extraction_error = None
     video_encode_error = None
 
-    # Save uploaded file with size validation
-    filepath = os.path.join(UPLOAD_DIR, file.filename)
+    # Save uploaded file with size validation AND compute sha256 as we go.
+    #
+    # Store under {upload_id}{safe_ext} rather than the user-supplied
+    # filename. This:
+    #   - prevents two uploads with the same name from overwriting each
+    #     other's source file on disk;
+    #   - closes the path-traversal hole (file.filename is user input and
+    #     could contain "../..");
+    #   - keeps a clean 1:1 relationship between upload_id and stored bytes.
+    # The original filename is preserved in `original_name` (display only).
+    #
+    # The sha256 is stored on the Media row as a content fingerprint for
+    # future analytics (e.g. "you've uploaded this before") but is NOT
+    # used to short-circuit processing — every upload runs the full
+    # pipeline so the user sees a predictable spinner → result flow.
+    original_name = file.filename or "upload"
+    safe_ext = Path(original_name).suffix.lower()
+    # Allow only a small set of suffixes so a nonsense one can't pollute disk.
+    if safe_ext not in {".mp4", ".webm", ".mov", ".m4v", ".mkv", ".avi", ".ogv"}:
+        safe_ext = ".mp4"
+    filepath = os.path.join(UPLOAD_DIR, f"{upload_id}{safe_ext}")
     size = 0
+    hasher = hashlib.sha256()
     with open(filepath, "wb") as f:
         while True:
             chunk = await file.read(1024 * 1024)  # Read 1MB at a time
@@ -251,7 +278,9 @@ async def upload_video(file: UploadFile = File(...)):
                 f.close()
                 os.remove(filepath)
                 return JSONResponse({"error": "File too large (max 500MB)"}, status_code=413)
+            hasher.update(chunk)
             f.write(chunk)
+    content_sha256 = hasher.hexdigest()
 
     # If processing fails mid-way, the saved source file must not linger.
     # A single outer try/except around the full pipeline catches every
@@ -324,6 +353,31 @@ async def upload_video(file: UploadFile = File(...)):
 
             # Log face data at intervals
             if last_result and fc % (int(fps) * 2) == 0:  # every 2 seconds
+                # Capture a tiny base64 JPEG thumbnail from the same frame we
+                # already have in memory. Width 120 px preserves aspect. Embedded
+                # in the response so the frontend renders it instantly via
+                # <img src="data:image/jpeg;base64,..."> — no separate request,
+                # no CORS, no persistent file. ~3-8 KB per thumb.
+                thumb_data_url = None
+                try:
+                    h, w = frame_with_overlay.shape[:2]
+                    thumb_w = 120
+                    thumb_h = max(1, int(h * thumb_w / w))
+                    thumb = cv2.resize(
+                        frame_with_overlay, (thumb_w, thumb_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    ok_enc, buf = cv2.imencode(
+                        ".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 72]
+                    )
+                    if ok_enc:
+                        thumb_data_url = (
+                            "data:image/jpeg;base64,"
+                            + base64.b64encode(buf.tobytes()).decode("ascii")
+                        )
+                except Exception:
+                    thumb_data_url = None
+
                 face_results_by_time.append({
                     'timestamp': round(ts, 1),
                     'time_display': f"{int(ts)//60:02d}:{int(ts)%60:02d}",
@@ -332,6 +386,7 @@ async def upload_video(file: UploadFile = File(...)):
                     'blink_rate': last_result['blink_rate'],
                     'tension_score': last_result.get('tension_score', 0),
                     'face_confidence': last_result['confidence_score'],
+                    'thumb': thumb_data_url,
                 })
 
         cap.release()
@@ -598,29 +653,10 @@ async def upload_video(file: UploadFile = File(...)):
         speech_score = sub_scores.get('filler_words')
         pace_score = sub_scores.get('speech_pace')
 
-        # Phase 2: persist Media + MediaSegment rows. No JSON file fallback —
-        # the DB is the source of truth. Failure here is logged so the
-        # response still returns successfully, but Library + Report endpoints
-        # won't see this upload. Warn loudly in logs.
-        try:
-            _persist_media_and_segments(
-                media_id=upload_id,
-                source_kind="upload",
-                original_name=file.filename,
-                stored_path=file.filename,
-                playback_path=video_serve,
-                duration_s=float(duration),
-                has_video=len(all_face_scores) > 0,
-                has_audio=has_audio,
-                score_avg=overall_score,
-                face_timeline=face_results_by_time,
-                speech_timeline=speech_timeline,
-            )
-        except Exception as e:
-            print(f"[warn] DB dual-write failed for upload {upload_id}: {e}")
-
-        return JSONResponse({
-            'filename': file.filename,
+        # Build the response once so we can both return it AND store it in
+        # Media.report_json for the Library / /api/report/{id} endpoint.
+        response_payload = {
+            'filename': original_name,
             'duration': round(duration, 1),
             'total_frames': total_frames,
             'has_audio': has_audio,
@@ -644,7 +680,31 @@ async def upload_video(file: UploadFile = File(...)):
             'speech_summary': speech_summary,
             'face_timeline': face_results_by_time,
             'speech_timeline': speech_timeline,
-        })
+        }
+
+        # Phase 2: persist Media + MediaSegment rows. Failure here is logged
+        # so the response still returns successfully, but Library + Report
+        # endpoints won't see this upload. Warn loudly in logs.
+        try:
+            _persist_media_and_segments(
+                media_id=upload_id,
+                source_kind="upload",
+                original_name=original_name,
+                stored_path=f"{upload_id}{safe_ext}",
+                playback_path=video_serve,
+                duration_s=float(duration),
+                has_video=len(all_face_scores) > 0,
+                has_audio=has_audio,
+                score_avg=overall_score,
+                face_timeline=face_results_by_time,
+                speech_timeline=speech_timeline,
+                report_json=response_payload,
+                content_sha256=content_sha256,
+            )
+        except Exception as e:
+            print(f"[warn] DB dual-write failed for upload {upload_id}: {e}")
+
+        return JSONResponse(response_payload)
     except Exception:
         # Processing failed mid-way — delete the orphaned source file before
         # re-raising so FastAPI still produces its 500 response.
@@ -655,12 +715,83 @@ async def upload_video(file: UploadFile = File(...)):
         raise
 
 
-@app.get("/api/video/{filename}")
-def serve_video(filename: str):
-    filepath = os.path.join(UPLOAD_DIR, filename)
-    if not os.path.exists(filepath):
+def _serve_with_range(request: Request, path: str, media_type: str):
+    """Serve a file with HTTP Range support so browsers can scrub videos.
+
+    Starlette's FileResponse (<= 0.38.x) ignores Range headers, which makes
+    <video>/<audio> elements unseekable in many browsers. This helper parses
+    the Range header, returns 206 Partial Content with a correct Content-Range,
+    and streams only the requested byte slice.
+    """
+    if not os.path.exists(path):
         return JSONResponse({"error": "Not found"}, status_code=404)
-    return FileResponse(filepath, media_type="video/mp4")
+
+    file_size = os.path.getsize(path)
+    range_header = request.headers.get("range") or request.headers.get("Range")
+
+    # No Range header — full file with Accept-Ranges so the browser knows
+    # it CAN seek and issues a Range request on the next click.
+    if not range_header:
+        def full_iter():
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        return StreamingResponse(
+            full_iter(),
+            media_type=media_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(file_size),
+            },
+        )
+
+    # Parse "bytes=start-end"
+    try:
+        units, _, rng = range_header.partition("=")
+        if units.strip().lower() != "bytes":
+            raise ValueError("unsupported unit")
+        start_s, _, end_s = rng.partition("-")
+        start = int(start_s) if start_s else 0
+        end = int(end_s) if end_s else file_size - 1
+    except Exception:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    if start < 0 or end >= file_size or start > end:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    length = end - start + 1
+
+    def range_iter():
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            chunk_size = 1024 * 1024
+            while remaining > 0:
+                chunk = f.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        range_iter(),
+        status_code=206,
+        media_type=media_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+            "Content-Length": str(length),
+        },
+    )
+
+
+@app.get("/api/video/{filename}")
+def serve_video(filename: str, request: Request):
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    return _serve_with_range(request, filepath, media_type="video/mp4")
 
 
 # ============================================================
@@ -828,28 +959,46 @@ async def analyze_audio_file(
     """
     Accepts any audio file (WAV, MP3, M4A, WebM, OGG).
     Runs full speech intelligence pipeline.
-    Returns identical report to a live session.
-    No camera. No WebSocket. Fully standalone.
+    Persists a Media row (source_kind='analyzer_audio') so the Library
+    lists this analysis alongside uploads and live sessions. The audio
+    file itself is saved to RECORDINGS_DIR for later playback.
     """
     import librosa
 
-    session_id = str(uuid.uuid4())[:8]
-    suffix = Path(audio_file.filename).suffix or ".webm"
-    tmp = Path(tempfile.gettempdir()) / f"analyze_{session_id}{suffix}"
+    media_id = f"analyzer_{uuid.uuid4().hex[:8]}"
+    suffix = Path(audio_file.filename or "recording.webm").suffix or ".webm"
+    saved_name = f"{media_id}{suffix}"
+    saved_path = RECORDINGS_DIR / saved_name
 
-    with open(tmp, "wb") as f:
-        shutil.copyfileobj(audio_file.file, f)
+    # Stream to disk, computing sha256 as a content fingerprint for the row.
+    hasher = hashlib.sha256()
+    with open(saved_path, "wb") as f:
+        while True:
+            chunk_bytes = await audio_file.read(1024 * 1024)
+            if not chunk_bytes:
+                break
+            hasher.update(chunk_bytes)
+            f.write(chunk_bytes)
+    content_sha256 = hasher.hexdigest()
+
+    # Every analyzer run is processed fresh. sha256 is stored on the row
+    # as a fingerprint (see upload_video for rationale) but NOT used to
+    # short-circuit — predictable spinner → result is preferred over the
+    # "sometimes instant" dedup behaviour.
 
     try:
         # Load + resample to 16kHz mono (librosa handles any format)
-        audio, _ = librosa.load(str(tmp), sr=16000, mono=True)
+        audio, _ = librosa.load(str(saved_path), sr=16000, mono=True)
     except Exception as e:
+        # Processing couldn't start — remove the saved file, no DB row.
+        try:
+            saved_path.unlink()
+        except OSError:
+            pass
         return JSONResponse(
             {"error": f"Could not load audio file: {str(e)}"},
             status_code=400,
         )
-    finally:
-        tmp.unlink(missing_ok=True)
 
     # Split into 3s chunks (same as live pipeline)
     chunk_size = 16000 * 3
@@ -871,12 +1020,76 @@ async def analyze_audio_file(
         result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
         snapshots.append(result)
 
-    report = generate_post_session_report(snapshots, session_id)
+    report = generate_post_session_report(snapshots, media_id)
     report["source"] = "file_upload"
     report["filename"] = audio_file.filename
     report["note"] = "Eye contact and expression scores not available for audio-only files."
+    report["recording"] = {
+        "media_id": media_id,
+        "audio_url": f"/api/analyzer/{media_id}/audio",
+    }
+
+    # Build timelines so Library listings + report retrieval round-trip.
+    speech_tl = []
+    for i, s in enumerate(snapshots):
+        chunk_offset_ms = i * 3000
+        speech_tl.append({
+            "timestamp": i * 3,
+            "text": s.get("transcript_text", ""),
+            "fillers": s.get("raw", {}).get("lexical_fillers", []),
+            "hedges": [],
+            "speech_score": s["scores"].get("speech_pace", 50),
+            "words": [
+                {
+                    "word": w.get("word"),
+                    "start_ms": int(w.get("start_ms", 0) + chunk_offset_ms),
+                    "end_ms": int(w.get("end_ms", 0) + chunk_offset_ms),
+                    "is_filler": bool(w.get("is_filler")),
+                }
+                for w in s.get("transcript_words", [])
+            ],
+        })
+
+    try:
+        _persist_media_and_segments(
+            media_id=media_id,
+            source_kind="analyzer_audio",
+            original_name=audio_file.filename,
+            stored_path=saved_name,
+            playback_path=saved_name,
+            duration_s=float(report.get("duration_s") or (len(snapshots) * 3)),
+            has_video=False,
+            has_audio=True,
+            score_avg=report.get("avg_score"),
+            face_timeline=[],  # no face rows for audio-only
+            speech_timeline=speech_tl,
+            report_json=report,
+            content_sha256=content_sha256,
+        )
+    except Exception as e:
+        print(f"[warn] analyzer DB persist failed for {media_id}: {e}")
 
     return report
+
+
+@app.get("/api/analyzer/{media_id}/audio")
+def get_analyzer_audio(media_id: str, request: Request):
+    """Serve the saved analyzer audio by media_id. Suffix-agnostic:
+    finds whichever file starts with the id in the recordings dir."""
+    matches = list(RECORDINGS_DIR.glob(f"{media_id}.*"))
+    if not matches:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    path = matches[0]
+    # Best-effort MIME — browsers handle most audio/* types via HTMLAudioElement.
+    suffix = path.suffix.lower()
+    mime = {
+        ".webm": "audio/webm",
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg",
+    }.get(suffix, "application/octet-stream")
+    return _serve_with_range(request, str(path), media_type=mime)
 
 
 @app.post("/api/session/upload-video")
@@ -916,11 +1129,9 @@ def list_recordings():
 
 
 @app.get("/api/recordings/{session_id}/video")
-def get_recording_video(session_id: str):
+def get_recording_video(session_id: str, request: Request):
     path = RECORDINGS_DIR / f"{session_id}_video.webm"
-    if not path.exists():
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return FileResponse(str(path), media_type="video/webm")
+    return _serve_with_range(request, str(path), media_type="video/webm")
 
 
 @app.get("/api/report/{session_id}")

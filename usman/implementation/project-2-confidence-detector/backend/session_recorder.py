@@ -1,9 +1,9 @@
 """
 Session recording directory + Library read helpers.
 
-Phase 2: Library now reads from the `media` table, not from disk
-enumeration. Still exposes RECORDINGS_DIR because the WEBM + report JSON
-files still land there (until Phase 2 Step 11 stops writing the report).
+Library queries the `media` table — sessions, uploads, and analyzer audio
+all land in Postgres, so all three kinds surface here. URL fields are
+computed per source_kind so the frontend can just use them directly.
 """
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,24 +29,23 @@ def _parse_started_at(session_id: str):
 
 
 def list_recordings():
-    """Return Library entries from the media table.
+    """Return every Media row as a Library entry.
 
-    Only sessions (source_kind = 'session') show up in the Library today —
-    upload-mode analyses aren't the same UX. If we later want them in
-    Library too, remove the where-clause below.
+    Per-kind URL wiring:
+      - session        → video served from RECORDINGS_DIR via /api/recordings/{id}/video
+      - upload         → video served from UPLOAD_DIR via /api/video/{playback_path}
+      - analyzer_audio → audio served via /api/analyzer/{id}/audio
     """
     with SessionLocal() as db:
         rows = db.execute(
-            select(Media)
-            .where(Media.source_kind == "session")
-            .order_by(Media.created_at.desc())
+            select(Media).order_by(Media.created_at.desc())
         ).scalars().all()
 
-        return [
-            {
+        entries = []
+        for m in rows:
+            entry = {
                 "session_id": m.id,
-                # Prefer DB created_at; fall back to parsing the session_id
-                # for rows imported from Phase 1 JSON (no created_at set).
+                "kind": m.source_kind,
                 "started_at": (
                     m.created_at.isoformat() if m.created_at
                     else _parse_started_at(m.id)
@@ -55,9 +54,19 @@ def list_recordings():
                 "score": m.score_avg,
                 "grade": m.score_grade,
                 "has_video": bool(m.has_video),
-                "has_report": True,  # If the media row exists, the report does too.
-                "video_url": f"/api/recordings/{m.id}/video",
+                "has_audio": bool(m.has_audio),
+                "has_report": m.report_json is not None,
                 "report_url": f"/api/report/{m.id}",
+                "original_name": m.original_name,
+                "video_url": None,
+                "audio_url": None,
             }
-            for m in rows
-        ]
+            if m.source_kind == "session":
+                entry["video_url"] = f"/api/recordings/{m.id}/video"
+            elif m.source_kind == "upload" and m.playback_path:
+                entry["video_url"] = f"/api/video/{m.playback_path}"
+            elif m.source_kind == "analyzer_audio":
+                entry["audio_url"] = f"/api/analyzer/{m.id}/audio"
+
+            entries.append(entry)
+        return entries

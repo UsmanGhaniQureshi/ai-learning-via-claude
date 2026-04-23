@@ -127,10 +127,12 @@ const PlaybackReview = forwardRef(function PlaybackReview(
       <div className="pb-grid">
         <div className="pb-video-wrap">
           <video
+            key={processedVideo}
             ref={videoRef}
             src={`${API_BASE}/api/video/${processedVideo}`}
             controls
             playsInline
+            preload="auto"
             className="processed-video"
             style={{ width: '100%', borderRadius: 8 }}
           />

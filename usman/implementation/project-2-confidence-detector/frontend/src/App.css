@@ -253,6 +253,16 @@ header p { color: #888; margin-top: 5px; }
 .timeline-section h3 { color: #7c4dff; margin-bottom: 12px; }
 .timeline-card {
   background: #151520; border-radius: 8px; padding: 14px; margin-bottom: 10px;
+  display: block; width: 100%; text-align: left;
+  border: 1px solid transparent; color: inherit; cursor: pointer;
+  font-family: inherit; font-size: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.timeline-card:hover {
+  background: #1c1c28; border-color: #333;
+}
+.timeline-open-hint {
+  margin-left: auto; color: #7c4dff; font-size: 0.85rem; font-weight: 600;
 }
 .timeline-top {
   display: flex; gap: 15px; align-items: center; margin-bottom: 8px; flex-wrap: wrap;
@@ -750,6 +760,107 @@ header p { color: #888; margin-top: 5px; }
   padding: 16px; background: #222; color: #888;
   border-radius: 8px; margin-top: 8px; text-align: center;
 }
+.history-kind {
+  background: #22222e; color: #7c4dff;
+  font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 8px; border-radius: 4px;
+}
+.history-name {
+  color: #888; font-size: 0.82rem;
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
 @media (min-width: 720px) {
   .history-grid { grid-template-columns: 1fr 1fr; }
+}
+
+/* Timeline Modal */
+.tm-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+  animation: tm-fade-in 0.15s ease-out;
+}
+@keyframes tm-fade-in {
+  from { opacity: 0; } to { opacity: 1; }
+}
+.tm-panel {
+  background: #151520; border: 1px solid #333; border-radius: 12px;
+  width: 100%; max-width: 1100px; max-height: 90vh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  animation: tm-slide-in 0.18s ease-out;
+}
+@keyframes tm-slide-in {
+  from { transform: translateY(12px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.tm-header {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 16px 20px;
+  border-bottom: 1px solid #2a2a3a; background: #0f0f18;
+}
+.tm-header-info {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  color: #fff; font-size: 1.05rem;
+}
+.tm-tag {
+  color: #aaa; font-size: 0.8rem;
+  background: #22222e; border-radius: 4px;
+  padding: 2px 8px;
+}
+.tm-tag-score { color: #7c4dff; font-weight: 600; }
+.tm-close {
+  background: transparent; border: none; color: #888;
+  font-size: 1.75rem; line-height: 1; cursor: pointer;
+  padding: 0 6px;
+}
+.tm-close:hover { color: #fff; }
+
+.tm-body {
+  display: grid; grid-template-columns: 1fr;
+  gap: 16px; padding: 16px 20px; overflow: auto;
+}
+.tm-video-wrap {
+  background: #000; border-radius: 8px; overflow: hidden;
+  position: relative;
+}
+.tm-video { width: 100%; display: block; }
+.tm-replay {
+  position: absolute; right: 12px; bottom: 56px;
+  background: rgba(124, 77, 255, 0.92); color: #fff;
+  border: none; border-radius: 6px;
+  padding: 8px 14px; font-size: 0.9rem; font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+.tm-replay:hover { background: #7c4dff; }
+
+.tm-words-pane {
+  background: #0f0f18; border: 1px solid #2a2a3a;
+  border-radius: 10px; padding: 14px 16px;
+  min-height: 180px;
+}
+.tm-words-label {
+  color: #888; font-size: 0.75rem; text-transform: uppercase;
+  letter-spacing: 0.08em; margin-bottom: 10px;
+}
+.tm-words {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  color: #ccc; font-size: 0.95rem; line-height: 1.6;
+}
+.tm-word {
+  padding: 2px 6px; border-radius: 4px;
+  background: #22222e;
+}
+.tm-word-filler {
+  color: #ff6d00; font-style: italic;
+  background: rgba(255, 109, 0, 0.15);
+}
+.tm-empty { color: #666; font-size: 0.9rem; font-style: italic; margin: 0; }
+
+@media (min-width: 820px) {
+  .tm-body { grid-template-columns: 2fr 1fr; }
 }

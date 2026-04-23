@@ -5,7 +5,7 @@ import ScoreGauge from './components/ScoreGauge'
 import SignalBars from './components/SignalBars'
 import FeedbackTips from './components/FeedbackTips'
 import PlaybackReview from './components/PlaybackReview'
-import useTimelineThumbnails from './components/TimelineThumbnails'
+import TimelineModal from './components/TimelineModal'
 import LiveSession from './pages/LiveSession'
 import Analyzer from './pages/Analyzer'
 import History from './pages/History'
@@ -17,16 +17,19 @@ function App() {
   })
   const [uploading, setUploading] = useState(false)
   const [results, setResults] = useState(null)
+  const [modalEntry, setModalEntry] = useState(null)
   const playbackRef = useRef(null)
 
-  // Client-side thumbnails for the Face Timeline. Captures frames from
-  // the already-loaded processed video — no backend call, no disk files.
-  const faceTimeline = results?.face_timeline || []
-  const timelineThumbs = useTimelineThumbnails(
-    results?.processed_video
-      ? `${API_BASE}/api/video/${results.processed_video}`
-      : null,
-    faceTimeline.map((e) => e.timestamp),
+  // Thumbnails come pre-baked inside face_timeline entries (entry.thumb is
+  // a data-URL JPEG generated server-side at upload time).
+  const processedVideoUrl = results?.processed_video
+    ? `${API_BASE}/api/video/${results.processed_video}`
+    : null
+
+  // Flatten every transcribed word across all chunks (already in absolute
+  // timestamps from the backend) so the modal can filter by time window.
+  const allWords = (results?.speech_timeline || []).flatMap(
+    (chunk) => chunk.words || []
   )
 
   const handleBack = () => {
@@ -251,11 +254,18 @@ function App() {
                 <div className="timeline-section">
                   <h3>Timeline — Confidence Over Time</h3>
                   {results.face_timeline.map((entry, i) => (
-                    <div key={i} className="timeline-card" style={{ borderLeft: `4px solid ${scoreColor(entry.face_confidence)}` }}>
+                    <button
+                      key={i}
+                      type="button"
+                      className="timeline-card"
+                      style={{ borderLeft: `4px solid ${scoreColor(entry.face_confidence)}` }}
+                      onClick={() => setModalEntry(entry)}
+                      title={`Open ${entry.time_display} window`}
+                    >
                       <div className="timeline-top">
-                        {timelineThumbs[entry.timestamp] ? (
+                        {entry.thumb ? (
                           <img
-                            src={timelineThumbs[entry.timestamp]}
+                            src={entry.thumb}
                             alt={`Frame at ${entry.time_display}`}
                             className="timeline-thumb"
                           />
@@ -268,15 +278,9 @@ function App() {
                           Face: {entry.face_confidence}/100
                         </span>
                         <span className="eye-contact">Eye: {entry.eye_contact_pct}%</span>
-                        <button
-                          className="timeline-jump"
-                          onClick={() => playbackRef.current?.seekTo(entry.timestamp)}
-                          title={`Jump video to ${entry.time_display}`}
-                        >
-                          ▶ Jump
-                        </button>
+                        <span className="timeline-open-hint">▶ Open</span>
                       </div>
-                    </div>
+                    </button>
                   ))}
                 </div>
               )}
@@ -284,6 +288,18 @@ function App() {
               <button className="upload-another" onClick={() => setResults(null)}>
                 Analyze Another Video
               </button>
+
+              {modalEntry && processedVideoUrl && (
+                <TimelineModal
+                  videoUrl={processedVideoUrl}
+                  startTime={modalEntry.timestamp}
+                  duration={2}
+                  words={allWords}
+                  expression={modalEntry.expression}
+                  score={modalEntry.face_confidence}
+                  onClose={() => setModalEntry(null)}
+                />
+              )}
             </div>
           )}
         </div>

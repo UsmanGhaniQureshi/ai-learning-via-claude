@@ -3,10 +3,15 @@ import SessionReport from '../components/SessionReport'
 import { API_BASE } from '../config'
 
 /**
- * Library page — lists past sessions and lets the user replay any of them.
- * Source of truth: GET /api/recordings (returns the schema produced by
- * SessionAudioRecorder.list_recordings).
+ * Library page — lists every Media row: live sessions, uploaded videos,
+ * and analyzer audio runs. Source of truth: GET /api/recordings.
  */
+const KIND_LABEL = {
+  session: 'Live session',
+  upload: 'Uploaded video',
+  analyzer_audio: 'Analyzer audio',
+}
+
 export default function History() {
   const [sessions, setSessions] = useState([])
   const [loading, setLoading] = useState(true)
@@ -103,11 +108,13 @@ export default function History() {
             <div key={s.session_id} className="history-card">
               <div className="history-card-header">
                 <strong>{formatDate(s.started_at)}</strong>
+                <span className="history-kind">{KIND_LABEL[s.kind] || s.kind}</span>
                 <span>Duration: {formatDuration(s.duration_s)}</span>
                 <span>Score: {s.score ?? '—'}</span>
+                {s.original_name && <span title={s.original_name} className="history-name">{s.original_name}</span>}
               </div>
 
-              {s.has_video ? (
+              {s.video_url ? (
                 <video
                   src={`${API_BASE}${s.video_url}`}
                   controls
@@ -116,15 +123,19 @@ export default function History() {
                   className="processed-video"
                   style={{ width: '100%', borderRadius: 8, marginTop: 8 }}
                 />
+              ) : s.audio_url ? (
+                <audio
+                  src={`${API_BASE}${s.audio_url}`}
+                  controls
+                  preload="metadata"
+                  style={{ width: '100%', marginTop: 8 }}
+                />
               ) : (
-                <div className="history-no-video" style={{
-                  padding: 16,
-                  background: '#222',
-                  color: '#888',
-                  borderRadius: 8,
-                  marginTop: 8,
-                  textAlign: 'center',
-                }}>video missing</div>
+                <div className="history-no-video">
+                  {s.has_video === false && s.has_audio === false
+                    ? 'media missing'
+                    : 'no playable file'}
+                </div>
               )}
 
               <button
