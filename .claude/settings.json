@@ -187,7 +187,8 @@
       "Bash(\"../detector_env/Scripts/python\" -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); ast.parse\\(open\\('session_recorder.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(\"detector_env/Scripts/python\" -c \"import starlette; print\\('starlette', starlette.__version__\\)\")",
       "Bash(detector_env/Scripts/python -c ' *)",
-      "Bash(\"../detector_env/Scripts/python\" -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(\"../detector_env/Scripts/python\" -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(node -e ' *)"
     ],
     "additionalDirectories": [
       "\\dev",

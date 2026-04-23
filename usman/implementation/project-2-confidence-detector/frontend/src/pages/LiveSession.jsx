@@ -1,9 +1,10 @@
+import { useEffect, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import useLiveSession from '../hooks/useLiveSession'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
 import FeedbackTips from '../components/FeedbackTips'
 import SessionGraph from '../components/SessionGraph'
-import SessionReport from '../components/SessionReport'
 
 function formatDuration(s) {
   const m = Math.floor(s / 60)
@@ -14,11 +15,21 @@ function formatDuration(s) {
 export default function LiveSession() {
   const {
     sessionState, videoRef, scores, transcript, tips, report, error,
-    scoreHistory, duration, faceScores, videoUrl, remoteVideoUrl,
-    startSession, stopSession, resetSession,
+    scoreHistory, duration, faceScores,
+    startSession, stopSession,
   } = useLiveSession()
 
-  const previewUrl = videoUrl || remoteVideoUrl
+  const navigate = useNavigate()
+  const navigatedRef = useRef(false)
+
+  // Once the report arrives, redirect to /result/:id. useRef guard so the
+  // navigation only fires once even if the effect re-runs.
+  useEffect(() => {
+    if (sessionState === 'report' && report?.session_id && !navigatedRef.current) {
+      navigatedRef.current = true
+      navigate(`/result/${report.session_id}`, { replace: true })
+    }
+  }, [sessionState, report, navigate])
 
   // Map backend session scores to SignalBars format
   const barScores = scores
@@ -33,25 +44,6 @@ export default function LiveSession() {
     : null
 
   const totalScore = scores?.total ?? 50
-
-  const handleDownloadReport = () => {
-    if (!report) return
-    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `session_report_${report.session_id || 'unknown'}.json`
-    a.click()
-    URL.revokeObjectURL(url)
-  }
-
-  const handleCopyTranscript = () => {
-    if (!report?.transcript) return
-    const text = report.transcript
-      .map((w) => (w.is_filler ? `(${w.word})` : w.word))
-      .join(' ')
-    navigator.clipboard.writeText(text)
-  }
 
   return (
     <div className="live-session-container">
@@ -165,26 +157,12 @@ export default function LiveSession() {
         </div>
       )}
 
-      {/* REPORT STATE — Post-session analysis */}
-      {sessionState === 'report' && report && (
-        <div className="session-report-wrap">
-          {previewUrl && (
-            <video
-              src={previewUrl}
-              controls
-              playsInline
-              className="processed-video"
-              style={{ width: '100%', marginBottom: 16, borderRadius: 8 }}
-            />
-          )}
-          <SessionReport
-            report={report}
-            onDownloadJSON={handleDownloadReport}
-            onCopyTranscript={handleCopyTranscript}
-          />
-          <button className="start-session-btn" onClick={resetSession}>
-            Start New Session
-          </button>
+      {/* REPORT STATE — navigation handled by useEffect above; render a
+          brief loader while the redirect to /result/:id happens. */}
+      {sessionState === 'report' && (
+        <div className="session-starting">
+          <div className="spinner"></div>
+          <p>Opening your session report…</p>
         </div>
       )}
     </div>

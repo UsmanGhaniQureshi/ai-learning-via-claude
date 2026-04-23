@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import SessionReport from '../components/SessionReport'
+import { Link } from 'react-router-dom'
 import { API_BASE } from '../config'
 
 /**
@@ -16,9 +16,6 @@ export default function History() {
   const [sessions, setSessions] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [expandedId, setExpandedId] = useState(null)
-  const [expandedReport, setExpandedReport] = useState(null)
-  const [reportError, setReportError] = useState(null)
 
   useEffect(() => {
     let cancelled = false
@@ -41,27 +38,6 @@ export default function History() {
     load()
     return () => { cancelled = true }
   }, [])
-
-  const handleExpand = async (session) => {
-    if (expandedId === session.session_id) {
-      setExpandedId(null)
-      setExpandedReport(null)
-      setReportError(null)
-      return
-    }
-    setExpandedId(session.session_id)
-    setExpandedReport(null)
-    setReportError(null)
-    if (!session.has_report) return
-    try {
-      const res = await fetch(`${API_BASE}${session.report_url}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setExpandedReport(data)
-    } catch (e) {
-      setReportError(e.message || 'Failed to load report')
-    }
-  }
 
   const formatDate = (iso) => {
     if (!iso) return 'Unknown date'
@@ -102,65 +78,51 @@ export default function History() {
       <p className="subtitle">Past recording sessions, newest first.</p>
 
       <div className="history-grid">
-        {sessions.map((s) => {
-          const isOpen = expandedId === s.session_id
-          return (
-            <div key={s.session_id} className="history-card">
-              <div className="history-card-header">
-                <strong>{formatDate(s.started_at)}</strong>
-                <span className="history-kind">{KIND_LABEL[s.kind] || s.kind}</span>
-                <span>Duration: {formatDuration(s.duration_s)}</span>
-                <span>Score: {s.score ?? '—'}</span>
-                {s.original_name && <span title={s.original_name} className="history-name">{s.original_name}</span>}
-              </div>
-
-              {s.video_url ? (
-                <video
-                  src={`${API_BASE}${s.video_url}`}
-                  controls
-                  preload="metadata"
-                  playsInline
-                  className="processed-video"
-                  style={{ width: '100%', borderRadius: 8, marginTop: 8 }}
-                />
-              ) : s.audio_url ? (
-                <audio
-                  src={`${API_BASE}${s.audio_url}`}
-                  controls
-                  preload="metadata"
-                  style={{ width: '100%', marginTop: 8 }}
-                />
-              ) : (
-                <div className="history-no-video">
-                  {s.has_video === false && s.has_audio === false
-                    ? 'media missing'
-                    : 'no playable file'}
-                </div>
-              )}
-
-              <button
-                className="report-btn"
-                style={{ marginTop: 8 }}
-                onClick={() => handleExpand(s)}
-              >
-                {isOpen ? 'Hide report' : 'Show report'}
-              </button>
-
-              {isOpen && expandedReport && (
-                <SessionReport report={expandedReport} showRecording={false} />
-              )}
-              {isOpen && !expandedReport && s.has_report && !reportError && (
-                <p>Loading report…</p>
-              )}
-              {isOpen && !s.has_report && (
-                <p>No report saved for this session.</p>
-              )}
-              {isOpen && reportError && (
-                <p className="session-error">Failed to load report: {reportError}</p>
+        {sessions.map((s) => (
+          <div key={s.session_id} className="history-card">
+            <div className="history-card-header">
+              <strong>{formatDate(s.started_at)}</strong>
+              <span className="history-kind">{KIND_LABEL[s.kind] || s.kind}</span>
+              <span>Duration: {formatDuration(s.duration_s)}</span>
+              <span>Score: {s.score ?? '—'}</span>
+              {s.original_name && (
+                <span title={s.original_name} className="history-name">{s.original_name}</span>
               )}
             </div>
-          )
-        })}
+
+            {s.video_url ? (
+              <video
+                src={`${API_BASE}${s.video_url}`}
+                controls
+                preload="metadata"
+                playsInline
+                className="processed-video"
+                style={{ width: '100%', borderRadius: 8, marginTop: 8 }}
+              />
+            ) : s.audio_url ? (
+              <audio
+                src={`${API_BASE}${s.audio_url}`}
+                controls
+                preload="metadata"
+                style={{ width: '100%', marginTop: 8 }}
+              />
+            ) : (
+              <div className="history-no-video">
+                {s.has_video === false && s.has_audio === false
+                  ? 'media missing'
+                  : 'no playable file'}
+              </div>
+            )}
+
+            <Link
+              to={`/result/${s.session_id}`}
+              className="report-btn"
+              style={{ marginTop: 8, display: 'inline-block', textAlign: 'center' }}
+            >
+              View Result →
+            </Link>
+          </div>
+        ))}
       </div>
     </div>
   )

@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react'
-import SessionReport from '../components/SessionReport'
+import { useNavigate } from 'react-router-dom'
 import { AnalyzerRecorder } from '../components/AnalyzerRecorder'
 import { API_BASE } from '../config'
 
@@ -8,15 +8,28 @@ const API = API_BASE
 /**
  * Standalone Speech Analyzer page.
  * No camera needed. Upload audio or record directly.
+ *
+ * On completion, navigates to /result/:media_id — the analysis result has
+ * its own canonical URL and lives in the Library like every other run.
+ *
  * Route: /analyzer
  */
 export default function Analyzer() {
-  const [mode, setMode] = useState(null) // null | 'uploading' | 'recording' | 'analyzing' | 'done'
-  const [report, setReport] = useState(null)
+  const [mode, setMode] = useState(null) // null | 'recording' | 'analyzing'
   const [error, setError] = useState(null)
   const [recordingTime, setRecordingTime] = useState(0)
   const recorderRef = useRef(null)
   const timerRef = useRef(null)
+  const navigate = useNavigate()
+
+  const goToResult = (mediaId) => {
+    if (!mediaId) {
+      setError('Server did not return a media id')
+      setMode(null)
+      return
+    }
+    navigate(`/result/${mediaId}`)
+  }
 
   // ── File Upload ───────────────────────────────────────────
   const handleFileUpload = async (e) => {
@@ -24,7 +37,6 @@ export default function Analyzer() {
     if (!file) return
     setMode('analyzing')
     setError(null)
-    setReport(null)
 
     const formData = new FormData()
     formData.append('audio_file', file)
@@ -37,8 +49,7 @@ export default function Analyzer() {
         throw new Error(err.error || `HTTP ${res.status}`)
       }
       const data = await res.json()
-      setReport(data)
-      setMode('done')
+      goToResult(data.media_id)
     } catch (err) {
       setError(err.message)
       setMode(null)
@@ -77,39 +88,11 @@ export default function Analyzer() {
 
     try {
       const data = await recorder.analyze(blob, 'recording')
-      setReport(data)
-      setMode('done')
+      goToResult(data.media_id)
     } catch (err) {
       setError(err.message)
       setMode(null)
     }
-  }
-
-  // ── Report actions ────────────────────────────────────────
-  const handleDownloadJSON = () => {
-    if (!report) return
-    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `speech_report_${report.session_id || 'unknown'}.json`
-    a.click()
-    URL.revokeObjectURL(url)
-  }
-
-  const handleCopyTranscript = () => {
-    if (!report?.transcript) return
-    const text = report.transcript
-      .map(w => w.is_filler ? `(${w.word})` : w.word)
-      .join(' ')
-    navigator.clipboard.writeText(text)
-  }
-
-  const resetAnalyzer = () => {
-    setMode(null)
-    setReport(null)
-    setError(null)
-    setRecordingTime(0)
   }
 
   const formatTime = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
@@ -162,20 +145,6 @@ export default function Analyzer() {
           <p>Analyzing speech...</p>
           <p className="small">Running VAD, pitch analysis, transcription, and scoring</p>
         </div>
-      )}
-
-      {/* Report */}
-      {mode === 'done' && report && (
-        <>
-          <SessionReport
-            report={report}
-            onDownloadJSON={handleDownloadJSON}
-            onCopyTranscript={handleCopyTranscript}
-          />
-          <button className="upload-another" onClick={resetAnalyzer}>
-            Analyze Another
-          </button>
-        </>
       )}
     </div>
   )

@@ -656,6 +656,7 @@ async def upload_video(file: UploadFile = File(...)):
         # Build the response once so we can both return it AND store it in
         # Media.report_json for the Library / /api/report/{id} endpoint.
         response_payload = {
+            'media_id': upload_id,
             'filename': original_name,
             'duration': round(duration, 1),
             'total_frames': total_frames,
@@ -1021,6 +1022,7 @@ async def analyze_audio_file(
         snapshots.append(result)
 
     report = generate_post_session_report(snapshots, media_id)
+    report["media_id"] = media_id
     report["source"] = "file_upload"
     report["filename"] = audio_file.filename
     report["note"] = "Eye contact and expression scores not available for audio-only files."
@@ -1136,17 +1138,20 @@ def get_recording_video(session_id: str, request: Request):
 
 @app.get("/api/report/{session_id}")
 def get_session_report(session_id: str):
-    """Get a saved session report by session ID.
+    """Get a saved media report by its id.
 
-    Phase 2: reads from Media.report_json in Postgres. The per-session
-    JSON file still exists on disk as a dual-write backup but is not
-    consulted — DB is the source of truth now.
+    Returns the stored Media.report_json payload, spread at the top level,
+    with `kind` and `media_id` added so the /result/:id frontend can branch
+    between upload / session / analyzer_audio shapes without sniffing.
     """
     with SessionLocal() as db:
         media = db.get(Media, session_id)
         if media is None or media.report_json is None:
             return JSONResponse({"error": "Report not found"}, status_code=404)
-        return media.report_json
+        payload = dict(media.report_json)
+        payload["kind"] = media.source_kind
+        payload["media_id"] = media.id
+        return payload
 
 
 if __name__ == "__main__":
