@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { API_BASE } from '../config'
+import { API_BASE, apiFetch } from '../config'
 import LiveAnalyzer from './LiveAnalyzer'
 
 /**
@@ -30,7 +30,7 @@ export default function Analyzer() {
     formData.append('session_label', file.name)
 
     try {
-      const res = await fetch(`${API_BASE}/api/analyze-audio`, {
+      const res = await apiFetch(`${API_BASE}/api/analyze-audio`, {
         method: 'POST',
         body: formData,
       })

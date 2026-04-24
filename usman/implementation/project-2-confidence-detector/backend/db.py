@@ -31,10 +31,27 @@ def _build_database_url() -> str:
 DATABASE_URL = _build_database_url()
 
 # echo=False keeps SQL out of stdout by default. Flip to True for debugging.
-# pool_pre_ping=True tests the connection on checkout so a dropped Postgres
-# (e.g. server restart) produces a reconnect instead of a silent error on
-# the next query.
-engine = create_engine(DATABASE_URL, echo=False, future=True, pool_pre_ping=True)
+#
+# Pool tuning:
+#   pool_pre_ping=True   — validate each checkout so a restarted Postgres
+#                          produces a reconnect, not a 500 on next query.
+#   pool_size=20         — default 5 was tight: upload + WS + face POSTs +
+#                          /api/report all want connections concurrently,
+#                          so 5 ran hot fast.
+#   max_overflow=20      — short bursts (e.g. WS disconnect storm) get
+#                          temporary slots above pool_size without failing.
+#   pool_recycle=1800    — recycle connections every 30 min so long-lived
+#                          idle sockets don't get dropped by the network
+#                          or by Postgres's own idle-transaction timeout.
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True,
+    pool_size=20,
+    max_overflow=20,
+    pool_recycle=1800,
+)
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 

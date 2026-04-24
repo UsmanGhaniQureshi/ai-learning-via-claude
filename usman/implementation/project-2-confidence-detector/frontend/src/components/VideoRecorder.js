@@ -2,7 +2,7 @@
  * SessionVideoRecorder — records video+audio from a MediaStream.
  * Reuses the SAME stream used for live camera feed.
  */
-import { API_BASE } from '../config'
+import { API_BASE, apiFetch } from '../config'
 
 export class SessionVideoRecorder {
   constructor() {
@@ -49,7 +49,7 @@ export class SessionVideoRecorder {
     const formData = new FormData()
     formData.append('video', this.blob, `${sessionId}_video.webm`)
     formData.append('session_id', sessionId)
-    const res = await fetch(`${API_BASE}/api/session/upload-video`, {
+    const res = await apiFetch(`${API_BASE}/api/session/upload-video`, {
       method: 'POST',
       body: formData,
     })

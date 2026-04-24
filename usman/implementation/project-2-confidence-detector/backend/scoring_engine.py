@@ -3,25 +3,40 @@ import time
 from collections import deque
 
 
-# Unified weights — matches signal_scorer.py (V2 specification)
+# Unified weights — matches signal_scorer.py.
+#
+# Expression is deliberately excluded from the aggregate. The mapping
+# {happy 90, speaking 80, focused 70, neutral 60, surprised 40, sad 30,
+# angry 20} is arbitrary and culturally biased — a neutral-faced user
+# and a smiling user of otherwise equal confidence got scores 30 points
+# apart. Keep the signal in the UI for awareness, but don't let it move
+# the headline number. The remaining 5 weights sum to 1.0 after
+# redistributing the old 0.08 expression weight proportionally.
 WEIGHTS = {
-    'voice_steadiness': 0.22,
-    'eye_contact': 0.22,
-    'speech_pace': 0.18,
-    'filler_words': 0.18,
+    'voice_steadiness': 0.24,
+    'eye_contact': 0.24,
+    'speech_pace': 0.20,
+    'filler_words': 0.20,
     'vocal_variety': 0.12,
-    'expression': 0.08,
 }
 
-# Rolling window: 10 entries at 500ms intervals = 5 seconds of smoothing
-ROLLING_WINDOW = 10
+# Signals tracked in rolling history and echoed back in the update()
+# response for UI display. Superset of WEIGHTS: expression appears here
+# but not in WEIGHTS, so it renders in the UI without biasing the total.
+DISPLAYED_SIGNALS = list(WEIGHTS.keys()) + ['expression']
+
+# Rolling window: 4 entries at 500ms intervals = 2 seconds of smoothing.
+# Was 10 (5s). 5s of lag meant a user's score still reflected what they
+# were doing five seconds ago, which is the opposite of "real-time"
+# feedback. 2s still removes per-chunk jitter without masking behaviour.
+ROLLING_WINDOW = 4
 
 
 class ScoringEngine:
     """Computes weighted confidence score from 6 sub-signals with rolling average."""
 
     def __init__(self):
-        self.history = {key: deque(maxlen=ROLLING_WINDOW) for key in WEIGHTS}
+        self.history = {key: deque(maxlen=ROLLING_WINDOW) for key in DISPLAYED_SIGNALS}
         self.total_history = deque(maxlen=ROLLING_WINDOW)
 
     def compute_sub_scores(self, face_result=None, speech_result=None, audio_result=None):
@@ -90,20 +105,22 @@ class ScoringEngine:
         """Push sub-scores into rolling average and compute weighted total.
         Returns smoothed scores + weighted total."""
 
-        # Push each sub-score into its rolling deque
-        for key in WEIGHTS:
+        # Push each sub-score into its rolling deque (tracks displayed
+        # signals including expression, even though expression has no
+        # weight in the aggregate).
+        for key in DISPLAYED_SIGNALS:
             value = sub_scores.get(key, 50)
             self.history[key].append(value)
 
-        # Compute rolling averages
+        # Compute rolling averages for every displayed signal.
         smoothed = {}
-        for key in WEIGHTS:
+        for key in DISPLAYED_SIGNALS:
             if self.history[key]:
                 smoothed[key] = int(sum(self.history[key]) / len(self.history[key]))
             else:
                 smoothed[key] = 50
 
-        # Weighted total
+        # Weighted total — expression intentionally excluded.
         total = sum(smoothed[key] * WEIGHTS[key] for key in WEIGHTS)
         total = max(0, min(100, int(total)))
 

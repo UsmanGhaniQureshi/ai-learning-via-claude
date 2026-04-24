@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { WS_BASE, API_BASE } from '../config'
+import { API_BASE, apiFetch, wsUrl } from '../config'
 import { SessionVideoRecorder } from '../components/VideoRecorder'
 import useFaceDetection from './useFaceDetection'
 
@@ -48,10 +48,25 @@ export default function useLiveSession() {
   const [videoBlob, setVideoBlob] = useState(null)
   const [videoUrl, setVideoUrl] = useState(null)
   const [remoteVideoUrl, setRemoteVideoUrl] = useState(null)
+  // 'connected' | 'lost' — surfaced as a banner in LiveSession. Flips
+  // to 'lost' when the WS closes unexpectedly while the session is
+  // still active; stays 'connected' during normal user-triggered stop.
+  const [connectionStatus, setConnectionStatus] = useState('connected')
 
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const reportRef = useRef(null)
+  // Tracks whether the user clicked Stop. Without this we can't
+  // distinguish an intentional WS close (user pressed Stop) from a
+  // network drop, and we'd try to "recover" from the normal
+  // termination path.
+  const userStopRef = useRef(false)
+  // Ref to the latest stopSession function. Needed because the ws
+  // onclose handler is installed inside startSession (which is
+  // useCallback-memoized with [] deps), so its closure captures
+  // stopSession from the first render — a stale one whose sessionState
+  // is still 'idle'. Reading through a ref gets us the live version.
+  const stopSessionRef = useRef(null)
 
   // Attach stream to video element once it's mounted in the DOM
   useEffect(() => {
@@ -79,6 +94,10 @@ export default function useLiveSession() {
 
   const stopSession = useCallback(async () => {
     if (sessionState !== 'active') return
+    // Mark as user-initiated so the onclose handler knows this is a
+    // normal termination and doesn't trigger the "connection lost"
+    // recovery path. Must be set BEFORE we touch the WS below.
+    userStopRef.current = true
     setSessionState('stopping')
 
     // Stop face detection + face score broadcasting
@@ -152,7 +171,7 @@ export default function useLiveSession() {
     // HTTP fallback: if WS didn't deliver the report, fetch it from disk
     if (!reportRef.current && sessionId) {
       try {
-        const res = await fetch(`${API_BASE}/api/report/${sessionId}`)
+        const res = await apiFetch(`${API_BASE}/api/report/${sessionId}`)
         if (res.ok) {
           const data = await res.json()
           if (data && !data.error) {
@@ -183,6 +202,12 @@ export default function useLiveSession() {
     // Wait for video upload to finish (non-critical)
     await videoUploadPromise.catch(() => {})
   }, [sessionState])
+
+  // Keep the ref pointing at the most recent stopSession so the
+  // onclose handler in startSession can call the live version.
+  useEffect(() => {
+    stopSessionRef.current = stopSession
+  }, [stopSession])
 
   // Linear interpolation resampler (browser rate -> 16kHz)
   function resample(input, inputRate, outputRate = 16000) {
@@ -221,6 +246,8 @@ export default function useLiveSession() {
 
   const startSession = useCallback(async () => {
     setError(null)
+    setConnectionStatus('connected')
+    userStopRef.current = false
     setSessionState('starting')
     setScores(null)
     setTranscript('')
@@ -252,7 +279,7 @@ export default function useLiveSession() {
       // 3. Generate session ID + open WebSocket
       const sessionId = `session_${Date.now()}`
       sessionIdRef.current = sessionId
-      const ws = new WebSocket(`${WS_BASE}/ws/session/${sessionId}`)
+      const ws = new WebSocket(wsUrl(`/ws/session/${sessionId}`))
       ws.binaryType = 'arraybuffer'
       wsRef.current = ws
 
@@ -317,6 +344,33 @@ export default function useLiveSession() {
         setError('WebSocket connection failed')
       }
 
+      // Handle unexpected disconnect (Wi-Fi blip, tab suspended, server
+      // restart). We DON'T attempt a live reconnect with the same
+      // session_id because the backend pipeline's in-memory snapshots
+      // are lost the moment its WS handler exits — a silent resume
+      // would splice a new pipeline's output into the user's report
+      // timeline in confusing ways. Instead: tell the user clearly,
+      // stop local capture, and fall back to fetching whatever the
+      // backend already persisted via HTTP — the stopSession() flow
+      // already handles that HTTP fallback.
+      ws.onclose = () => {
+        if (userStopRef.current) return // normal termination
+        // Unexpected: mark the UI and short-circuit into the normal
+        // stop path so the user lands on /result with whatever data
+        // got saved before the drop.
+        setConnectionStatus('lost')
+        setError(
+          'Connection lost during the session. Saving what was captured up to that point…'
+        )
+        // Defer the stop slightly so React gets to paint the banner
+        // before the HTTP fallback begins — otherwise the user sees
+        // the UI freeze for a second with no explanation.
+        setTimeout(() => {
+          const stop = stopSessionRef.current
+          if (stop) stop().catch(() => {})
+        }, 50)
+      }
+
       // Wait for WS to open
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error('WebSocket timeout')), 5000)
@@ -343,28 +397,29 @@ export default function useLiveSession() {
       const inputRate = audioCtx.sampleRate
       audioCtxRef.current = audioCtx
       const source = audioCtx.createMediaStreamSource(stream)
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1)
+
+      // Load the AudioWorklet once per context. The worklet runs on the
+      // audio thread so UI re-renders, transitions, and heavy DOM work
+      // can't drop audio frames — unlike the old ScriptProcessorNode,
+      // which ran on the main thread.
+      await audioCtx.audioWorklet.addModule('/audioProcessor.worklet.js')
+      const processor = new AudioWorkletNode(audioCtx, 'audio-processor')
       audioProcessorRef.current = processor
 
-      processor.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0)
-        // Resample from browser native rate to 16kHz
-        const resampled = resample(input, inputRate, 16000)
+      processor.port.onmessage = (event) => {
+        if (!event.data || event.data.type !== 'frame') return
+        const frame = event.data.data // Float32Array at inputRate
+        const resampled = resample(frame, inputRate, 16000)
         for (let i = 0; i < resampled.length; i++) {
           audioBufferRef.current.push(resampled[i])
         }
         flushAudioBuffer(false)
       }
 
-      // Use a muted GainNode sink instead of connecting to audioCtx.destination.
-      // ScriptProcessor needs a downstream node to keep onaudioprocess firing,
-      // but routing the captured stream to the speakers caused mic feedback
-      // (and contaminated the very audio we then transcribe).
-      const muteSink = audioCtx.createGain()
-      muteSink.gain.value = 0
+      // AudioWorkletNode's process() fires even without a downstream
+      // connection, so we don't need the old mute-sink plumbing. Just
+      // tap the source into the worklet and let its port deliver frames.
       source.connect(processor)
-      processor.connect(muteSink)
-      muteSink.connect(audioCtx.destination)
 
       // 6. Start browser face detection
       setFaceActive(true)
@@ -465,6 +520,7 @@ export default function useLiveSession() {
     tips,
     report,
     error,
+    connectionStatus,
     scoreHistory,
     duration,
     faceScores,

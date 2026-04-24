@@ -15,7 +15,7 @@ function formatDuration(s) {
 export default function LiveSession() {
   const {
     sessionState, videoRef, scores, transcript, tips, report, error,
-    scoreHistory, duration, faceScores,
+    connectionStatus, scoreHistory, duration, faceScores,
     startSession, stopSession,
   } = useLiveSession()
 
@@ -84,6 +84,21 @@ export default function LiveSession() {
       {/* ACTIVE STATE — Live session in progress */}
       {(sessionState === 'active' || sessionState === 'stopping') && (
         <div className="session-active">
+          {connectionStatus === 'lost' && (
+            <div
+              className="session-error"
+              style={{
+                background: '#4a1f1f',
+                border: '1px solid #8a3333',
+                color: '#ff9b9b',
+                marginBottom: 12,
+              }}
+            >
+              <strong>Connection lost.</strong> Saving what was captured
+              so far — we'll redirect you to the report in a moment.
+            </div>
+          )}
+
           {/* Status bar */}
           <div className="session-status-bar">
             <div className="status-left">

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { API_BASE, WS_BASE } from '../config'
+import { API_BASE, apiFetch, wsUrl } from '../config'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
 
@@ -36,7 +36,6 @@ export default function LiveAnalyzer() {
   const mediaStreamRef = useRef(null)
   const audioCtxRef = useRef(null)
   const processorRef = useRef(null)
-  const muteSinkRef = useRef(null)
   const wsRef = useRef(null)
   const audioBufferRef = useRef([])
   const mediaRecorderRef = useRef(null)
@@ -46,16 +45,14 @@ export default function LiveAnalyzer() {
   const startedAtRef = useRef(null)
   const reportReceivedRef = useRef(false)
   const lastTranscriptRef = useRef('')
+  const userStopRef = useRef(false)
+  const [connectionLost, setConnectionLost] = useState(false)
 
   // ── Cleanup — always safe to call ──────────────────────────────────
   const cleanup = useCallback(() => {
     if (processorRef.current) {
       try { processorRef.current.disconnect() } catch {}
       processorRef.current = null
-    }
-    if (muteSinkRef.current) {
-      try { muteSinkRef.current.disconnect() } catch {}
-      muteSinkRef.current = null
     }
     if (audioCtxRef.current) {
       try { audioCtxRef.current.close() } catch {}
@@ -109,6 +106,8 @@ export default function LiveAnalyzer() {
   // ── Start ──────────────────────────────────────────────────────────
   const start = async () => {
     setError(null)
+    setConnectionLost(false)
+    userStopRef.current = false
     setState('starting')
     setScores(null)
     setTranscript('')
@@ -138,7 +137,7 @@ export default function LiveAnalyzer() {
     mediaStreamRef.current = stream
 
     // Open WS with ?kind=analyzer_audio
-    const ws = new WebSocket(`${WS_BASE}/ws/session/${mediaId}?kind=analyzer_audio`)
+    const ws = new WebSocket(wsUrl(`/ws/session/${mediaId}?kind=analyzer_audio`))
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
 
@@ -164,6 +163,16 @@ export default function LiveAnalyzer() {
       }
     }
     ws.onerror = () => setError('WebSocket connection failed')
+    ws.onclose = () => {
+      if (userStopRef.current) return // normal termination
+      setConnectionLost(true)
+      setError(
+        'Connection lost during the session. Saving what was captured so far…'
+      )
+      // Route through the normal stop flow so the partial report lands
+      // in the DB and the UI transitions to /result.
+      setTimeout(() => { stop().catch(() => {}) }, 50)
+    }
 
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('WebSocket timeout')), 5000)
@@ -199,23 +208,24 @@ export default function LiveAnalyzer() {
     audioCtxRef.current = ctx
     const inputRate = ctx.sampleRate
     const source = ctx.createMediaStreamSource(stream)
-    const processor = ctx.createScriptProcessor(4096, 1, 1)
+
+    // AudioWorkletNode runs on the audio rendering thread — UI
+    // re-renders (transitions, big state updates) can't drop audio
+    // frames here, unlike ScriptProcessorNode which shared the main
+    // thread and was officially deprecated.
+    await ctx.audioWorklet.addModule('/audioProcessor.worklet.js')
+    const processor = new AudioWorkletNode(ctx, 'audio-processor')
     processorRef.current = processor
-    processor.onaudioprocess = (e) => {
-      const input = e.inputBuffer.getChannelData(0)
-      const resampled = resample(input, inputRate, 16000)
+    processor.port.onmessage = (event) => {
+      if (!event.data || event.data.type !== 'frame') return
+      const frame = event.data.data
+      const resampled = resample(frame, inputRate, 16000)
       for (let i = 0; i < resampled.length; i++) {
         audioBufferRef.current.push(resampled[i])
       }
       flushAudioBuffer(false)
     }
-    // Muted GainNode downstream so ScriptProcessor runs without mic feedback.
-    const muteSink = ctx.createGain()
-    muteSink.gain.value = 0
-    muteSinkRef.current = muteSink
     source.connect(processor)
-    processor.connect(muteSink)
-    muteSink.connect(ctx.destination)
 
     startedAtRef.current = Date.now()
     durationTimerRef.current = setInterval(() => {
@@ -228,6 +238,7 @@ export default function LiveAnalyzer() {
   // ── Stop ───────────────────────────────────────────────────────────
   const stop = async () => {
     if (state !== 'active') return
+    userStopRef.current = true
     setState('stopping')
 
     // Stop audio capture.
@@ -274,7 +285,7 @@ export default function LiveAnalyzer() {
         const form = new FormData()
         form.append('audio', audioBlob, `${mediaIdRef.current}.webm`)
         form.append('session_id', mediaIdRef.current)
-        await fetch(`${API_BASE}/api/session/upload-audio`, {
+        await apiFetch(`${API_BASE}/api/session/upload-audio`, {
           method: 'POST',
           body: form,
         })
@@ -335,6 +346,20 @@ export default function LiveAnalyzer() {
 
       {(state === 'active' || state === 'stopping') && (
         <div className="session-active">
+          {connectionLost && (
+            <div
+              className="session-error"
+              style={{
+                background: '#4a1f1f',
+                border: '1px solid #8a3333',
+                color: '#ff9b9b',
+                marginBottom: 12,
+              }}
+            >
+              <strong>Connection lost.</strong> Saving what was captured
+              so far — we'll redirect you to the report in a moment.
+            </div>
+          )}
           <div className="session-status-bar">
             <div className="status-left">
               <span className="rec-indicator">
@@ -348,7 +373,8 @@ export default function LiveAnalyzer() {
             <ScoreGauge score={totalScore} label="Confidence" size={180} />
           </div>
 
-          {barScores && <SignalBars scores={barScores} />}
+          {/* LiveAnalyzer is audio-only — face signals never apply. */}
+          {barScores && <SignalBars scores={barScores} faceUnavailable={true} />}
 
           {transcript && (
             <div className="live-transcript">

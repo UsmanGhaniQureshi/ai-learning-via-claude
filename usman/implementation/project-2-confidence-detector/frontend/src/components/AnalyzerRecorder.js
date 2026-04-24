@@ -2,7 +2,7 @@
  * AnalyzerRecorder — audio-only recorder for the /analyzer page.
  * No camera permission needed. Completely independent of live session.
  */
-import { API_BASE } from '../config'
+import { API_BASE, apiFetch } from '../config'
 
 const API = API_BASE
 
@@ -67,7 +67,7 @@ export class AnalyzerRecorder {
     formData.append('audio_file', blob, `${label}.webm`)
     formData.append('session_label', label)
 
-    const res = await fetch(`${API}/api/analyze-audio`, {
+    const res = await apiFetch(`${API}/api/analyze-audio`, {
       method: 'POST',
       body: formData,
     })

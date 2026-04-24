@@ -122,13 +122,18 @@ class SignalScorer:
     @staticmethod
     def aggregate(signals):
         """Compute weighted aggregate confidence score.
-        Uses research-informed weights for presentation confidence."""
+
+        Expression is deliberately excluded — its mapping (happy 90,
+        neutral 60, sad 30, ...) is arbitrary and culturally biased.
+        The remaining 5 weights sum to 1.0 after redistributing the
+        old 0.08 expression weight. Must stay in sync with the
+        WEIGHTS dict in scoring_engine.py.
+        """
         weights = {
-            "voice_steadiness": 0.22,
-            "eye_contact": 0.22,
-            "speech_pace": 0.18,
-            "filler_words": 0.18,
+            "voice_steadiness": 0.24,
+            "eye_contact": 0.24,
+            "speech_pace": 0.20,
+            "filler_words": 0.20,
             "vocal_variety": 0.12,
-            "expression": 0.08,
         }
         return round(sum(signals.get(k, 50) * w for k, w in weights.items()))

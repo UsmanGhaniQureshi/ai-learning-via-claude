@@ -8,7 +8,7 @@ computed per source_kind so the frontend can just use them directly.
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from db import SessionLocal
 from models import Media
@@ -28,17 +28,28 @@ def _parse_started_at(session_id: str):
     return None
 
 
-def list_recordings():
-    """Return every Media row as a Library entry.
+def list_recordings(limit: int = 50, offset: int = 0):
+    """Return a page of Media rows as Library entries + total count.
 
     Per-kind URL wiring:
       - session        → video served from RECORDINGS_DIR via /api/recordings/{id}/video
       - upload         → video served from UPLOAD_DIR via /api/video/{playback_path}
       - analyzer_audio → audio served via /api/analyzer/{id}/audio
+
+    Args:
+        limit: max rows per page (hard-capped at 200 in the handler)
+        offset: number of rows to skip from the newest-first ordering
+
+    Returns a dict:
+        { "items": [...], "total": N, "limit": L, "offset": O }
     """
     with SessionLocal() as db:
+        total = db.execute(select(func.count(Media.id))).scalar() or 0
         rows = db.execute(
-            select(Media).order_by(Media.created_at.desc())
+            select(Media)
+            .order_by(Media.created_at.desc())
+            .limit(limit)
+            .offset(offset)
         ).scalars().all()
 
         entries = []
@@ -69,4 +80,9 @@ def list_recordings():
                 entry["audio_url"] = f"/api/analyzer/{m.id}/audio"
 
             entries.append(entry)
-        return entries
+        return {
+            "items": entries,
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+        }

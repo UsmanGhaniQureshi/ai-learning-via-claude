@@ -2,11 +2,22 @@ import { useEffect, useRef, useState } from 'react'
 
 /**
  * Browser-side face detection using MediaPipe FaceLandmarker.
- * Analyzes video element and returns scores every ~100ms.
- *
  * Mirrors backend/face_engine.py logic: blendshape-based expression,
  * eye contact, and tension detection — but runs locally in the browser.
+ *
+ * Performance: FaceLandmarker.detectForVideo takes 15-40 ms per call on
+ * a mid-range CPU. Running at the display refresh rate (60 Hz) would
+ * consume 90-100% of the main thread and cause visible UI jank. We run
+ * on a fixed 150 ms interval (~6-7 Hz) instead — enough resolution for
+ * expression smoothing and eye-contact history, ~10× less main-thread
+ * work than the old rAF loop.
+ *
+ * TODO (future): for truly heavy sessions move MediaPipe into a
+ * Web Worker with OffscreenCanvas. The 6 Hz throttle here captures
+ * most of the benefit without that refactor.
  */
+const DETECTION_INTERVAL_MS = 150
+
 export default function useFaceDetection(videoRef, active) {
   const [faceScores, setFaceScores] = useState({
     eye_contact: 50,
@@ -17,7 +28,7 @@ export default function useFaceDetection(videoRef, active) {
   })
 
   const landmarkerRef = useRef(null)
-  const rafRef = useRef(null)
+  const intervalRef = useRef(null)
   const eyeContactHistoryRef = useRef([])
   const mountedRef = useRef(true)
 
@@ -62,30 +73,37 @@ export default function useFaceDetection(videoRef, active) {
         }
 
         landmarkerRef.current = landmarker
-        detectLoop()
+        startInterval()
       } catch (e) {
         console.error('FaceLandmarker init failed:', e)
       }
     }
 
-    function detectLoop() {
+    function startInterval() {
+      // setInterval rather than requestAnimationFrame: rAF fires at the
+      // display rate (60 Hz typical) and piggy-backs on the browser's
+      // paint pipeline, so heavy detection work inside the callback
+      // slows every frame. A fixed-cadence setInterval is independent
+      // of paint and cleanly capped at the chosen rate regardless of
+      // what the display is doing.
+      intervalRef.current = setInterval(tick, DETECTION_INTERVAL_MS)
+    }
+
+    function tick() {
       if (cancelled || !landmarkerRef.current || !videoRef.current) return
-
       const video = videoRef.current
-      if (video.readyState < 2) {
-        rafRef.current = requestAnimationFrame(detectLoop)
-        return
-      }
-
-      const now = performance.now()
+      // Skip if the video element isn't ready to deliver frames
+      // (HAVE_CURRENT_DATA = 2). Retry on the next tick.
+      if (video.readyState < 2) return
       try {
-        const result = landmarkerRef.current.detectForVideo(video, now)
+        const result = landmarkerRef.current.detectForVideo(
+          video,
+          performance.now()
+        )
         processResult(result)
-      } catch (e) {
-        // Frame skip on transient errors
+      } catch {
+        // Transient MediaPipe / video-frame mismatch — skip this tick.
       }
-
-      rafRef.current = requestAnimationFrame(detectLoop)
     }
 
     function processResult(result) {
@@ -172,7 +190,10 @@ export default function useFaceDetection(videoRef, active) {
 
     return () => {
       cancelled = true
-      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
       if (landmarkerRef.current) {
         try {
           landmarkerRef.current.close()

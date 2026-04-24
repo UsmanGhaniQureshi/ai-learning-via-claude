@@ -39,10 +39,20 @@ from audio_pipeline import AudioPipeline, get_whisper, get_vad
 from signal_scorer import SignalScorer
 from session_recorder import list_recordings as _list_session_recordings, RECORDINGS_DIR
 from report_generator import generate_post_session_report
-from sqlalchemy import select
+from sqlalchemy import select, text
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+import re
 
-from db import SessionLocal
+from db import SessionLocal, engine as _db_engine
 from models import Media, MediaSegment
+from log_config import configure_logging, get_logger
+
+# Install the JSON formatter as early as possible so every subsequent
+# log line (including uvicorn access logs) flows through it.
+configure_logging()
+log = get_logger("confidence_detector")
 
 
 # Same grade thresholds as generate_post_session_report — kept inline here
@@ -59,6 +69,21 @@ def _grade_for(score: int) -> str:
         if score >= threshold:
             return grade
     return "F"
+
+
+# ── Path-traversal guard ────────────────────────────────────────────────
+# Every endpoint that consumes a media/session id and uses it to build a
+# filesystem path must run the id through this first. Accepts only what
+# our own id generators produce: a-z, A-Z, 0-9, underscore, dot, 1-80 chars.
+# Rejects: "../", "/", "\", control chars, anything longer than 80.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_\.]{1,80}$")
+
+
+def _safe_media_id(media_id: str) -> bool:
+    """Return True iff the id is safe to interpolate into a filesystem path."""
+    if not isinstance(media_id, str):
+        return False
+    return bool(_SAFE_ID_RE.match(media_id))
 
 
 def _persist_media_and_segments(
@@ -171,12 +196,96 @@ except ImportError:
 
 # Configuration from environment
 PORT = int(os.environ.get('PORT', 8000))
-CORS_ORIGINS = os.environ.get('CORS_ORIGINS', '*').split(',')
+
+# CORS origins — default to local dev only. In production set CORS_ORIGINS
+# to a comma-separated list of explicit origins ("https://app.example.com").
+# Using "*" is supported for deliberate public-API deployments but is NEVER
+# compatible with credential-bearing requests (cookies) — keep that in mind
+# before adding auth.
+_DEFAULT_CORS = "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173"
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("CORS_ORIGINS", _DEFAULT_CORS).split(",")
+    if o.strip()
+]
+
+# Shout loudly if the operator has set CORS_ORIGINS=*. Wildcard CORS:
+#   - lets any website on the internet call this backend from a browser
+#   - is incompatible with credentialed requests, so if you later add
+#     cookie auth it will silently break
+# Keep wildcard only for deliberate throwaway demo deploys.
+if "*" in CORS_ORIGINS:
+    log.warning(
+        "cors.wildcard_enabled",
+        extra={
+            "origins": CORS_ORIGINS,
+            "detail": (
+                "CORS_ORIGINS='*' — every origin can call this backend. "
+                "Set CORS_ORIGINS to a comma-separated allow-list before "
+                "production."
+            ),
+        },
+    )
 
 app = FastAPI(title="Confidence Detector API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-face_engine = FaceEngine()
+# ── API-key auth ────────────────────────────────────────────────
+# When API_KEY env var is set, every HTTP request (except the liveness
+# endpoints in AUTH_EXEMPT_PATHS and CORS preflight OPTIONS) must carry
+# a matching X-API-Key header. WebSockets read `?api_key=` from the
+# query string because browsers cannot set custom headers on the WS
+# upgrade handshake.
+#
+# When API_KEY is unset or empty, auth is disabled — local dev stays a
+# one-command affair. Do NOT deploy to production without setting it.
+API_KEY = os.environ.get("API_KEY", "").strip()
+AUTH_EXEMPT_PATHS = {"/", "/health", "/docs", "/redoc", "/openapi.json"}
+
+
+@app.middleware("http")
+async def api_key_auth(request: Request, call_next):
+    if not API_KEY:
+        return await call_next(request)
+    if request.method == "OPTIONS" or request.url.path in AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+    if request.headers.get("X-API-Key") != API_KEY:
+        return JSONResponse(
+            {"error": "unauthorized", "detail": "missing or invalid X-API-Key"},
+            status_code=401,
+        )
+    return await call_next(request)
+
+
+# ── Rate limiting (slowapi) ─────────────────────────────────────
+# Keyed by X-API-Key when present, else by client IP. Limits are
+# deliberately generous for dev and prevent only obvious abuse.
+# Tune via env or edit per-route decorators (@limiter.limit("10/hour")).
+def _rate_limit_key(request: Request) -> str:
+    key = request.headers.get("X-API-Key")
+    if key:
+        return f"key:{key}"
+    return f"ip:{get_remote_address(request)}"
+
+
+limiter = Limiter(
+    key_func=_rate_limit_key,
+    default_limits=["120/minute"],
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# NOTE: FaceEngine is instantiated per-request inside upload_video — the
+# instance keeps per-session mutable state (baseline, blink_times, etc.)
+# that MUST NOT be shared across concurrent requests. The old global
+# `face_engine = FaceEngine()` was a correctness bug waiting for the
+# second simultaneous user.
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -198,14 +307,19 @@ async def warmup_models():
 
     def preload():
         try:
-            print("[Startup] Pre-loading Whisper (this may take a minute on first run)...")
+            log.info("startup.models.loading", extra={"model": "whisper"})
             get_whisper()
-            print("[Startup] Pre-loading Silero VAD...")
+            log.info("startup.models.loading", extra={"model": "silero_vad"})
             get_vad()
-            print("[Startup] All models ready. Backend is live.")
+            log.info("startup.models.loading", extra={"model": "face_engine"})
+            # Probe: instantiate once to surface a missing .task file at
+            # startup rather than on the first upload. Discard immediately
+            # — actual uploads create their own per-request instance.
+            FaceEngine()
+            log.info("startup.models.ready")
             return True
         except Exception as e:
-            print(f"[Startup] Model preload FAILED: {e}")
+            log.exception("startup.models.failed", extra={"error": str(e)})
             return False
 
     # Run model loading in thread pool, but AWAIT it so startup blocks
@@ -222,12 +336,31 @@ def root():
 @app.get("/health")
 def health():
     """Health check endpoint for deployment platforms.
-    Returns 200 with ready=true only when all models are loaded."""
-    models_ok = (face_engine.face_lm is not None and face_engine.pose_lm is not None)
-    ready = _models_ready and models_ok
+    Returns 200 with ready=true only when models AND DB are reachable.
+    Load balancers should treat ready=false as "do not route traffic".
+
+    The FaceEngine is instantiated per-request now, so model readiness is
+    represented by the `_models_ready` flag set after warmup_models() has
+    finished preloading Whisper + VAD + verifying FaceEngine can load.
+    """
+    # Cheap DB round-trip so a Postgres outage trips this check. Without
+    # this, load balancers happily route traffic to an app that will 500
+    # on the first query.
+    db_ok = False
+    db_error = None
+    try:
+        with _db_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception as e:
+        db_error = str(e)[:200]
+
+    ready = _models_ready and db_ok
     return {
         "status": "ok" if ready else "loading",
-        "models_loaded": models_ok,
+        "models_loaded": _models_ready,
+        "db_connected": db_ok,
+        "db_error": db_error,
         "ready": ready,
         "version": "2.0.0",
     }
@@ -237,11 +370,16 @@ def health():
 # MODE 1: VIDEO UPLOAD + ANALYSIS (legacy offline mode)
 # ============================================================
 @app.post("/api/upload")
-async def upload_video(file: UploadFile = File(...)):
+@limiter.limit("10/hour")
+async def upload_video(request: Request, file: UploadFile = File(...)):
     # Per-upload id namespaces all artifacts (extracted audio, processed video,
     # evidence frames) so concurrent uploads — or repeat uploads of files with
     # the same name — don't overwrite each other's outputs.
-    upload_id = uuid.uuid4().hex[:8]
+    # Full 32-char uuid4 hex = 128 bits of entropy. The previous 8-char
+    # id had a 50% collision probability at ~65k rows (birthday bound)
+    # which would surface as a 500 on Media.id unique-constraint
+    # violation. The full hex effectively eliminates that risk.
+    upload_id = uuid.uuid4().hex
     audio_extraction_error = None
     video_encode_error = None
 
@@ -294,32 +432,115 @@ async def upload_video(file: UploadFile = File(...)):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Extract audio directly into memory via an ffmpeg stdout pipe —
-        # no intermediate WAV on disk. -f s16le = raw signed 16-bit LE PCM,
-        # matches what AudioPipeline.process_chunk() expects after scaling.
-        # Capture stderr so a missing/broken ffmpeg surfaces a real error
-        # instead of silently producing has_audio=False.
+        # Reject clips shorter than 3 seconds with a clean 400 rather
+        # than processing them. Below 3 s: a single chunk is zero-padded
+        # to fill AudioPipeline's window, which skews pitch / WPM stats
+        # by ~2× (denominator is padded silence). We'd rather tell the
+        # user to re-record than silently publish garbage numbers.
+        if duration > 0 and duration < 3.0:
+            cap.release()
+            try: os.unlink(filepath)
+            except OSError: pass
+            return JSONResponse(
+                {
+                    "error": "Recording too short",
+                    "detail": (
+                        f"The clip is {duration:.1f} s. "
+                        "Please upload at least 3 s of footage so the "
+                        "speech and face analysis have enough signal to "
+                        "produce meaningful scores."
+                    ),
+                },
+                status_code=400,
+            )
+
+        # Stream audio through ffmpeg's stdout in 3-second windows and
+        # process each window through AudioPipeline as it arrives, so the
+        # full waveform is never resident in RAM. For a 3-hour upload the
+        # old capture_output=True path peaked at ~1 GB (int16 bytes + the
+        # float32 view). This path never holds more than a single chunk
+        # at a time.
         has_audio = False
-        audio_data = None
+        snapshots: list[dict] = []
         try:
-            proc = subprocess.run(
-                [FFMPEG, '-i', filepath, '-ar', '16000', '-ac', '1',
+            # Hardening against malformed / malicious media files:
+            #   -err_detect crccheck+bitstream  — bail on structural errors
+            #       early instead of pushing garbage bytes through decode
+            #       libraries that historically had RCE CVEs. Must appear
+            #       BEFORE -i (it's an input-demuxer flag).
+            #   -fflags +discardcorrupt         — drop corrupt frames
+            #       rather than propagating them. Also input-side.
+            #
+            # Note: we deliberately DO NOT pass -max_muxing_queue_size
+            # here. That's an output-muxer option and ffmpeg rejects it
+            # on raw-PCM pipes (which have no real mux). It only helps
+            # on complex A+V re-encodes — see the re-encode call later
+            # in this handler where it's used correctly.
+            proc = subprocess.Popen(
+                [FFMPEG,
+                 '-err_detect', 'crccheck+bitstream',
+                 '-fflags', '+discardcorrupt',
+                 '-i', filepath,
+                 '-ar', '16000', '-ac', '1',
                  '-f', 's16le', '-', '-loglevel', 'error'],
-                capture_output=True, timeout=120)
-            # Minimum ~1000 samples ≈ 62 ms at 16 kHz mono 16-bit = 2000 bytes.
-            if proc.returncode == 0 and len(proc.stdout) > 2000:
-                audio_int16 = np.frombuffer(proc.stdout, dtype=np.int16)
-                audio_data = audio_int16.astype(np.float32) / 32768.0
-                has_audio = True
-            else:
-                tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
-                audio_extraction_error = (
-                    "ffmpeg produced no usable audio. " + " | ".join(tail)
-                ).strip()
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
         except FileNotFoundError:
             audio_extraction_error = "ffmpeg binary not found on the server."
-        except subprocess.TimeoutExpired:
-            audio_extraction_error = "ffmpeg timed out after 120s extracting audio."
+            proc = None
+        if proc is not None:
+            chunk_samples = 16000 * 3  # 3 seconds
+            chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
+            pipeline = AudioPipeline()
+
+            def _stream_and_process_sync():
+                nonlocal has_audio
+                total_bytes = 0
+                leftover = b""
+                try:
+                    while True:
+                        need = chunk_bytes - len(leftover)
+                        data = proc.stdout.read(need) if need > 0 else b""
+                        if not data:
+                            break
+                        total_bytes += len(data)
+                        buf = leftover + data
+                        while len(buf) >= chunk_bytes:
+                            piece = buf[:chunk_bytes]
+                            buf = buf[chunk_bytes:]
+                            arr = np.frombuffer(piece, dtype=np.int16).astype(np.float32) / 32768.0
+                            snapshots.append(pipeline.process_chunk(arr, sr=16000))
+                        leftover = buf
+                    if leftover:
+                        arr = np.frombuffer(leftover, dtype=np.int16).astype(np.float32) / 32768.0
+                        if len(arr) < chunk_samples:
+                            arr = np.pad(arr, (0, chunk_samples - len(arr)))
+                        snapshots.append(pipeline.process_chunk(arr, sr=16000))
+                    try:
+                        rc = proc.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        rc = -1
+                    err_tail = ""
+                    if proc.stderr:
+                        err_tail = proc.stderr.read().decode("utf-8", errors="ignore")
+                    # Minimum ~1000 samples ≈ 62 ms = 2000 bytes.
+                    if rc == 0 and total_bytes > 2000:
+                        has_audio = True
+                        return None
+                    tail_lines = err_tail.splitlines()[-3:]
+                    return (
+                        "ffmpeg produced no usable audio. " + " | ".join(tail_lines)
+                    ).strip()
+                finally:
+                    try: proc.stdout.close()
+                    except Exception: pass
+                    try: proc.stderr.close()
+                    except Exception: pass
+
+            audio_extraction_error = await asyncio.get_event_loop().run_in_executor(
+                None, _stream_and_process_sync
+            )
 
         # Process video frames with face engine
         output_name = f"processed_{upload_id}.mp4"
@@ -328,90 +549,94 @@ async def upload_video(file: UploadFile = File(...)):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-        face_engine.reset()
-        face_results_by_time = []
-        all_face_scores = []
-        process_every = 2
-        fc = 0
-        last_result = None
+        # Per-request FaceEngine instance. CRITICAL: sharing a single
+        # instance across concurrent requests corrupts blink_times /
+        # baseline / eye_contact_hist between users. Instantiation costs
+        # ~0.5-1.5s (MediaPipe model load) which is negligible compared
+        # to the 30-120s video processing that follows.
+        face_engine = FaceEngine()
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            fc += 1
-            ts = fc / fps
+        # The frame loop is the single biggest blocking cost in the
+        # upload pipeline — MediaPipe + cv2 writes for a 60-s clip run
+        # 30-120 s of pure CPU. Run it inside a worker thread via
+        # run_in_executor so the FastAPI event loop can continue to
+        # serve health checks, WebSockets, and other uploads.
+        def _frame_loop_sync():
+            face_results_by_time = []
+            all_face_scores = []
+            process_every = 2
+            fc = 0
+            last_result = None
 
-            if fc % process_every == 0:
-                last_result = face_engine.process_frame(frame, ts)
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                fc += 1
+                ts = fc / fps
 
-            if last_result:
-                all_face_scores.append(last_result['confidence_score'])
+                if fc % process_every == 0:
+                    last_result = face_engine.process_frame(frame, ts)
 
-            frame_with_overlay = face_engine.draw_overlay(frame.copy(), last_result)
-            writer.write(frame_with_overlay)
+                if last_result:
+                    all_face_scores.append(last_result['confidence_score'])
 
-            # Log face data at intervals
-            if last_result and fc % (int(fps) * 2) == 0:  # every 2 seconds
-                # Capture a tiny base64 JPEG thumbnail from the same frame we
-                # already have in memory. Width 120 px preserves aspect. Embedded
-                # in the response so the frontend renders it instantly via
-                # <img src="data:image/jpeg;base64,..."> — no separate request,
-                # no CORS, no persistent file. ~3-8 KB per thumb.
-                thumb_data_url = None
-                try:
-                    h, w = frame_with_overlay.shape[:2]
-                    thumb_w = 120
-                    thumb_h = max(1, int(h * thumb_w / w))
-                    thumb = cv2.resize(
-                        frame_with_overlay, (thumb_w, thumb_h),
-                        interpolation=cv2.INTER_AREA,
-                    )
-                    ok_enc, buf = cv2.imencode(
-                        ".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 72]
-                    )
-                    if ok_enc:
-                        thumb_data_url = (
-                            "data:image/jpeg;base64,"
-                            + base64.b64encode(buf.tobytes()).decode("ascii")
-                        )
-                except Exception:
+                frame_with_overlay = face_engine.draw_overlay(frame.copy(), last_result)
+                writer.write(frame_with_overlay)
+
+                # Log face data at intervals
+                if last_result and fc % (int(fps) * 2) == 0:  # every 2 seconds
+                    # Capture a tiny base64 JPEG thumbnail from the same frame we
+                    # already have in memory. Width 120 px preserves aspect. Embedded
+                    # in the response so the frontend renders it instantly via
+                    # <img src="data:image/jpeg;base64,..."> — no separate request,
+                    # no CORS, no persistent file. ~3-8 KB per thumb.
                     thumb_data_url = None
+                    try:
+                        h, w = frame_with_overlay.shape[:2]
+                        thumb_w = 120
+                        thumb_h = max(1, int(h * thumb_w / w))
+                        thumb = cv2.resize(
+                            frame_with_overlay, (thumb_w, thumb_h),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        ok_enc, buf = cv2.imencode(
+                            ".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 72]
+                        )
+                        if ok_enc:
+                            thumb_data_url = (
+                                "data:image/jpeg;base64,"
+                                + base64.b64encode(buf.tobytes()).decode("ascii")
+                            )
+                    except Exception:
+                        thumb_data_url = None
 
-                face_results_by_time.append({
-                    'timestamp': round(ts, 1),
-                    'time_display': f"{int(ts)//60:02d}:{int(ts)%60:02d}",
-                    'expression': last_result['expression'],
-                    'eye_contact_pct': last_result['eye_contact_pct'],
-                    'blink_rate': last_result['blink_rate'],
-                    'tension_score': last_result.get('tension_score', 0),
-                    'face_confidence': last_result['confidence_score'],
-                    'thumb': thumb_data_url,
-                })
+                    face_results_by_time.append({
+                        'timestamp': round(ts, 1),
+                        'time_display': f"{int(ts)//60:02d}:{int(ts)%60:02d}",
+                        'expression': last_result['expression'],
+                        'eye_contact_pct': last_result['eye_contact_pct'],
+                        'blink_rate': last_result['blink_rate'],
+                        'tension_score': last_result.get('tension_score', 0),
+                        'face_confidence': last_result['confidence_score'],
+                        'thumb': thumb_data_url,
+                    })
 
-        cap.release()
-        writer.release()
+            cap.release()
+            writer.release()
+            return face_results_by_time, all_face_scores
 
-        # Process audio with the production AudioPipeline (faster-whisper + VAD
-        # + PYIN + acoustic filler detection). Same pipeline the live and
-        # analyzer modes use. audio_data already loaded from ffmpeg stdout pipe.
+        face_results_by_time, all_face_scores = await asyncio.get_event_loop().run_in_executor(
+            None, _frame_loop_sync
+        )
+
+        # Snapshots were already produced during streaming audio extraction
+        # above — AudioPipeline processed each 3s window as it came off
+        # ffmpeg's stdout. Nothing more to do here besides aggregation.
         speech_summary = None
         speech_timeline = []
         if has_audio:
-            if audio_data is not None and len(audio_data) > 0:
-                # Split into 3-second chunks (same as live + analyzer paths).
-                # The final chunk is zero-padded; this is offline analysis of a
-                # known recording so the live silence-padding pathology doesn't
-                # apply (the chunk gate inside process_chunk still catches it).
-                chunk_size = 16000 * 3
-                pipeline = AudioPipeline()
-                snapshots = []
-                for i in range(0, len(audio_data), chunk_size):
-                    chunk = audio_data[i:i + chunk_size]
-                    if len(chunk) < chunk_size:
-                        chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
-                    snapshots.append(pipeline.process_chunk(chunk, sr=16000))
-
+            if snapshots:
                 # ── Aggregate snapshots into the legacy speech_summary shape ──
                 all_words = [
                     w for s in snapshots for w in s.get("transcript_words", [])
@@ -564,7 +789,15 @@ async def upload_video(file: UploadFile = File(...)):
         # back in here with -map, otherwise the preview plays silent.
         web_name = f"web_{output_name}"
         web_path = os.path.join(UPLOAD_DIR, web_name)
-        reencode_cmd = [FFMPEG, '-y', '-i', output_path]
+        # Same hardening flags as the audio-extract Popen above. The
+        # re-encode touches user-controlled bytes again (second pass
+        # over the source-plus-overlay), so apply the same guards.
+        reencode_cmd = [
+            FFMPEG,
+            '-err_detect', 'crccheck+bitstream',
+            '-fflags', '+discardcorrupt',
+            '-y', '-i', output_path,
+        ]
         if has_audio:
             # Second input is the original source file; take its audio track.
             reencode_cmd.extend([
@@ -580,22 +813,32 @@ async def upload_video(file: UploadFile = File(...)):
             '-movflags', '+faststart',
             web_path,
         ])
-        try:
-            proc = subprocess.run(
-                reencode_cmd,
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)
-            ffmpeg_ok = os.path.exists(web_path) and os.path.getsize(web_path) > 0
-            if not ffmpeg_ok:
-                tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
-                video_encode_error = (
-                    "ffmpeg re-encode failed; serving raw output. " + " | ".join(tail)
-                ).strip()
-        except FileNotFoundError:
-            ffmpeg_ok = False
-            video_encode_error = "ffmpeg binary not found for re-encode."
-        except subprocess.TimeoutExpired:
-            ffmpeg_ok = False
-            video_encode_error = "ffmpeg re-encode timed out after 300s."
+        # ffmpeg re-encode is a subprocess.run that can take 30-90s on long
+        # clips — another event-loop blocker. Dispatch to a worker thread.
+        def _reencode_sync():
+            try:
+                proc = subprocess.run(
+                    reencode_cmd,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)
+                ok = os.path.exists(web_path) and os.path.getsize(web_path) > 0
+                if not ok:
+                    tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
+                    err = (
+                        "ffmpeg re-encode failed; serving raw output. "
+                        + " | ".join(tail)
+                    ).strip()
+                    return False, err
+                return True, None
+            except FileNotFoundError:
+                return False, "ffmpeg binary not found for re-encode."
+            except subprocess.TimeoutExpired:
+                return False, "ffmpeg re-encode timed out after 300s."
+
+        ffmpeg_ok, _ffmpeg_err = await asyncio.get_event_loop().run_in_executor(
+            None, _reencode_sync
+        )
+        if _ffmpeg_err is not None:
+            video_encode_error = _ffmpeg_err
         video_serve = web_name if ffmpeg_ok else output_name
 
         # The mp4v overlay file is only useful as a libx264 fallback.
@@ -655,6 +898,22 @@ async def upload_video(file: UploadFile = File(...)):
 
         # Build the response once so we can both return it AND store it in
         # Media.report_json for the Library / /api/report/{id} endpoint.
+        # Multi-face warning: if more than 10% of processed frames saw a
+        # second person in shot, surface a warning so the user knows the
+        # scores were computed on whichever face MediaPipe picked first
+        # — which might not be them.
+        multi_face_warning = None
+        if face_engine.frames_processed > 0:
+            multi_face_pct = round(
+                100 * face_engine.frames_multi_face / face_engine.frames_processed
+            )
+            if multi_face_pct >= 10:
+                multi_face_warning = (
+                    f"A second face was in frame {multi_face_pct}% of the time. "
+                    "Scores are based on whichever face MediaPipe detected first — "
+                    "which may not be you."
+                )
+
         response_payload = {
             'media_id': upload_id,
             'filename': original_name,
@@ -662,6 +921,7 @@ async def upload_video(file: UploadFile = File(...)):
             'total_frames': total_frames,
             'has_audio': has_audio,
             'no_face_detected': len(all_face_scores) == 0,
+            'multi_face_warning': multi_face_warning,
             'audio_extraction_error': audio_extraction_error,
             'video_encode_error': video_encode_error,
             'processed_video': video_serve,
@@ -686,6 +946,18 @@ async def upload_video(file: UploadFile = File(...)):
         # Phase 2: persist Media + MediaSegment rows. Failure here is logged
         # so the response still returns successfully, but Library + Report
         # endpoints won't see this upload. Warn loudly in logs.
+        #
+        # Strip base64 thumbs before saving: each `face_timeline[n].thumb`
+        # is ~3-8 KB, and at 1 thumb per 2 s of video a 10-minute clip
+        # racks up ~900 KB of inline base64 in report_json. That bloats
+        # every GET /api/report/{id} response forever. The fresh upload
+        # response still carries them (user expects to see evidence on
+        # first view); subsequent Library revisits render placeholders.
+        slim_face_timeline = [
+            {k: v for k, v in e.items() if k != 'thumb'}
+            for e in face_results_by_time
+        ]
+        slim_report = {**response_payload, 'face_timeline': slim_face_timeline}
         try:
             _persist_media_and_segments(
                 media_id=upload_id,
@@ -699,11 +971,14 @@ async def upload_video(file: UploadFile = File(...)):
                 score_avg=overall_score,
                 face_timeline=face_results_by_time,
                 speech_timeline=speech_timeline,
-                report_json=response_payload,
+                report_json=slim_report,
                 content_sha256=content_sha256,
             )
         except Exception as e:
-            print(f"[warn] DB dual-write failed for upload {upload_id}: {e}")
+            log.warning(
+                "db.dual_write_failed",
+                extra={"media_id": upload_id, "source": "upload", "error": str(e)},
+            )
 
         return JSONResponse(response_payload)
     except Exception:
@@ -791,6 +1066,10 @@ def _serve_with_range(request: Request, path: str, media_type: str):
 
 @app.get("/api/video/{filename}")
 def serve_video(filename: str, request: Request):
+    # Guard against ../ etc. before building a filesystem path. The
+    # filename is user-controlled via the URL.
+    if not _safe_media_id(filename):
+        return JSONResponse({"error": "Invalid filename"}, status_code=400)
     filepath = os.path.join(UPLOAD_DIR, filename)
     return _serve_with_range(request, filepath, media_type="video/mp4")
 
@@ -814,7 +1093,24 @@ async def session_ws(ws: WebSocket, session_id: str):
       - "analyzer_audio" → Live Audio Analyzer flow; persisted as audio-only,
                            audio_url served.
     """
+    # Auth check must happen BEFORE accept() so an unauthorised client
+    # gets a clean 4401 close-frame reason rather than an accepted socket
+    # that immediately disconnects. Browsers can't set custom headers on
+    # the WS upgrade, so we accept the key via query param.
+    if API_KEY and ws.query_params.get("api_key") != API_KEY:
+        # 4401 is in the private WebSocket close-code range (4000-4999);
+        # we reuse the HTTP 401 digit as a convention.
+        await ws.close(code=4401)
+        return
+
     await ws.accept()
+
+    # Guard against path-traversal patterns in session_id before any
+    # filesystem path is built from it.
+    if not _safe_media_id(session_id):
+        await ws.send_json({"type": "error", "message": "Invalid session id"})
+        await ws.close()
+        return
 
     # Reject if models aren't ready yet (startup still in progress)
     if not _models_ready:
@@ -833,9 +1129,21 @@ async def session_ws(ws: WebSocket, session_id: str):
     snapshots = []
     latest_browser_face = {}  # Face scores from browser MediaPipe
     client_requested_stop = False
+    _finalized = False  # Guard against double-finalize races.
 
     async def finalize_and_send_report():
-        """Generate report and send via WebSocket while still open."""
+        """Generate report and send via WebSocket while still open.
+
+        Idempotent: if called twice (e.g. once from an explicit stop_session
+        and again from the finally-block fallback when the client also
+        disconnects), the second call is a no-op. Prevents unique-constraint
+        violations from a duplicate Media insert and keeps the report stable.
+        """
+        nonlocal _finalized
+        if _finalized:
+            return
+        _finalized = True
+
         if kind == "analyzer_audio":
             recording_info = {
                 "media_id": session_id,
@@ -926,7 +1234,10 @@ async def session_ws(ws: WebSocket, session_id: str):
                 report_json=report,
             )
         except Exception as e:
-            print(f"[warn] DB dual-write failed for session {session_id}: {e}")
+            log.warning(
+                "db.dual_write_failed",
+                extra={"media_id": session_id, "source": "session", "error": str(e)},
+            )
 
         try:
             await ws.send_json({"type": "session_ended", "report": report})
@@ -990,7 +1301,9 @@ async def session_ws(ws: WebSocket, session_id: str):
 # MODE 4: STANDALONE AUDIO ANALYZER
 # ============================================================
 @app.post("/api/analyze-audio")
+@limiter.limit("10/hour")
 async def analyze_audio_file(
+    request: Request,
     audio_file: UploadFile = File(...),
     session_label: str = Form(default="uploaded"),
 ):
@@ -1001,9 +1314,7 @@ async def analyze_audio_file(
     lists this analysis alongside uploads and live sessions. The audio
     file itself is saved to RECORDINGS_DIR for later playback.
     """
-    import librosa
-
-    media_id = f"analyzer_{uuid.uuid4().hex[:8]}"
+    media_id = f"analyzer_{uuid.uuid4().hex}"
     suffix = Path(audio_file.filename or "recording.webm").suffix or ".webm"
     saved_name = f"{media_id}{suffix}"
     saved_path = RECORDINGS_DIR / saved_name
@@ -1024,39 +1335,101 @@ async def analyze_audio_file(
     # short-circuit — predictable spinner → result is preferred over the
     # "sometimes instant" dedup behaviour.
 
+    # Stream through ffmpeg stdout in 3-second windows, pipelining each
+    # window into AudioPipeline as it arrives. librosa.load() — the old
+    # path — materialised the entire waveform at 16 kHz float32, which
+    # OOMs on hour-scale uploads (~230 MB/hour). This approach keeps at
+    # most one 3-second chunk (~192 KB) in memory at a time.
+    chunk_samples = 16000 * 3
+    chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
+    pipeline = AudioPipeline()
+    snapshots: list[dict] = []
+
     try:
-        # Load + resample to 16kHz mono (librosa handles any format)
-        audio, _ = librosa.load(str(saved_path), sr=16000, mono=True)
-    except Exception as e:
-        # Processing couldn't start — remove the saved file, no DB row.
-        try:
-            saved_path.unlink()
-        except OSError:
-            pass
+        # Same hardening flags as upload_video — input-side only. No
+        # -max_muxing_queue_size on raw-PCM pipes (see that handler's
+        # comment for why).
+        proc = subprocess.Popen(
+            [FFMPEG,
+             '-err_detect', 'crccheck+bitstream',
+             '-fflags', '+discardcorrupt',
+             '-i', str(saved_path),
+             '-ar', '16000', '-ac', '1',
+             '-f', 's16le', '-', '-loglevel', 'error'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        try: saved_path.unlink()
+        except OSError: pass
         return JSONResponse(
-            {"error": f"Could not load audio file: {str(e)}"},
-            status_code=400,
+            {"error": "ffmpeg binary not found on the server."},
+            status_code=500,
         )
 
-    # Split into 3s chunks (same as live pipeline)
-    chunk_size = 16000 * 3
-    chunks = []
-    for i in range(0, len(audio), chunk_size):
-        chunk = audio[i:i + chunk_size]
-        if len(chunk) < chunk_size:
-            chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
-        chunks.append(chunk)
+    def _stream_and_process_sync():
+        total_bytes = 0
+        leftover = b""
+        try:
+            while True:
+                need = chunk_bytes - len(leftover)
+                data = proc.stdout.read(need) if need > 0 else b""
+                if not data:
+                    break
+                total_bytes += len(data)
+                buf = leftover + data
+                while len(buf) >= chunk_bytes:
+                    piece = buf[:chunk_bytes]
+                    buf = buf[chunk_bytes:]
+                    arr = np.frombuffer(piece, dtype=np.int16).astype(np.float32) / 32768.0
+                    result = pipeline.process_chunk(arr, sr=16000)
+                    # Audio-only: no face data, set to neutral
+                    result["scores"]["eye_contact"] = 50
+                    result["scores"]["expression"] = 50
+                    result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
+                    snapshots.append(result)
+                leftover = buf
+            if leftover:
+                arr = np.frombuffer(leftover, dtype=np.int16).astype(np.float32) / 32768.0
+                if len(arr) < chunk_samples:
+                    arr = np.pad(arr, (0, chunk_samples - len(arr)))
+                result = pipeline.process_chunk(arr, sr=16000)
+                result["scores"]["eye_contact"] = 50
+                result["scores"]["expression"] = 50
+                result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
+                snapshots.append(result)
+            try:
+                rc = proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = -1
+            err_tail = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
+            if rc != 0 or total_bytes < 2000:
+                tail_lines = err_tail.splitlines()[-3:]
+                return "Could not decode audio. " + " | ".join(tail_lines)
+            # Reject clips shorter than 3 s. Below that, a single chunk
+            # is padded with silence which skews pitch/WPM stats by ~2×.
+            # 3 s × 16000 Hz × 2 bytes/sample = 96000 bytes.
+            if total_bytes < 96000:
+                seconds = total_bytes / (16000 * 2)
+                return (
+                    f"Audio is too short ({seconds:.1f} s). Please "
+                    "upload at least 3 s so speech analysis has enough "
+                    "signal to produce meaningful scores."
+                )
+            return None
+        finally:
+            try: proc.stdout.close()
+            except Exception: pass
+            try: proc.stderr.close()
+            except Exception: pass
 
-    # Run same pipeline on each chunk
-    pipeline = AudioPipeline()
-    snapshots = []
-    for chunk in chunks:
-        result = pipeline.process_chunk(chunk)
-        # Audio-only: no face data, set to neutral
-        result["scores"]["eye_contact"] = 50
-        result["scores"]["expression"] = 50
-        result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
-        snapshots.append(result)
+    decode_error = await asyncio.get_event_loop().run_in_executor(
+        None, _stream_and_process_sync
+    )
+    if decode_error:
+        try: saved_path.unlink()
+        except OSError: pass
+        return JSONResponse({"error": decode_error}, status_code=400)
 
     report = generate_post_session_report(snapshots, media_id)
     report["media_id"] = media_id
@@ -1111,7 +1484,10 @@ async def analyze_audio_file(
             content_sha256=content_sha256,
         )
     except Exception as e:
-        print(f"[warn] analyzer DB persist failed for {media_id}: {e}")
+        log.warning(
+            "db.dual_write_failed",
+            extra={"media_id": media_id, "source": "analyzer_audio", "error": str(e)},
+        )
 
     return report
 
@@ -1120,6 +1496,9 @@ async def analyze_audio_file(
 def get_analyzer_audio(media_id: str, request: Request):
     """Serve the saved analyzer audio by media_id. Suffix-agnostic:
     finds whichever file starts with the id in the recordings dir."""
+    # Guard against glob patterns / .. in user-supplied id.
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
     matches = list(RECORDINGS_DIR.glob(f"{media_id}.*"))
     if not matches:
         return JSONResponse({"error": "Not found"}, status_code=404)
@@ -1137,12 +1516,16 @@ def get_analyzer_audio(media_id: str, request: Request):
 
 
 @app.post("/api/session/upload-video")
+@limiter.limit("30/hour")
 async def upload_session_video(
+    request: Request,
     video: UploadFile = File(...),
     session_id: str = Form(...),
 ):
     """Save video recording from a live session.
     Streams to disk with a 500 MB cap; returns a browser-loadable URL."""
+    if not _safe_media_id(session_id):
+        return JSONResponse({"error": "Invalid session id"}, status_code=400)
     path = RECORDINGS_DIR / f"{session_id}_video.webm"
     size = 0
     with open(path, "wb") as f:
@@ -1167,7 +1550,9 @@ async def upload_session_video(
 
 
 @app.post("/api/session/upload-audio")
+@limiter.limit("30/hour")
 async def upload_session_audio(
+    request: Request,
     audio: UploadFile = File(...),
     session_id: str = Form(...),
 ):
@@ -1177,6 +1562,8 @@ async def upload_session_audio(
     /api/analyzer/{id}/audio already serves. Keeping the extension lets us
     serve with a correct MIME (webm/wav/mp3/etc.) on read.
     """
+    if not _safe_media_id(session_id):
+        return JSONResponse({"error": "Invalid session id"}, status_code=400)
     suffix = Path(audio.filename or "recording.webm").suffix.lower()
     if suffix not in {".webm", ".wav", ".mp3", ".m4a", ".ogg"}:
         suffix = ".webm"
@@ -1196,6 +1583,25 @@ async def upload_session_audio(
                 )
             f.write(chunk)
     size_mb = round(size / 1e6, 2)
+
+    # The WS finalize runs BEFORE this upload arrives, so the Media row's
+    # playback_path was written as None or a guess. Correct it now that we
+    # know the filename we actually saved. Best-effort — failure here
+    # doesn't block the 200 response because audio_url is computed from
+    # kind + id anyway.
+    try:
+        with SessionLocal() as db:
+            m = db.get(Media, session_id)
+            if m is not None and m.playback_path != path.name:
+                m.playback_path = path.name
+                m.has_audio = True
+                db.commit()
+    except Exception as e:
+        log.warning(
+            "db.playback_path_update_failed",
+            extra={"media_id": session_id, "error": str(e)},
+        )
+
     return {
         "status": "saved",
         "audio_url": f"/api/analyzer/{session_id}/audio",
@@ -1204,13 +1610,24 @@ async def upload_session_audio(
 
 
 @app.get("/api/recordings")
-def list_recordings():
-    """List all recorded session audio files."""
-    return _list_session_recordings()
+def list_recordings(limit: int = 50, offset: int = 0):
+    """Paginated list of Library entries (sessions + uploads + analyzer audio).
+
+    Response shape: { items: [...], total, limit, offset }.
+
+    `limit` is clamped to [1, 200] so a misbehaving client can't force a
+    megabyte-scale payload. `offset` is non-negative; negatives are
+    treated as 0.
+    """
+    limit = max(1, min(200, int(limit)))
+    offset = max(0, int(offset))
+    return _list_session_recordings(limit=limit, offset=offset)
 
 
 @app.get("/api/recordings/{session_id}/video")
 def get_recording_video(session_id: str, request: Request):
+    if not _safe_media_id(session_id):
+        return JSONResponse({"error": "Invalid session id"}, status_code=400)
     path = RECORDINGS_DIR / f"{session_id}_video.webm"
     return _serve_with_range(request, str(path), media_type="video/webm")
 
@@ -1222,7 +1639,13 @@ def get_session_report(session_id: str):
     Returns the stored Media.report_json payload, spread at the top level,
     with `kind` and `media_id` added so the /result/:id frontend can branch
     between upload / session / analyzer_audio shapes without sniffing.
+
+    Rejects anything that doesn't match the id character class — not to
+    guard the DB (ORM parameters are safe) but to match the behaviour of
+    the file endpoints so callers get a consistent 400 vs 404.
     """
+    if not _safe_media_id(session_id):
+        return JSONResponse({"error": "Invalid session id"}, status_code=400)
     with SessionLocal() as db:
         media = db.get(Media, session_id)
         if media is None or media.report_json is None:
@@ -1231,6 +1654,131 @@ def get_session_report(session_id: str):
         payload["kind"] = media.source_kind
         payload["media_id"] = media.id
         return payload
+
+
+@app.get("/api/report/{session_id}/csv")
+def export_report_csv(session_id: str):
+    """Download the per-chunk score timeline as CSV.
+
+    Lets users take the raw data into Excel/Sheets/pandas and do their
+    own aggregation — or push back on a headline number they disagree
+    with by looking at the underlying chunks.
+
+    Columns: t_s, total, voice_steadiness, eye_contact, speech_pace,
+             filler_words, vocal_variety.
+
+    Works only for reports whose report_json has a `timeline` key (i.e.
+    sessions and analyzer_audio). Upload-kind reports use a different
+    shape — returns 404 with a clear message rather than silently empty.
+    """
+    import csv
+    import io
+
+    if not _safe_media_id(session_id):
+        return JSONResponse({"error": "Invalid session id"}, status_code=400)
+
+    with SessionLocal() as db:
+        media = db.get(Media, session_id)
+        if media is None or media.report_json is None:
+            return JSONResponse({"error": "Report not found"}, status_code=404)
+        report = media.report_json
+        timeline = report.get("timeline")
+        if not timeline:
+            return JSONResponse(
+                {"error": "No per-chunk timeline in this report (upload-kind reports don't expose one)."},
+                status_code=404,
+            )
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "t_s", "total", "voice_steadiness", "eye_contact",
+        "speech_pace", "filler_words", "vocal_variety",
+    ])
+    for row in timeline:
+        w.writerow([
+            row.get("t_s", 0),
+            row.get("total", 0),
+            row.get("voice_steadiness", 0),
+            row.get("eye_contact", 0),
+            row.get("speech_pace", 0),
+            row.get("filler_words", 0),
+            row.get("vocal_variety", 0),
+        ])
+    csv_bytes = buf.getvalue().encode("utf-8")
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{session_id}.csv"',
+            "Content-Length": str(len(csv_bytes)),
+        },
+    )
+
+
+@app.delete("/api/media/{media_id}")
+def delete_media(media_id: str):
+    """Hard-delete a media row + its segments + its on-disk files.
+
+    Why this exists:
+      - GDPR / "right to erasure": once a user records something they
+        regret, they need a way to get rid of it without psql.
+      - Housekeeping: the Library can grow forever otherwise.
+
+    What it deletes:
+      - Media row (cascades to media_segments via FK)
+      - Any file under uploads/ matching stored_path + the processed
+        `web_<id>.mp4` / `processed_<id>.mp4` variants
+      - Any file under recordings/ matching `<id>.*` or `<id>_video.webm`
+
+    Best-effort on files: a missing or already-deleted file is NOT an
+    error. We want the UX side ("it's gone from my Library") to
+    succeed even if disk state is slightly out of sync.
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+
+    removed = {"db_row": False, "files": []}
+
+    with SessionLocal() as db:
+        media = db.get(Media, media_id)
+        if media is None:
+            return JSONResponse({"error": "Media not found"}, status_code=404)
+        # Snapshot filesystem paths before dropping the row.
+        stored_path = media.stored_path
+        playback_path = media.playback_path
+        source_kind = media.source_kind
+        db.delete(media)
+        db.commit()
+        removed["db_row"] = True
+
+    # Collect candidate file paths. We use a set because stored_path and
+    # playback_path are often the same string.
+    candidates: set[Path] = set()
+    uploads_dir = Path(UPLOAD_DIR)
+    for name in (stored_path, playback_path):
+        if name:
+            candidates.add(uploads_dir / name)
+    # Processed / re-encoded variants live alongside the source.
+    candidates.add(uploads_dir / f"processed_{media_id}.mp4")
+    candidates.add(uploads_dir / f"web_{media_id}.mp4")
+    # Session recordings land here.
+    candidates.add(RECORDINGS_DIR / f"{media_id}_video.webm")
+    for p in RECORDINGS_DIR.glob(f"{media_id}.*"):
+        candidates.add(p)
+
+    for p in candidates:
+        try:
+            if p.is_file():
+                p.unlink()
+                removed["files"].append(p.name)
+        except OSError:
+            # A file may be momentarily locked by another handler (e.g.
+            # an in-flight range request). Don't fail the whole delete
+            # for that — the next cron / retry can clean it up.
+            pass
+
+    return {"status": "deleted", "media_id": media_id, "removed": removed}
 
 
 if __name__ == "__main__":

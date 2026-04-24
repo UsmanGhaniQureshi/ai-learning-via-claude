@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { API_BASE } from '../config'
+import { API_BASE, apiFetch } from '../config'
 
 /**
  * Upload — pick a video, POST /api/upload, navigate to /result/:id when done.
@@ -22,7 +22,7 @@ export default function Upload() {
     const formData = new FormData()
     formData.append('file', file)
     try {
-      const res = await fetch(`${API_BASE}/api/upload`, {
+      const res = await apiFetch(`${API_BASE}/api/upload`, {
         method: 'POST',
         body: formData,
       })

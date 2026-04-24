@@ -2,7 +2,7 @@ import ScoreGauge from './ScoreGauge'
 import SignalBars from './SignalBars'
 import SessionGraph from './SessionGraph'
 import TranscriptView from './TranscriptView'
-import { API_BASE } from '../config'
+import { API_BASE, apiFetch } from '../config'
 
 /**
  * Shared report UI — used by both live session post-report and standalone analyzer.
@@ -24,10 +24,17 @@ export default function SessionReport({
 
   const {
     avg_score, peak_score, lowest_score, grade, grade_label,
-    signal_averages, filler_breakdown, total_fillers, acoustic_fillers,
-    pace, insights, action_items, timeline, transcript, duration_s,
-    weakest_signal, note, session_id, recording,
+    signal_averages, signal_stderrs, signal_reasons, filler_breakdown,
+    total_fillers, acoustic_fillers, pace, insights, action_items,
+    timeline, transcript, duration_s, weakest_signal, note, session_id,
+    recording, kind,
   } = report
+
+  // Analyzer audio has no face signal by definition; live/upload sessions
+  // with no face in frame land on a 50-default. For analyzer_audio we can
+  // say so definitively and mark the face bars N/A rather than render a
+  // meaningless 50.
+  const faceUnavailable = kind === 'analyzer_audio'
 
   const recordingVideoUrl = recording?.video_url
     ? `${API_BASE}${recording.video_url}`
@@ -91,13 +98,33 @@ export default function SessionReport({
       {/* Signal Bars */}
       <div className="report-section">
         <h3>Signal Breakdown</h3>
-        <ReportSignalBars signals={signal_averages} />
+        <ReportSignalBars
+          signals={signal_averages}
+          stderrs={signal_stderrs}
+          reasons={signal_reasons}
+          faceUnavailable={faceUnavailable}
+        />
       </div>
 
       {/* Score Timeline */}
       {graphHistory.length > 2 && (
         <div className="report-section">
           <SessionGraph history={graphHistory} />
+          {session_id && (
+            <div style={{ marginTop: 8, textAlign: 'right' }}>
+              <button
+                type="button"
+                onClick={() => downloadCsv(session_id)}
+                style={{
+                  background: 'none', border: 'none', padding: 0,
+                  color: '#8ab4f8', cursor: 'pointer',
+                  fontSize: '0.85em', opacity: 0.85,
+                }}
+              >
+                ⬇ Download raw scores (CSV)
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -193,41 +220,97 @@ export default function SessionReport({
   )
 }
 
-function ReportSignalBars({ signals }) {
+function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
   if (!signals) return null
   const items = [
-    { key: 'voice_steadiness', label: 'Voice Steadiness' },
-    { key: 'eye_contact', label: 'Eye Contact' },
-    { key: 'speech_pace', label: 'Speech Pace' },
-    { key: 'filler_words', label: 'Filler Words' },
-    { key: 'vocal_variety', label: 'Vocal Variety' },
-    { key: 'expression', label: 'Expression' },
+    { key: 'voice_steadiness', label: 'Voice Steadiness', face: false },
+    { key: 'eye_contact', label: 'Eye Contact', face: true },
+    { key: 'speech_pace', label: 'Speech Pace', face: false },
+    { key: 'filler_words', label: 'Filler Words', face: false },
+    { key: 'vocal_variety', label: 'Vocal Variety', face: false },
+    { key: 'expression', label: 'Expression', face: true },
   ]
 
   const barColor = (v) => v >= 71 ? '#00c853' : v >= 41 ? '#ffd600' : '#ff1744'
 
   return (
     <div className="signal-bars">
-      {items.map(({ key, label }) => {
+      {items.map(({ key, label, face }) => {
+        const hide = face && faceUnavailable
         const value = signals[key] ?? 50
+        const raw = stderrs?.[key]
+        const se = typeof raw === 'number' ? Math.round(raw) : null
+        const reason = reasons?.[key]
         return (
           <div key={key} className="signal-row">
-            <div className="signal-label"><span>{label}</span></div>
+            <div className="signal-label">
+              <span>{label}</span>
+              {reason && !hide && (
+                <div style={{
+                  fontSize: '0.72em',
+                  opacity: 0.65,
+                  marginTop: 2,
+                }}>
+                  {reason}
+                </div>
+              )}
+              {hide && (
+                <div style={{
+                  fontSize: '0.72em',
+                  opacity: 0.55,
+                  marginTop: 2,
+                }}>
+                  No face data available for this recording.
+                </div>
+              )}
+            </div>
             <div className="signal-bar-bg">
               <div className="signal-bar-fill" style={{
-                width: `${value}%`,
-                backgroundColor: barColor(value),
+                width: hide ? '0%' : `${value}%`,
+                backgroundColor: hide ? '#444' : barColor(value),
                 transition: 'width 0.5s ease',
               }} />
             </div>
-            <div className="signal-value" style={{ color: barColor(value) }}>
-              {Math.round(value)}
+            <div
+              className="signal-value"
+              style={{ color: hide ? '#888' : barColor(value) }}
+            >
+              {hide ? 'N/A' : Math.round(value)}
+              {!hide && se !== null && se >= 1 && (
+                <span
+                  title="Standard error across chunks — how steady the signal was"
+                  style={{ opacity: 0.55, marginLeft: 4, fontSize: '0.75em' }}
+                >
+                  ± {se}
+                </span>
+              )}
             </div>
           </div>
         )
       })}
     </div>
   )
+}
+
+async function downloadCsv(sessionId) {
+  // Use apiFetch so the X-API-Key header goes along when configured.
+  // A plain anchor tag can't inject custom headers, so we fetch the
+  // bytes, wrap them in a Blob, and trigger a programmatic download.
+  try {
+    const res = await apiFetch(`${API_BASE}/api/report/${sessionId}/csv`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${sessionId}.csv`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    alert(`CSV download failed: ${e.message}`)
+  }
 }
 
 function formatDuration(seconds) {

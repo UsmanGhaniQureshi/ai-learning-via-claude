@@ -17,14 +17,25 @@ class FaceEngine:
 
     def __init__(self):
         # Face landmarker WITH blendshapes (52 direct facial action scores)
+        # num_faces=2 so we can detect when a second person walks into
+        # frame and surface it as a warning. We still only SCORE the
+        # first face; the second is purely a signal for "you may not be
+        # the one being analysed here".
         self.face_lm = vision.FaceLandmarker.create_from_options(
             vision.FaceLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-                num_faces=1,
+                num_faces=2,
                 output_face_blendshapes=True,
                 min_face_detection_confidence=0.4,
                 min_face_presence_confidence=0.4,
                 running_mode=vision.RunningMode.IMAGE))
+
+        # Accumulated counters for the session-level report. `frames_processed`
+        # denominates everything so ratios are meaningful. `frames_multi_face`
+        # is the number of frames where >1 face was present; rendered as a
+        # warning when it exceeds a small fraction of total frames.
+        self.frames_processed = 0
+        self.frames_multi_face = 0
 
         # Pose landmarker for body language
         self.pose_lm = vision.PoseLandmarker.create_from_options(
@@ -48,10 +59,18 @@ class FaceEngine:
         # Expression smoothing
         self.expr_history = deque(maxlen=10)
 
-        # Baseline calibration — first 30 frames establish "your normal"
+        # Baseline calibration — first ~3 s establish "your normal".
+        #
+        # Was 30 frames (~1 s). One second captures the user still moving
+        # from "about to start speaking" into their resting pose, so the
+        # baseline was contaminated with motion. 90 frames at 30 fps gives
+        # three seconds — enough to average out the startup jitter and
+        # still short enough that the user doesn't notice the "calibrating"
+        # state. For uploads processed with process_every=2 this is ~6 s
+        # of video, which is reasonable for a minimum clip.
         self.baseline = None
         self.calibration_frames = []
-        self.CALIBRATION_COUNT = 30  # ~1 second at 30fps
+        self.CALIBRATION_COUNT = 90  # ~3 seconds at 30fps
 
     def _get_blendshape(self, blendshapes, name):
         """Get a blendshape score by name. Returns 0.0 if not found."""
@@ -68,7 +87,12 @@ class FaceEngine:
 
         bs = {b.category_name: b.score for b in blendshapes}
 
-        # Extract signals that change meaningfully across expressions
+        # Extract signals that change meaningfully across expressions.
+        # Eye-look baselines (look_{down,up,in,out}_rest) are captured
+        # here as well so _detect_eye_contact can compare against the
+        # user's own resting eye position rather than a global absolute
+        # threshold — that's what lets the system adapt for glasses
+        # refraction, monitor-below-camera rigs, etc.
         signals = {
             'squint': (bs.get('eyeSquintLeft', 0) + bs.get('eyeSquintRight', 0)) / 2,
             'brow_down': (bs.get('browDownLeft', 0) + bs.get('browDownRight', 0)) / 2,
@@ -78,6 +102,10 @@ class FaceEngine:
             'mouth_frown': (bs.get('mouthFrownLeft', 0) + bs.get('mouthFrownRight', 0)) / 2,
             'jaw_open': bs.get('jawOpen', 0),
             'blink': (bs.get('eyeBlinkLeft', 0) + bs.get('eyeBlinkRight', 0)) / 2,
+            'look_down_rest': (bs.get('eyeLookDownLeft', 0) + bs.get('eyeLookDownRight', 0)) / 2,
+            'look_up_rest': (bs.get('eyeLookUpLeft', 0) + bs.get('eyeLookUpRight', 0)) / 2,
+            'look_in_rest': (bs.get('eyeLookInLeft', 0) + bs.get('eyeLookInRight', 0)) / 2,
+            'look_out_rest': (bs.get('eyeLookOutLeft', 0) + bs.get('eyeLookOutRight', 0)) / 2,
         }
 
         # === CALIBRATION PHASE ===
@@ -168,7 +196,20 @@ class FaceEngine:
 
     def _detect_eye_contact(self, blendshapes):
         """Detect eye contact using blendshape gaze directions.
-        If all look directions are low, the person is looking straight (at camera)."""
+        If all look directions are low, the person is looking straight (at camera).
+
+        Baseline-aware: during the 3-second calibration window we record
+        each user's resting look-{down,up,in,out} values. At detection
+        time we subtract that baseline from the current measurement, so
+        the "are they looking at the camera?" check fires only when
+        their eyes have DEVIATED from their own neutral position — not
+        against a global absolute threshold. This removes the bias
+        against users with:
+          - glasses (refraction shifts the apparent gaze)
+          - webcam below eye-line (look_down always elevated)
+          - webcam above eye-line (look_up always elevated)
+          - individual anatomy differences
+        """
 
         bs = {b.category_name: b.score for b in blendshapes}
 
@@ -177,12 +218,26 @@ class FaceEngine:
         look_in = (bs.get('eyeLookInLeft', 0) + bs.get('eyeLookInRight', 0)) / 2
         look_out = (bs.get('eyeLookOutLeft', 0) + bs.get('eyeLookOutRight', 0)) / 2
 
+        # Subtract baseline if calibrated. Clipped at 0 because the user
+        # never looks LESS-than-rest in any direction — the "rest" values
+        # are a minimum, not a centre.
+        if self.baseline is not None:
+            look_down = max(0, look_down - self.baseline.get('look_down_rest', 0))
+            look_up = max(0, look_up - self.baseline.get('look_up_rest', 0))
+            look_in = max(0, look_in - self.baseline.get('look_in_rest', 0))
+            look_out = max(0, look_out - self.baseline.get('look_out_rest', 0))
+
         # If looking strongly in any direction = NOT at camera
         max_look = max(look_down, look_up, look_in, look_out)
 
-        # Threshold: 0.55 — allows slight downward gaze (normal for laptop/webcam)
-        # Old value 0.4 was too strict — flagged normal camera angle as "not looking"
-        looking = max_look < 0.55
+        # Threshold after baseline subtraction is tighter because we've
+        # removed the per-user offset. Environment variable override so
+        # operators can tune it against labelled data without a redeploy.
+        try:
+            eye_threshold = float(os.environ.get("EYE_CONTACT_THRESHOLD", "0.40"))
+        except ValueError:
+            eye_threshold = 0.40
+        looking = max_look < eye_threshold
 
         gaze_direction = 'center'
         if not looking:
@@ -228,17 +283,61 @@ class FaceEngine:
 
         pl = pose_landmarks[0]
 
-        # Shoulder tilt (left shoulder y vs right shoulder y)
         l_shoulder = pl[11]
         r_shoulder = pl[12]
-        shoulder_tilt = abs(l_shoulder.y - r_shoulder.y)
+        l_hip = pl[23]
+        r_hip = pl[24]
 
-        # Posture: shoulder width relative to frame (leaning in vs slouching back)
-        shoulder_width = abs(l_shoulder.x - r_shoulder.x)
+        # Posture is measured RELATIVE to the hip line so a tilted
+        # webcam (e.g. laptop on a raised surface angling down) doesn't
+        # produce false "tilted" posture readings. Both the shoulder
+        # axis and the hip axis rotate together with the camera, so the
+        # ANGLE BETWEEN them is invariant to camera orientation.
+        shoulder_axis = math.atan2(
+            r_shoulder.y - l_shoulder.y, r_shoulder.x - l_shoulder.x
+        )
+        hips_visible = (
+            getattr(l_hip, "visibility", 1.0) > 0.4
+            and getattr(r_hip, "visibility", 1.0) > 0.4
+        )
+        if hips_visible:
+            hip_axis = math.atan2(r_hip.y - l_hip.y, r_hip.x - l_hip.x)
+            rel = abs(shoulder_axis - hip_axis)
+            # Wrap to [0, pi]
+            if rel > math.pi:
+                rel = 2 * math.pi - rel
+            shoulder_tilt = rel
+        else:
+            # Fallback for seated users where hips aren't in frame —
+            # use raw shoulder slope. Less accurate but the best we can
+            # do without a hip reference.
+            shoulder_tilt = abs(l_shoulder.y - r_shoulder.y)
 
-        if shoulder_tilt > 0.06:
+        # Slouching: torso height relative to shoulder width. A compressed
+        # torso (short vertical span) means the user is slumped forward
+        # or leaning back off-axis. Ratio-based so it's independent of
+        # how far the user sits from the camera.
+        shoulder_width = math.hypot(
+            l_shoulder.x - r_shoulder.x, l_shoulder.y - r_shoulder.y
+        )
+        torso_height = 0.0
+        if hips_visible:
+            mid_shoulder = ((l_shoulder.x + r_shoulder.x) / 2,
+                            (l_shoulder.y + r_shoulder.y) / 2)
+            mid_hip = ((l_hip.x + r_hip.x) / 2, (l_hip.y + r_hip.y) / 2)
+            torso_height = math.hypot(
+                mid_shoulder[0] - mid_hip[0], mid_shoulder[1] - mid_hip[1]
+            )
+
+        # Thresholds: tilt > ~17° (0.3 rad) relative to hips means one
+        # shoulder is dropped; torso:shoulder ratio < 1.1 is compressed.
+        if shoulder_tilt > 0.30:
             posture = 'tilted'
-        elif shoulder_width < 0.1:
+        elif hips_visible and shoulder_width > 0 and torso_height / shoulder_width < 1.1:
+            posture = 'slouching'
+        elif not hips_visible and shoulder_width < 0.1:
+            # Hips off-screen and shoulders tiny → user is far from cam
+            # or hunched forward. Mark as slouching for back-compat.
             posture = 'slouching'
         else:
             posture = 'upright'
@@ -270,16 +369,40 @@ class FaceEngine:
 
         fidget_score = 0
         if len(self.pose_history) >= 10:
-            # Compare current position to 10 frames ago
-            old = self.pose_history[-10]
-            total_movement = 0
-            for key in ['l_shoulder', 'r_shoulder', 'l_wrist', 'r_wrist']:
-                dx = current_pose[key][0] - old[key][0]
-                dy = current_pose[key][1] - old[key][1]
-                total_movement += math.sqrt(dx*dx + dy*dy)
-            # Scale to 0-100 (higher = more fidgeting)
-            # Reduced sensitivity — normal webcam micro-movements shouldn't register
-            fidget_score = min(100, int(max(0, total_movement - 0.03) * 300))
+            # Fidgeting is quantified as SHOULDER drift only — wrists are
+            # excluded because presentation coaches actively encourage
+            # hand gesturing, and raw wrist displacement can't tell a
+            # purposeful point-at-slide gesture apart from a nervous
+            # tic. Shoulders, by contrast, should stay roughly planted
+            # throughout a presentation; rapid shoulder motion means
+            # the whole upper body is jittering.
+            #
+            # We also look at DIRECTION CHANGES, not just total distance.
+            # A smooth lean-in (consistent direction) shouldn't count,
+            # but bouncing back-and-forth does. We approximate this by
+            # comparing short-term (3 frames) vs long-term (10 frames)
+            # drift: if the 3-frame drift is large relative to the
+            # 10-frame drift, motion is jerky/fidgety rather than smooth.
+            old_long = self.pose_history[-10]
+            old_short = self.pose_history[-3]
+            short_move = 0.0
+            long_move = 0.0
+            for key in ['l_shoulder', 'r_shoulder']:
+                short_move += math.hypot(
+                    current_pose[key][0] - old_short[key][0],
+                    current_pose[key][1] - old_short[key][1],
+                )
+                long_move += math.hypot(
+                    current_pose[key][0] - old_long[key][0],
+                    current_pose[key][1] - old_long[key][1],
+                )
+            # jerkiness in [0, ~3]: high when short-term drift outpaces
+            # long-term (= lots of direction changes, i.e. fidgeting).
+            jerkiness = short_move / (long_move + 0.01)
+            # Only flag when BOTH the motion is meaningful (short_move
+            # above webcam-noise floor) AND it's jerky rather than smooth.
+            if short_move > 0.03 and jerkiness > 1.2:
+                fidget_score = min(100, int((short_move - 0.03) * 400))
 
         return {
             'posture': posture,
@@ -351,8 +474,11 @@ class FaceEngine:
             face_r = self.face_lm.detect(mi)
         except Exception:
             return None
+        self.frames_processed += 1
         if not face_r.face_landmarks:
             return None
+        if len(face_r.face_landmarks) > 1:
+            self.frames_multi_face += 1
 
         fl = face_r.face_landmarks[0]
         blendshapes = face_r.face_blendshapes[0] if face_r.face_blendshapes else []
@@ -575,3 +701,5 @@ class FaceEngine:
         self.expr_history.clear()
         self.baseline = None
         self.calibration_frames = []
+        self.frames_processed = 0
+        self.frames_multi_face = 0

@@ -39,6 +39,23 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         vals = [s.get(key, 0) for s in all_scores]
         return round(sum(vals) / max(len(vals), 1))
 
+    def stderr(key):
+        """Standard error of the mean: std / sqrt(N).
+
+        Quantifies per-chunk variability around the headline average —
+        NOT ground-truth accuracy. Use it as "how steady was this signal
+        across the session?" If stderr is small the session was
+        consistent; if large, the signal swung a lot and the average
+        hides that.
+        """
+        vals = [s.get(key, 0) for s in all_scores]
+        n = len(vals)
+        if n < 2:
+            return 0
+        mean = sum(vals) / n
+        var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+        return round((var ** 0.5) / (n ** 0.5), 1)
+
     avg_total = avg("total")
     peak_total = max((s.get("total", 0) for s in all_scores), default=0)
     lowest_total = min((s.get("total", 0) for s in all_scores), default=0)
@@ -52,6 +69,16 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         "expression": avg("expression"),
     }
 
+    signal_stderrs = {
+        "voice_steadiness": stderr("voice_steadiness"),
+        "eye_contact": stderr("eye_contact"),
+        "speech_pace": stderr("speech_pace"),
+        "filler_words": stderr("filler_words"),
+        "vocal_variety": stderr("vocal_variety"),
+        "expression": stderr("expression"),
+        "total": stderr("total"),
+    }
+
     # ── Filler word breakdown ────────────────────────────────────────
     filler_counts = {}
     for w in all_words:
@@ -62,6 +89,34 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         len(s.get("acoustic_fillers", [])) for s in all_raw
     )
     total_fillers = sum(filler_counts.values()) + total_acoustic
+
+    # ── Language confidence (Whisper auto-detect) ───────────────────
+    # Majority vote across chunks: if most voiced chunks detected a
+    # non-English language (or low confidence), flag the whole session
+    # so the UI can warn the user that the analysis may be unreliable.
+    voiced_chunks = [r for r in all_raw if r.get("voiced_s", 0) >= 0.8]
+    langs = [r.get("language", "en") for r in voiced_chunks]
+    low_conf_flags = [bool(r.get("language_low_confidence")) for r in voiced_chunks]
+    non_en_count = sum(1 for L in langs if L and L != "en")
+    low_conf_count = sum(1 for f in low_conf_flags if f)
+    language_warning = None
+    dominant_language = "en"
+    if voiced_chunks:
+        if non_en_count > len(voiced_chunks) // 2:
+            # Most chunks weren't English — pick the most common non-en language.
+            from collections import Counter
+            dominant_language = Counter(
+                L for L in langs if L and L != "en"
+            ).most_common(1)[0][0]
+            language_warning = (
+                f"Detected speech as '{dominant_language}', not English. "
+                "Scoring is optimised for English — results may be unreliable."
+            )
+        elif low_conf_count > len(voiced_chunks) // 2:
+            language_warning = (
+                "Language detection confidence was low across most of the "
+                "session. The transcript and scores may be unreliable."
+            )
 
     # ── Pace statistics ──────────────────────────────────────────────
     wpms = [s.get("wpm", 0) for s in all_raw if s.get("wpm", 0) > 0]
@@ -75,6 +130,62 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         ),
         "ideal_pct": round(
             sum(1 for w in wpms if 130 <= w <= 160) / max(len(wpms), 1) * 100
+        ),
+    }
+
+    # ── Per-signal explanation ──────────────────────────────────────
+    # Every number in signal_averages gets a one-liner explaining WHY
+    # it is what it is, drawn from the underlying aggregate statistics.
+    # A score without an explanation is a black box users can't argue
+    # with. "scored 45 because filler_rate was 12% (avg 3)" gives them
+    # something concrete to improve on.
+    pitch_stds = [r.get("pitch", {}).get("std_hz", 0) for r in all_raw]
+    pitch_stds_nonzero = [p for p in pitch_stds if p > 0]
+    avg_pitch_std = (
+        sum(pitch_stds_nonzero) / len(pitch_stds_nonzero)
+        if pitch_stds_nonzero else 0
+    )
+    voiced_total_s = sum(r.get("voiced_s", 0) for r in all_raw)
+    filler_rate_pct = (
+        round(total_fillers / max(duration_s, 1) * 60, 1)
+        if duration_s > 0 else 0.0
+    )
+
+    def _explain_score(score):
+        if score >= 80: return "strong"
+        if score >= 65: return "solid"
+        if score >= 50: return "developing"
+        if score >= 35: return "below average"
+        return "weak"
+
+    signal_reasons = {
+        "voice_steadiness": (
+            f"{_explain_score(signal_avgs['voice_steadiness'])}: "
+            f"pitch SD {avg_pitch_std:.1f} Hz across {len(voiced_chunks)} voiced "
+            f"chunks"
+        ),
+        "eye_contact": (
+            f"{_explain_score(signal_avgs['eye_contact'])}: averaged across "
+            f"face-detected frames"
+        ),
+        "speech_pace": (
+            f"{_explain_score(signal_avgs['speech_pace'])}: avg {pace['avg_wpm']} WPM"
+            + (f", {pace['too_fast_pct']}% too fast" if pace['too_fast_pct'] > 15 else "")
+            + (f", {pace['too_slow_pct']}% too slow" if pace['too_slow_pct'] > 15 else "")
+            + (" (ideal 130-160)" if pace['avg_wpm'] else "")
+        ),
+        "filler_words": (
+            f"{_explain_score(signal_avgs['filler_words'])}: "
+            f"{total_fillers} fillers total ({filler_rate_pct}/min) — "
+            f"{sum(filler_counts.values())} lexical, {total_acoustic} acoustic"
+        ),
+        "vocal_variety": (
+            f"{_explain_score(signal_avgs['vocal_variety'])}: pitch SD "
+            f"{avg_pitch_std:.1f} Hz (monotone <5, natural 15-50, animated 50+)"
+        ),
+        "expression": (
+            f"{_explain_score(signal_avgs['expression'])}: excluded from "
+            f"total score — display only"
         ),
     }
 
@@ -197,6 +308,8 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         "grade": grade,
         "grade_label": label,
         "signal_averages": signal_avgs,
+        "signal_stderrs": signal_stderrs,
+        "signal_reasons": signal_reasons,
         "weakest_signal": sorted_signals[0][0] if sorted_signals else "unknown",
         "filler_breakdown": filler_counts,
         "total_fillers": total_fillers,
@@ -206,4 +319,6 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         "action_items": action_items,
         "timeline": timeline,
         "transcript": transcript,
+        "language": dominant_language,
+        "language_warning": language_warning,
     }

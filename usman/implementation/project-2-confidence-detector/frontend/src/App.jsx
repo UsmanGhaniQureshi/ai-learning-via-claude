@@ -6,6 +6,7 @@ import Result from './pages/Result'
 import LiveSession from './pages/LiveSession'
 import Analyzer from './pages/Analyzer'
 import History from './pages/History'
+import ErrorBoundary from './components/ErrorBoundary'
 
 function App() {
   const location = useLocation()
@@ -27,24 +28,26 @@ function App() {
         </button>
       )}
 
-      <Routes>
-        <Route path="/" element={<Home />} />
-        <Route path="/live" element={<LiveSession />} />
-        <Route path="/upload" element={<Upload />} />
-        <Route path="/analyzer" element={<Analyzer />} />
-        <Route path="/library" element={<History />} />
-        <Route path="/result/:id" element={<Result />} />
-        <Route
-          path="*"
-          element={
-            <div className="section">
-              <h2>Page not found</h2>
-              <p className="subtitle">No route matches this URL.</p>
-              <Link to="/" className="report-btn">← Home</Link>
-            </div>
-          }
-        />
-      </Routes>
+      <ErrorBoundary>
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/live" element={<LiveSession />} />
+          <Route path="/upload" element={<Upload />} />
+          <Route path="/analyzer" element={<Analyzer />} />
+          <Route path="/library" element={<History />} />
+          <Route path="/result/:id" element={<Result />} />
+          <Route
+            path="*"
+            element={
+              <div className="section">
+                <h2>Page not found</h2>
+                <p className="subtitle">No route matches this URL.</p>
+                <Link to="/" className="report-btn">← Home</Link>
+              </div>
+            }
+          />
+        </Routes>
+      </ErrorBoundary>
     </div>
   )
 }

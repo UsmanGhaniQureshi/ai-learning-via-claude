@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
-import { API_BASE } from '../config'
+import { API_BASE, apiFetch } from '../config'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
 import FeedbackTips from '../components/FeedbackTips'
@@ -31,7 +31,7 @@ export default function Result() {
     setData(null)
     ;(async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/report/${id}`)
+        const res = await apiFetch(`${API_BASE}/api/report/${id}`)
         if (res.status === 404) {
           if (!cancelled) {
             setError('not_found')
@@ -132,6 +132,19 @@ export default function Result() {
 
   return (
     <div className="section">
+      {data.language_warning && (
+        <div
+          className="session-error"
+          style={{
+            background: '#3b2f00',
+            border: '1px solid #8a7100',
+            color: '#ffd95a',
+            marginBottom: 16,
+          }}
+        >
+          <strong>Language warning:</strong> {data.language_warning}
+        </div>
+      )}
       {isAnalyzerAudio && <AudioPlaybackReview report={data} />}
       <SessionReport report={data} showRecording={!isAnalyzerAudio} />
       <Link to="/library" className="report-btn" style={{ marginTop: 16 }}>
@@ -177,6 +190,18 @@ function UploadResult({ data }) {
             reflect the speaker.
           </div>
         )}
+        {data.multi_face_warning && (
+          <div
+            className="session-error"
+            style={{
+              background: '#3b2f00',
+              border: '1px solid #8a7100',
+              color: '#ffd95a',
+            }}
+          >
+            <strong>Multiple faces:</strong> {data.multi_face_warning}
+          </div>
+        )}
         {data.audio_extraction_error && (
           <div className="session-error">
             Audio could not be extracted: {data.audio_extraction_error}
@@ -200,7 +225,12 @@ function UploadResult({ data }) {
           </div>
         </div>
 
-        {data.sub_scores && <SignalBars scores={data.sub_scores} />}
+        {data.sub_scores && (
+          <SignalBars
+            scores={data.sub_scores}
+            faceUnavailable={!!data.no_face_detected}
+          />
+        )}
 
         {data.tips && <FeedbackTips tips={data.tips} />}
 
