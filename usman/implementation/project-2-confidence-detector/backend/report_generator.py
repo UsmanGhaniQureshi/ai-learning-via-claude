@@ -18,7 +18,21 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
 
     all_scores = [s["scores"] for s in snapshots]
     all_raw = [s["raw"] for s in snapshots]
-    all_words = [w for s in snapshots for w in s.get("transcript_words", [])]
+    # Shift per-word timestamps into ABSOLUTE media time (each chunk is 3s,
+    # so chunk i contributes offset i*3000ms). Without this, word 0 of every
+    # chunk has start_ms=0, and AudioPlaybackReview can't sync past the
+    # first chunk.
+    all_words = []
+    for i, snap in enumerate(snapshots):
+        offset = i * 3000
+        for w in snap.get("transcript_words", []):
+            all_words.append({
+                "word": w.get("word"),
+                "start_ms": (w.get("start_ms") or 0) + offset,
+                "end_ms": (w.get("end_ms") or 0) + offset,
+                "is_filler": w.get("is_filler", False),
+                "probability": w.get("probability"),
+            })
     duration_s = len(snapshots) * 3
 
     def avg(key):

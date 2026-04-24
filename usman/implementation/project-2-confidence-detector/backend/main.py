@@ -808,6 +808,11 @@ async def session_ws(ws: WebSocket, session_id: str):
     Server sends:
       - Per-chunk JSON with scores + transcript
       - Final {"type": "session_ended", "report": {...}} on disconnect
+
+    ?kind query param (default "session"):
+      - "session"        → Live Practice flow; persisted as video, video_url served.
+      - "analyzer_audio" → Live Audio Analyzer flow; persisted as audio-only,
+                           audio_url served.
     """
     await ws.accept()
 
@@ -820,6 +825,10 @@ async def session_ws(ws: WebSocket, session_id: str):
         await ws.close()
         return
 
+    kind = ws.query_params.get("kind", "session")
+    if kind not in ("session", "analyzer_audio"):
+        kind = "session"
+
     pipeline = AudioPipeline()
     snapshots = []
     latest_browser_face = {}  # Face scores from browser MediaPipe
@@ -827,11 +836,16 @@ async def session_ws(ws: WebSocket, session_id: str):
 
     async def finalize_and_send_report():
         """Generate report and send via WebSocket while still open."""
-        # Audio already lives inside the uploaded WEBM — no separate WAV.
-        recording_info = {
-            "session_id": session_id,
-            "video_url": f"/api/recordings/{session_id}/video",
-        }
+        if kind == "analyzer_audio":
+            recording_info = {
+                "media_id": session_id,
+                "audio_url": f"/api/analyzer/{session_id}/audio",
+            }
+        else:
+            recording_info = {
+                "session_id": session_id,
+                "video_url": f"/api/recordings/{session_id}/video",
+            }
         report = generate_post_session_report(snapshots, session_id)
         report["recording"] = recording_info
         # Phase 2: report JSON is now stored inside Media.report_json via
@@ -874,17 +888,40 @@ async def session_ws(ws: WebSocket, session_id: str):
                         for w in snap.get("transcript_words", [])
                     ],
                 })
+            # Audio-only analyzer rows don't have a video file. Their
+            # playback file is whichever audio extension the client
+            # uploaded (saved by /api/session/upload-audio as analyzer_<id>.<ext>).
+            if kind == "analyzer_audio":
+                audio_matches = list(RECORDINGS_DIR.glob(f"{session_id}.*"))
+                playback = audio_matches[0].name if audio_matches else None
+                has_video = False
+                has_audio = True
+                source_kind = "analyzer_audio"
+                # Face timeline is meaningless for audio-only; skip it.
+                face_rows = []
+            else:
+                playback = f"{session_id}_video.webm"
+                has_video = (RECORDINGS_DIR / playback).exists()
+                has_audio = True
+                source_kind = "session"
+                face_rows = face_tl
+
+            # Attach speech_timeline to the report so AudioPlaybackReview
+            # (and any future consumer) can always reach absolute-timestamped
+            # words, regardless of how transcript was built.
+            report["speech_timeline"] = speech_tl
+
             _persist_media_and_segments(
                 media_id=session_id,
-                source_kind="session",
+                source_kind=source_kind,
                 original_name=None,
                 stored_path=None,
-                playback_path=f"{session_id}_video.webm",
+                playback_path=playback,
                 duration_s=float(report.get("duration_s") or (len(snapshots) * 3)),
-                has_video=(RECORDINGS_DIR / f"{session_id}_video.webm").exists(),
-                has_audio=True,
+                has_video=has_video,
+                has_audio=has_audio,
                 score_avg=report.get("avg_score"),
-                face_timeline=face_tl,
+                face_timeline=face_rows,
                 speech_timeline=speech_tl,
                 report_json=report,
             )
@@ -1052,6 +1089,11 @@ async def analyze_audio_file(
             ],
         })
 
+    # Attach speech_timeline to the stored report so AudioPlaybackReview
+    # can always reach absolute-timestamped words even if report.transcript
+    # is ever off.
+    report["speech_timeline"] = speech_tl
+
     try:
         _persist_media_and_segments(
             media_id=media_id,
@@ -1120,6 +1162,43 @@ async def upload_session_video(
     return {
         "status": "saved",
         "video_url": f"/api/recordings/{session_id}/video",
+        "size_mb": size_mb,
+    }
+
+
+@app.post("/api/session/upload-audio")
+async def upload_session_audio(
+    audio: UploadFile = File(...),
+    session_id: str = Form(...),
+):
+    """Save an audio recording from a live audio analyzer session.
+
+    Files land as `{session_id}.{ext}` in RECORDINGS_DIR, which
+    /api/analyzer/{id}/audio already serves. Keeping the extension lets us
+    serve with a correct MIME (webm/wav/mp3/etc.) on read.
+    """
+    suffix = Path(audio.filename or "recording.webm").suffix.lower()
+    if suffix not in {".webm", ".wav", ".mp3", ".m4a", ".ogg"}:
+        suffix = ".webm"
+    path = RECORDINGS_DIR / f"{session_id}{suffix}"
+    size = 0
+    with open(path, "wb") as f:
+        while True:
+            chunk = await audio.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_SIZE:
+                f.close()
+                path.unlink(missing_ok=True)
+                return JSONResponse(
+                    {"error": "File too large (max 500MB)"}, status_code=413
+                )
+            f.write(chunk)
+    size_mb = round(size / 1e6, 2)
+    return {
+        "status": "saved",
+        "audio_url": f"/api/analyzer/{session_id}/audio",
         "size_mb": size_mb,
     }
 

@@ -5,6 +5,7 @@ import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
 import FeedbackTips from '../components/FeedbackTips'
 import PlaybackReview from '../components/PlaybackReview'
+import AudioPlaybackReview from '../components/AudioPlaybackReview'
 import TimelineModal from '../components/TimelineModal'
 import SessionReport from '../components/SessionReport'
 
@@ -124,11 +125,15 @@ export default function Result() {
     )
   }
 
-  // Session / analyzer_audio: SessionReport renders scores + transcript
-  // + video/audio via recording.video_url or recording.audio_url.
+  // Analyzer audio: audio playback synced to scores + transcript, then the
+  // full SessionReport underneath for the static numbers.
+  const isAnalyzerAudio =
+    data.kind === 'analyzer_audio' || data?.recording?.audio_url != null
+
   return (
     <div className="section">
-      <SessionReport report={data} showRecording={true} />
+      {isAnalyzerAudio && <AudioPlaybackReview report={data} />}
+      <SessionReport report={data} showRecording={!isAnalyzerAudio} />
       <Link to="/library" className="report-btn" style={{ marginTop: 16 }}>
         ← Back to Library
       </Link>
