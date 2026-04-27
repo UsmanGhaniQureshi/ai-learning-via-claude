@@ -32,25 +32,44 @@ class SignalScorer:
     @staticmethod
     def speech_pace(words, vad_segments):
         """Score speech pace using articulation rate (words per voiced second).
-        words: list of word dicts from whisper transcription.
-        vad_segments: list of (start_ms, end_ms) speech segments."""
-        voiced_s = max(sum(e - s for s, e in vad_segments) / 1000, 0.1)
+
+        The old piecewise curve had a cliff at 180 WPM — a chunk at 181
+        WPM got 0 while a chunk at 180 WPM got 40. That produced huge
+        false penalties for anyone speaking a bit fast. The curve below
+        is smooth and mirror-symmetric around the 140 WPM sweet spot,
+        matching the one in scoring_engine._wpm_to_score.
+
+        Returns None for chunks with no meaningful speech (voiced_s<0.5)
+        so callers can exclude silence from the aggregate rather than
+        averaging a zero that drags everything down.
+        """
+        voiced_s = sum(e - s for s, e in vad_segments) / 1000
+        # Reject silence/near-silence chunks. Caller decides what to do.
+        if voiced_s < 0.5:
+            return None
+
         count = len([w for w in words if len(w.get("word", "")) > 1])
         wpm = (count / voiced_s) * 60
 
-        if 130 <= wpm <= 160:
+        # Sweet spot 130-150, gentle falloff on either side, floor 10.
+        if wpm <= 0:
+            return 20
+        if 130 <= wpm <= 150:
             score = 100
-        elif 110 <= wpm < 130:
-            score = 70 + (wpm - 110) * 1.5
+        elif 120 <= wpm <= 160:
+            score = 90
+        elif 100 <= wpm < 120:
+            score = 60 + (wpm - 100) * 1.5     # 60 → 90
         elif 160 < wpm <= 180:
-            score = 100 - (wpm - 160) * 3
-        elif wpm > 180:
-            score = max(0, 100 - (wpm - 160) * 5)
-        elif 80 <= wpm < 110:
-            score = 40 + (wpm - 80)
-        else:
-            score = max(0, wpm * 0.5)
-
+            score = 90 - (wpm - 160) * 1.5     # 90 → 60
+        elif 80 <= wpm < 100:
+            score = 30 + (wpm - 80) * 1.5      # 30 → 60
+        elif 180 < wpm <= 200:
+            score = 60 - (wpm - 180) * 1.5     # 60 → 30
+        elif wpm < 80:
+            score = max(10, int(wpm * 0.375))
+        else:  # wpm > 200
+            score = max(10, 30 - int((wpm - 200) * 0.5))
         return round(score)
 
     @staticmethod
@@ -136,4 +155,12 @@ class SignalScorer:
             "filler_words": 0.20,
             "vocal_variety": 0.12,
         }
-        return round(sum(signals.get(k, 50) * w for k, w in weights.items()))
+        # `None` means "no signal available for this chunk" (e.g.
+        # speech_pace on a silent chunk). Treat it as neutral 50 so a
+        # silent chunk gets a reasonable total rather than dragging it
+        # to zero. The session-wide average below excludes Nones from
+        # the speech_pace denominator separately.
+        def _val(k):
+            v = signals.get(k)
+            return 50 if v is None else v
+        return round(sum(_val(k) * w for k, w in weights.items()))

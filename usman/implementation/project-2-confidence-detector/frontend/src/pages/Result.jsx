@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { useParams, Link } from 'react-router-dom'
-import { API_BASE, apiFetch } from '../config'
+import { useNavigate, useParams, Link } from 'react-router-dom'
+import { API_BASE, apiFetch, mediaUrl } from '../config'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
 import FeedbackTips from '../components/FeedbackTips'
@@ -8,6 +8,10 @@ import PlaybackReview from '../components/PlaybackReview'
 import AudioPlaybackReview from '../components/AudioPlaybackReview'
 import TimelineModal from '../components/TimelineModal'
 import SessionReport from '../components/SessionReport'
+import MetadataEditor from '../components/MetadataEditor'
+import TrimPanel from '../components/TrimPanel'
+import CommentsThread from '../components/CommentsThread'
+import ShareModal from '../components/ShareModal'
 
 /**
  * Result — shared page for every analysis result.
@@ -20,9 +24,64 @@ import SessionReport from '../components/SessionReport'
  */
 export default function Result() {
   const { id } = useParams()
+  const navigate = useNavigate()
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [discardBusy, setDiscardBusy] = useState(false)
+  // Share modal toggle. Only renders for owners; recipients see a
+  // "Shared by X" banner instead.
+  const [shareOpen, setShareOpen] = useState(false)
+  // Imperative handle to whichever media player is currently rendered
+  // (audio for analyzer_audio, video for session/upload). Populated by
+  // the player's forwardRef / playerHandleRef on mount, consumed by
+  // CommentsThread to seek + auto-pause for ranged comments.
+  const playerRef = useRef(null)
+
+  // Refresh from server. Used after trim (file changed → duration_s
+  // refreshes) and after metadata edits that need a re-render.
+  async function reload() {
+    try {
+      const res = await apiFetch(`${API_BASE}/api/report/${id}`)
+      if (res.status === 404) { setError('not_found'); return }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const json = await res.json()
+      setData(json)
+    } catch (e) {
+      setError(e.message || 'Failed to reload result')
+    }
+  }
+
+  // Discard + re-take: hard-deletes the recording then sends the user
+  // back to the live page. Same backend path as DELETE — the framing
+  // here is "I want to redo this", not "GDPR delete forever". Uses
+  // confirm() because the action is irreversible and a stray click
+  // shouldn't trash a recording.
+  async function discardAndRetake() {
+    if (!data) return
+    if (!window.confirm(
+      'Discard this recording and start over? This cannot be undone.'
+    )) return
+    setDiscardBusy(true)
+    try {
+      const res = await apiFetch(`${API_BASE}/api/media/${id}/discard`, {
+        method: 'POST',
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.error || `HTTP ${res.status}`)
+      }
+      // Route back to the originating mode. analyzer_audio came from
+      // /analyzer (live audio); session from /live; upload from /upload.
+      const dest = data.kind === 'analyzer_audio' ? '/analyzer'
+                 : data.kind === 'session' ? '/live'
+                 : '/upload'
+      navigate(dest, { replace: true })
+    } catch (e) {
+      alert(`Discard failed: ${e.message}`)
+      setDiscardBusy(false)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -97,7 +156,22 @@ export default function Result() {
     Array.isArray(data.face_timeline)
 
   if (looksLikeUpload) {
-    return <UploadResult data={data} />
+    return (
+      <UploadResult
+        data={data}
+        mediaId={data.media_id || id}
+        onUpdated={(saved) => setData((prev) => ({ ...prev, ...saved }))}
+        onTrimmed={() => reload()}
+        onDiscard={discardAndRetake}
+        discardBusy={discardBusy}
+        isOwner={data.is_owner !== false}
+        sharedBy={data.shared_by}
+        onOpenShare={() => setShareOpen(true)}
+        shareModalOpen={shareOpen}
+        onCloseShare={() => setShareOpen(false)}
+        playerRef={playerRef}
+      />
+    )
   }
 
   const looksLikeSessionReport =
@@ -130,6 +204,10 @@ export default function Result() {
   const isAnalyzerAudio =
     data.kind === 'analyzer_audio' || data?.recording?.audio_url != null
 
+  // Owner vs recipient view. Backend sends `is_owner` and `shared_by`;
+  // recipients only see the read+comment surface.
+  const isOwner = data.is_owner !== false  // default true for legacy records
+
   return (
     <div className="section">
       {data.language_warning && (
@@ -145,22 +223,115 @@ export default function Result() {
           <strong>Language warning:</strong> {data.language_warning}
         </div>
       )}
-      {isAnalyzerAudio && <AudioPlaybackReview report={data} />}
-      <SessionReport report={data} showRecording={!isAnalyzerAudio} />
-      <Link to="/library" className="report-btn" style={{ marginTop: 16 }}>
-        ← Back to Library
-      </Link>
+
+      {!isOwner && data.shared_by && (
+        <div
+          style={{
+            background: '#1a2438',
+            border: '1px solid #2a3850',
+            color: '#cfe1ff',
+            padding: '10px 14px',
+            borderRadius: 6,
+            marginBottom: 16,
+            fontSize: '0.9em',
+          }}
+        >
+          <strong>Shared by</strong> {data.shared_by.name || data.shared_by.email}.
+          You can read and comment, but only the owner can edit, trim,
+          or delete this recording.
+        </div>
+      )}
+
+      {isOwner && (
+        <MetadataEditor
+          mediaId={data.media_id || id}
+          initial={{ title: data.title, topic: data.topic, tags: data.tags }}
+          onUpdated={(saved) => setData((prev) => ({ ...prev, ...saved }))}
+        />
+      )}
+
+      {isAnalyzerAudio && <AudioPlaybackReview ref={playerRef} report={data} />}
+      <SessionReport
+        report={data}
+        showRecording={!isAnalyzerAudio}
+        // Only attach playerHandleRef to SessionReport when it's
+        // actually showing the recording video. Without that condition
+        // the audio-branch and video-branch would race to overwrite
+        // playerRef with each other's API.
+        playerHandleRef={!isAnalyzerAudio ? playerRef : null}
+      />
+
+      {isOwner && (
+        <TrimPanel
+          mediaId={data.media_id || id}
+          durationS={data.duration_s_current ?? data.duration_s ?? 0}
+          onTrimmed={() => reload()}
+        />
+      )}
+
+      <CommentsThread
+        mediaId={data.media_id || id}
+        isMediaOwner={isOwner}
+        playerRef={playerRef}
+      />
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
+        <Link to="/library" className="report-btn">
+          ← Back to Library
+        </Link>
+        {isOwner && (
+          <>
+            <button
+              type="button"
+              onClick={() => setShareOpen(true)}
+              className="report-btn"
+              style={{ background: '#2a3850' }}
+            >
+              Share this recording
+            </button>
+            <button
+              type="button"
+              onClick={discardAndRetake}
+              disabled={discardBusy}
+              style={{
+                background: 'transparent',
+                border: '1px solid #6a1b1b',
+                color: '#ff7a7a',
+                padding: '8px 14px',
+                borderRadius: 6,
+                cursor: discardBusy ? 'wait' : 'pointer',
+              }}
+            >
+              {discardBusy ? 'Discarding…' : 'Discard & re-take'}
+            </button>
+          </>
+        )}
+      </div>
+
+      {shareOpen && (
+        <ShareModal
+          mediaId={data.media_id || id}
+          onClose={() => setShareOpen(false)}
+        />
+      )}
     </div>
   )
 }
 
 // ── Upload-result view (same markup the old inline App.jsx block rendered) ──
-function UploadResult({ data }) {
+function UploadResult({
+  data, mediaId, onUpdated, onTrimmed, onDiscard, discardBusy,
+  isOwner = true, sharedBy = null,
+  onOpenShare, shareModalOpen, onCloseShare,
+  // From parent — single ref used by both PlaybackReview (for its
+  // exposed seekAndPlay/getCurrentTime API) and CommentsThread (for
+  // ranged-comment seek + auto-pause).
+  playerRef = null,
+}) {
   const [modalEntry, setModalEntry] = useState(null)
-  const playbackRef = useRef(null)
 
   const processedVideoUrl = data.processed_video
-    ? `${API_BASE}/api/video/${data.processed_video}`
+    ? mediaUrl(`/api/video/${data.processed_video}`)
     : null
 
   const allWords = (data.speech_timeline || []).flatMap(
@@ -183,6 +354,31 @@ function UploadResult({ data }) {
   return (
     <div className="section">
       <div className="results">
+        {!isOwner && sharedBy && (
+          <div
+            style={{
+              background: '#1a2438',
+              border: '1px solid #2a3850',
+              color: '#cfe1ff',
+              padding: '10px 14px',
+              borderRadius: 6,
+              marginBottom: 16,
+              fontSize: '0.9em',
+            }}
+          >
+            <strong>Shared by</strong> {sharedBy.name || sharedBy.email}.
+            You can read and comment, but only the owner can edit, trim,
+            or delete this recording.
+          </div>
+        )}
+
+        {isOwner && (
+          <MetadataEditor
+            mediaId={mediaId}
+            initial={{ title: data.title, topic: data.topic, tags: data.tags }}
+            onUpdated={onUpdated}
+          />
+        )}
         {data.no_face_detected && (
           <div className="session-error">
             No face was detected in this video. Face-based scores
@@ -294,7 +490,12 @@ function UploadResult({ data }) {
         {/* Synced playback */}
         {data.processed_video && (
           <PlaybackReview
-            ref={playbackRef}
+            // Pass the parent's ref directly. forwardRef +
+            // useImperativeHandle in PlaybackReview attaches the
+            // {getCurrentTime, seekAndPlay, seekTo} API to it on
+            // mount. CommentsThread reads the same ref to capture
+            // playback time when the user clicks Set start / Add end.
+            ref={playerRef}
             processedVideo={data.processed_video}
             faceTimeline={data.face_timeline}
             speechTimeline={data.speech_timeline}
@@ -337,7 +538,54 @@ function UploadResult({ data }) {
           </div>
         )}
 
-        <Link to="/library" className="upload-another">← Back to Library</Link>
+        {isOwner && (
+          <TrimPanel
+            mediaId={mediaId}
+            durationS={data.duration_s_current ?? data.duration ?? 0}
+            onTrimmed={onTrimmed}
+          />
+        )}
+
+        <CommentsThread
+          mediaId={mediaId}
+          isMediaOwner={isOwner}
+          playerRef={playerRef}
+        />
+
+        <div style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
+          <Link to="/library" className="report-btn">← Back to Library</Link>
+          {isOwner && (
+            <>
+              <button
+                type="button"
+                onClick={onOpenShare}
+                className="report-btn"
+                style={{ background: '#2a3850' }}
+              >
+                Share this recording
+              </button>
+              <button
+                type="button"
+                onClick={onDiscard}
+                disabled={discardBusy}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #6a1b1b',
+                  color: '#ff7a7a',
+                  padding: '8px 14px',
+                  borderRadius: 6,
+                  cursor: discardBusy ? 'wait' : 'pointer',
+                }}
+              >
+                {discardBusy ? 'Discarding…' : 'Discard & re-take'}
+              </button>
+            </>
+          )}
+        </div>
+
+        {shareModalOpen && (
+          <ShareModal mediaId={mediaId} onClose={onCloseShare} />
+        )}
 
         {modalEntry && processedVideoUrl && (
           <TimelineModal

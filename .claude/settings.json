@@ -192,7 +192,12 @@
       "Bash(\"../detector_env/Scripts/python\" -c \"import ast; ast.parse\\(open\\('report_generator.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(\"detector_env/Scripts/python\" -c \"import ast; ast.parse\\(open\\('backend/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('backend/report_generator.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/python.exe\" -c \"import slowapi, fastapi, sqlalchemy, mediapipe, faster_whisper, numpy, cv2, psycopg, dotenv; print\\('all deps importable in detector_env'\\)\")",
-      "Bash(curl -sf http://localhost:8000/health)"
+      "Bash(curl -sf http://localhost:8000/health)",
+      "Bash(\"../detector_env/Scripts/python.exe\" main.py)",
+      "Bash(\"../detector_env/Scripts/python.exe\" -m alembic upgrade head)",
+      "Bash(npx --no-install vite build)",
+      "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/python.exe\" \"d:/tmp/smoke_phase_1_to_6.py\")",
+      "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/python.exe\" \"d:/tmp/smoke_ranged_comments.py\")"
     ],
     "additionalDirectories": [
       "\\dev",

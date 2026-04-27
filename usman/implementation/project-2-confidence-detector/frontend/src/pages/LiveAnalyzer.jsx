@@ -3,6 +3,9 @@ import { useNavigate } from 'react-router-dom'
 import { API_BASE, apiFetch, wsUrl } from '../config'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
+import PracticeSetup from '../components/PracticeSetup'
+import CountdownOverlay from '../components/CountdownOverlay'
+import PracticeTimer from '../components/PracticeTimer'
 
 /**
  * LiveAnalyzer — real-time audio analyzer.
@@ -47,6 +50,11 @@ export default function LiveAnalyzer() {
   const lastTranscriptRef = useRef('')
   const userStopRef = useRef(false)
   const [connectionLost, setConnectionLost] = useState(false)
+  // Pre-session setup (topic + duration) and countdown overlay state.
+  // Same pattern as LiveSession.jsx — see that file for the rationale.
+  const [setup, setSetup] = useState(null)
+  const [showCountdown, setShowCountdown] = useState(false)
+  const [recStartedAt, setRecStartedAt] = useState(null)
 
   // ── Cleanup — always safe to call ──────────────────────────────────
   const cleanup = useCallback(() => {
@@ -228,12 +236,34 @@ export default function LiveAnalyzer() {
     source.connect(processor)
 
     startedAtRef.current = Date.now()
+    setRecStartedAt(startedAtRef.current)
     durationTimerRef.current = setInterval(() => {
       setDuration(Math.floor((Date.now() - startedAtRef.current) / 1000))
     }, 1000)
 
     setState('active')
   }
+
+  // Pre-session flow: setup → countdown → start. The setup form is the
+  // same component LiveSession uses; the analyser just doesn't render
+  // the gesture badge afterwards.
+  function handleSetupComplete(s) {
+    setSetup(s)
+    setShowCountdown(true)
+  }
+  function handleCountdownComplete() {
+    setShowCountdown(false)
+    start()
+  }
+  const handleTimeUp = useCallback(() => {
+    if (state === 'active') {
+      stop().catch(() => {})
+    }
+    // Note: stop is a function declared below this — JS hoisting makes
+    // the reference resolvable at call time even though it's not yet
+    // defined when this useCallback is created.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state])
 
   // ── Stop ───────────────────────────────────────────────────────────
   const stop = async () => {
@@ -321,20 +351,12 @@ export default function LiveAnalyzer() {
 
       {error && <div className="session-error">{error}</div>}
 
-      {state === 'idle' && (
-        <div className="session-idle">
-          <div className="idle-info">
-            <p className="info-large">Ready to start?</p>
-            <p className="info-small">
-              We'll ask for microphone access. Audio is streamed for
-              analysis and also saved for you to play back afterwards.
-            </p>
-          </div>
-          <button className="start-session-btn" onClick={start}>
-            <span className="start-icon">&#x25B6;</span>
-            Start Recording
-          </button>
-        </div>
+      {state === 'idle' && !showCountdown && (
+        <PracticeSetup onStart={handleSetupComplete} ctaLabel="Start recording" />
+      )}
+
+      {showCountdown && (
+        <CountdownOverlay onComplete={handleCountdownComplete} />
       )}
 
       {state === 'starting' && (
@@ -360,12 +382,43 @@ export default function LiveAnalyzer() {
               so far — we'll redirect you to the report in a moment.
             </div>
           )}
+
+          {setup?.promptTitle && (
+            <div
+              style={{
+                marginBottom: 12,
+                padding: '10px 14px',
+                background: '#1a1a22',
+                borderLeft: '3px solid #4a90e2',
+                borderRadius: 4,
+                fontSize: '0.92rem',
+              }}
+            >
+              <div style={{ opacity: 0.7, fontSize: '0.78rem', marginBottom: 2 }}>
+                Topic
+              </div>
+              <div><strong>{setup.promptTitle}</strong></div>
+            </div>
+          )}
+
+          {setup?.durationMin && (
+            <div style={{ marginBottom: 12 }}>
+              <PracticeTimer
+                targetMin={setup.durationMin}
+                startedAtMs={recStartedAt}
+                onTimeUp={handleTimeUp}
+              />
+            </div>
+          )}
+
           <div className="session-status-bar">
             <div className="status-left">
               <span className="rec-indicator">
                 <span className="rec-dot"></span> REC
               </span>
-              <span className="session-duration">{fmt(duration)}</span>
+              {!setup && (
+                <span className="session-duration">{fmt(duration)}</span>
+              )}
             </div>
           </div>
 

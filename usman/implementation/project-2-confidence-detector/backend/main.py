@@ -30,7 +30,8 @@ import tempfile
 import numpy as np
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
-from fastapi import Request
+from fastapi import Request, Depends, HTTPException
+from pydantic import BaseModel, EmailStr
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from face_engine import FaceEngine
@@ -46,7 +47,7 @@ from slowapi.util import get_remote_address
 import re
 
 from db import SessionLocal, engine as _db_engine
-from models import Media, MediaSegment
+from models import Media, MediaSegment, User, Comment
 from log_config import configure_logging, get_logger
 
 # Install the JSON formatter as early as possible so every subsequent
@@ -90,6 +91,7 @@ def _persist_media_and_segments(
     *,
     media_id: str,
     source_kind: str,
+    user_id: str | None,
     original_name: str | None,
     stored_path: str | None,
     playback_path: str | None,
@@ -101,8 +103,14 @@ def _persist_media_and_segments(
     speech_timeline: list[dict],
     report_json: dict | None = None,
     content_sha256: str | None = None,
+    title: str | None = None,
 ) -> None:
     """Dual-write helper — called from upload + session paths.
+
+    `user_id` is required for new rows (every recording belongs to one
+    user). The parameter is technically Optional because the legacy
+    backfill migration produced rows without one, but every new persist
+    call must supply it. Callers that don't have a user_id are buggy.
 
     Wrapped in a broad try/except by callers so a DB failure cannot kill
     the main response while Phase 2 is still dual-writing alongside the
@@ -114,6 +122,7 @@ def _persist_media_and_segments(
         media = Media(
             id=media_id,
             source_kind=source_kind,
+            user_id=user_id,
             original_name=original_name,
             stored_path=stored_path,
             playback_path=playback_path,
@@ -124,6 +133,12 @@ def _persist_media_and_segments(
             score_grade=grade,
             report_json=report_json,
             content_sha256=content_sha256,
+            # Default title — caller decides what makes sense (filename
+            # stem for uploads, "Recording <ts> - Video/Audio" for
+            # live captures). Trimmed + length-capped to match the
+            # PATCH /api/media/{id} validation, so the user can't end
+            # up with a default that breaks future edits.
+            title=(title.strip()[:200] if isinstance(title, str) and title.strip() else None),
         )
         db.add(media)
         db.flush()
@@ -235,31 +250,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── API-key auth ────────────────────────────────────────────────
-# When API_KEY env var is set, every HTTP request (except the liveness
-# endpoints in AUTH_EXEMPT_PATHS and CORS preflight OPTIONS) must carry
-# a matching X-API-Key header. WebSockets read `?api_key=` from the
-# query string because browsers cannot set custom headers on the WS
-# upgrade handshake.
+# ── JWT-based authentication ────────────────────────────────────
+# Auth is now per-endpoint via FastAPI's `Depends(get_current_user)`.
+# Each protected handler declares the dependency and receives a `User`
+# object; unauthenticated callers get a 401 with a clean WWW-Authenticate
+# header. Public endpoints (login, register, health, root, docs) simply
+# don't include the dependency.
 #
-# When API_KEY is unset or empty, auth is disabled — local dev stays a
-# one-command affair. Do NOT deploy to production without setting it.
-API_KEY = os.environ.get("API_KEY", "").strip()
-AUTH_EXEMPT_PATHS = {"/", "/health", "/docs", "/redoc", "/openapi.json"}
-
-
-@app.middleware("http")
-async def api_key_auth(request: Request, call_next):
-    if not API_KEY:
-        return await call_next(request)
-    if request.method == "OPTIONS" or request.url.path in AUTH_EXEMPT_PATHS:
-        return await call_next(request)
-    if request.headers.get("X-API-Key") != API_KEY:
-        return JSONResponse(
-            {"error": "unauthorized", "detail": "missing or invalid X-API-Key"},
-            status_code=401,
-        )
-    return await call_next(request)
+# The previous global X-API-Key middleware was removed because:
+#   - middleware-level checks tangled with per-endpoint exemption lists
+#   - real user identity (User row) was never threaded through anyway
+#   - JWT verification needs to be selective: /api/auth/login MUST be
+#     reachable without a token
+#
+# The frontend stores the JWT in localStorage and sends it as
+# Authorization: Bearer <token> via apiFetch.
+#
+# WebSocket auth is handled inside the session_ws handler — it reads
+# `?token=` from the query string, decodes it, and rejects with a 4401
+# close code on failure (browsers can't set custom headers on WS
+# upgrades, so query-string is the only option).
+from auth import (
+    JWT_SECRET, _DEFAULT_SECRET,
+    decode_token, get_current_user, get_current_user_for_media,
+    media_readable_by, media_owned_by,
+)
+if JWT_SECRET == _DEFAULT_SECRET:
+    log.warning(
+        "auth.jwt_secret_default",
+        extra={
+            "detail": (
+                "JWT_SECRET is the dev default. Set JWT_SECRET env var "
+                "to a random 32+ byte string before deploying to "
+                "production — otherwise tokens are forgeable by anyone "
+                "who reads this codebase."
+            ),
+        },
+    )
 
 
 # ── Rate limiting (slowapi) ─────────────────────────────────────
@@ -367,11 +394,128 @@ def health():
 
 
 # ============================================================
+# AUTH — register / login / me
+# ============================================================
+class RegisterPayload(BaseModel):
+    email: EmailStr
+    name: str
+    password: str
+
+
+class LoginPayload(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    token: str
+    user: dict
+
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+@limiter.limit("10/hour")
+def register(request: Request, payload: RegisterPayload):
+    """Create a new account and return a JWT.
+
+    Email uniqueness is enforced at the DB level (unique index). On
+    conflict we return 409 with a generic "already registered" message
+    so we don't leak which emails are present (mild enumeration guard;
+    the login flow's distinct error messages would defeat it, but no
+    point making it free).
+    """
+    from auth import hash_password, create_access_token, new_user_id
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required.")
+    try:
+        pw_hash = hash_password(payload.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    user_id = new_user_id()
+    with SessionLocal() as db:
+        existing = db.query(User).filter(User.email == payload.email).first()
+        if existing is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="An account with that email already exists.",
+            )
+        user = User(
+            id=user_id,
+            email=str(payload.email).lower(),
+            name=name,
+            password_hash=pw_hash,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return TokenResponse(
+            token=create_access_token(user.id),
+            user={"id": user.id, "email": user.email, "name": user.name},
+        )
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+@limiter.limit("20/hour")
+def login(request: Request, payload: LoginPayload):
+    """Verify credentials and return a JWT.
+
+    Returns 401 with a deliberately vague message on either bad email
+    OR bad password. Distinguishing the two would let an attacker
+    enumerate registered emails.
+    """
+    from auth import verify_password, create_access_token
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.email == str(payload.email).lower()).first()
+        if user is None or not verify_password(payload.password, user.password_hash):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email or password.",
+            )
+        return TokenResponse(
+            token=create_access_token(user.id),
+            user={"id": user.id, "email": user.email, "name": user.name},
+        )
+
+
+@app.get("/api/auth/me")
+def me(user: User = Depends(get_current_user)):
+    """Return the current user. Frontend uses this on app boot to
+    decide whether to show login or the main UI."""
+    return {"id": user.id, "email": user.email, "name": user.name}
+
+
+# ============================================================
+# PROMPTS — practice topic library
+# ============================================================
+@app.get("/api/prompts")
+def get_prompts(user: User = Depends(get_current_user)):
+    """Return the practice-prompt library. Auth-required so the list
+    isn't world-scrapable, even though the content is non-sensitive
+    today — keeps the policy uniform across endpoints.
+
+    Response shape: [{id, title, body, category, suggested_min}, ...]
+    """
+    from prompts import list_prompts
+    return list_prompts()
+
+
+# Logout is intentionally not a server endpoint. JWT is stateless;
+# "logout" is the client dropping its token from localStorage. A real
+# server-side logout would require a token-blacklist table, which
+# isn't worth the complexity at this scale.
+
+
+# ============================================================
 # MODE 1: VIDEO UPLOAD + ANALYSIS (legacy offline mode)
 # ============================================================
 @app.post("/api/upload")
 @limiter.limit("10/hour")
-async def upload_video(request: Request, file: UploadFile = File(...)):
+async def upload_video(
+    request: Request,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
     # Per-upload id namespaces all artifacts (extracted audio, processed video,
     # evidence frames) so concurrent uploads — or repeat uploads of files with
     # the same name — don't overwrite each other's outputs.
@@ -962,6 +1106,7 @@ async def upload_video(request: Request, file: UploadFile = File(...)):
             _persist_media_and_segments(
                 media_id=upload_id,
                 source_kind="upload",
+                user_id=user.id,
                 original_name=original_name,
                 stored_path=f"{upload_id}{safe_ext}",
                 playback_path=video_serve,
@@ -973,6 +1118,9 @@ async def upload_video(request: Request, file: UploadFile = File(...)):
                 speech_timeline=speech_timeline,
                 report_json=slim_report,
                 content_sha256=content_sha256,
+                # Default title = uploaded filename minus extension.
+                # The user can rename via the inline editor later.
+                title=Path(original_name).stem if original_name else None,
             )
         except Exception as e:
             log.warning(
@@ -1065,11 +1213,22 @@ def _serve_with_range(request: Request, path: str, media_type: str):
 
 
 @app.get("/api/video/{filename}")
-def serve_video(filename: str, request: Request):
+def serve_video(
+    filename: str,
+    request: Request,
+    user: User = Depends(get_current_user_for_media),
+):
     # Guard against ../ etc. before building a filesystem path. The
     # filename is user-controlled via the URL.
     if not _safe_media_id(filename):
         return JSONResponse({"error": "Invalid filename"}, status_code=400)
+    # Look up the Media row by playback_path; allow access if the
+    # caller owns it OR has been shared on it. Without this check
+    # anyone could read any uploaded video by guessing filenames.
+    with SessionLocal() as db:
+        m = db.query(Media).filter(Media.playback_path == filename).first()
+        if not media_readable_by(user.id, m):
+            return JSONResponse({"error": "Not found"}, status_code=404)
     filepath = os.path.join(UPLOAD_DIR, filename)
     return _serve_with_range(request, filepath, media_type="video/mp4")
 
@@ -1096,12 +1255,19 @@ async def session_ws(ws: WebSocket, session_id: str):
     # Auth check must happen BEFORE accept() so an unauthorised client
     # gets a clean 4401 close-frame reason rather than an accepted socket
     # that immediately disconnects. Browsers can't set custom headers on
-    # the WS upgrade, so we accept the key via query param.
-    if API_KEY and ws.query_params.get("api_key") != API_KEY:
-        # 4401 is in the private WebSocket close-code range (4000-4999);
-        # we reuse the HTTP 401 digit as a convention.
+    # the WS upgrade, so we accept the JWT via the `?token=` query param.
+    token = ws.query_params.get("token") or ""
+    payload = decode_token(token) if token else None
+    if not payload or "sub" not in payload:
         await ws.close(code=4401)
         return
+    ws_user_id: str = payload["sub"]
+    # Confirm the user still exists in the DB. Without this, a token
+    # issued to a since-deleted account would still pass the decode.
+    with SessionLocal() as db:
+        if db.get(User, ws_user_id) is None:
+            await ws.close(code=4401)
+            return
 
     await ws.accept()
 
@@ -1219,9 +1385,20 @@ async def session_ws(ws: WebSocket, session_id: str):
             # words, regardless of how transcript was built.
             report["speech_timeline"] = speech_tl
 
+            # Default title for a LIVE recording: timestamped, with the
+            # medium ("Video" / "Audio") suffixed so a quick Library
+            # scan tells you what kind of practice it was. UTC because
+            # the server doesn't know the user's timezone; we mark it
+            # explicitly so the value isn't mis-read locally.
+            from datetime import datetime as _dt, timezone as _tz
+            ts = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+            medium_suffix = "Audio" if source_kind == "analyzer_audio" else "Video"
+            default_title = f"Recording {ts} - {medium_suffix}"
+
             _persist_media_and_segments(
                 media_id=session_id,
                 source_kind=source_kind,
+                user_id=ws_user_id,
                 original_name=None,
                 stored_path=None,
                 playback_path=playback,
@@ -1232,6 +1409,7 @@ async def session_ws(ws: WebSocket, session_id: str):
                 face_timeline=face_rows,
                 speech_timeline=speech_tl,
                 report_json=report,
+                title=default_title,
             )
         except Exception as e:
             log.warning(
@@ -1306,6 +1484,7 @@ async def analyze_audio_file(
     request: Request,
     audio_file: UploadFile = File(...),
     session_label: str = Form(default="uploaded"),
+    user: User = Depends(get_current_user),
 ):
     """
     Accepts any audio file (WAV, MP3, M4A, WebM, OGG).
@@ -1467,10 +1646,19 @@ async def analyze_audio_file(
     # is ever off.
     report["speech_timeline"] = speech_tl
 
+    # Default title for an UPLOADED audio file: filename without
+    # extension (matches video-upload convention). For LIVE audio
+    # captures the WS handler sets a "Recording <ts> - Audio" title
+    # instead — see session_ws's finalize block.
+    default_title = (
+        Path(audio_file.filename).stem
+        if audio_file.filename else None
+    )
     try:
         _persist_media_and_segments(
             media_id=media_id,
             source_kind="analyzer_audio",
+            user_id=user.id,
             original_name=audio_file.filename,
             stored_path=saved_name,
             playback_path=saved_name,
@@ -1482,6 +1670,7 @@ async def analyze_audio_file(
             speech_timeline=speech_tl,
             report_json=report,
             content_sha256=content_sha256,
+            title=default_title,
         )
     except Exception as e:
         log.warning(
@@ -1493,12 +1682,21 @@ async def analyze_audio_file(
 
 
 @app.get("/api/analyzer/{media_id}/audio")
-def get_analyzer_audio(media_id: str, request: Request):
+def get_analyzer_audio(
+    media_id: str,
+    request: Request,
+    user: User = Depends(get_current_user_for_media),
+):
     """Serve the saved analyzer audio by media_id. Suffix-agnostic:
-    finds whichever file starts with the id in the recordings dir."""
+    finds whichever file starts with the id in the recordings dir.
+    Owner-only."""
     # Guard against glob patterns / .. in user-supplied id.
     if not _safe_media_id(media_id):
         return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if not media_readable_by(user.id, m):
+            return JSONResponse({"error": "Not found"}, status_code=404)
     matches = list(RECORDINGS_DIR.glob(f"{media_id}.*"))
     if not matches:
         return JSONResponse({"error": "Not found"}, status_code=404)
@@ -1521,9 +1719,18 @@ async def upload_session_video(
     request: Request,
     video: UploadFile = File(...),
     session_id: str = Form(...),
+    user: User = Depends(get_current_user),
 ):
     """Save video recording from a live session.
-    Streams to disk with a 500 MB cap; returns a browser-loadable URL."""
+    Streams to disk with a 500 MB cap; returns a browser-loadable URL.
+
+    Requires authentication. Note: the Media row is created by the WS
+    finalize handler, not here — this endpoint just lands the file. We
+    don't pre-check ownership of the session_id because the WS handler
+    that owns it has already validated the user. A misbehaving caller
+    can at worst write a file to a session_id that no Media row will
+    ever reference, which becomes orphaned-file noise (cleaned up by
+    the next backup script run)."""
     if not _safe_media_id(session_id):
         return JSONResponse({"error": "Invalid session id"}, status_code=400)
     path = RECORDINGS_DIR / f"{session_id}_video.webm"
@@ -1555,8 +1762,11 @@ async def upload_session_audio(
     request: Request,
     audio: UploadFile = File(...),
     session_id: str = Form(...),
+    user: User = Depends(get_current_user),
 ):
     """Save an audio recording from a live audio analyzer session.
+    Authentication required. See upload_session_video for the
+    rationale on not pre-checking session_id ownership.
 
     Files land as `{session_id}.{ext}` in RECORDINGS_DIR, which
     /api/analyzer/{id}/audio already serves. Keeping the extension lets us
@@ -1592,7 +1802,11 @@ async def upload_session_audio(
     try:
         with SessionLocal() as db:
             m = db.get(Media, session_id)
-            if m is not None and m.playback_path != path.name:
+            # Owner-only: silently skip if the row belongs to someone
+            # else (a misbehaving caller racing the upload). The 200
+            # below still fires — the file is on disk, but it won't
+            # update the wrong user's row.
+            if m is not None and m.user_id == user.id and m.playback_path != path.name:
                 m.playback_path = path.name
                 m.has_audio = True
                 db.commit()
@@ -1610,67 +1824,720 @@ async def upload_session_audio(
 
 
 @app.get("/api/recordings")
-def list_recordings(limit: int = 50, offset: int = 0):
-    """Paginated list of Library entries (sessions + uploads + analyzer audio).
+def list_recordings(
+    limit: int = 50,
+    offset: int = 0,
+    q: str | None = None,
+    sort: str = "created_desc",
+    date_from: str | None = None,
+    date_to: str | None = None,
+    min_score: int | None = None,
+    max_score: int | None = None,
+    tag: str | None = None,
+    user: User = Depends(get_current_user),
+):
+    """Paginated, filterable list of the current user's Library.
 
     Response shape: { items: [...], total, limit, offset }.
 
-    `limit` is clamped to [1, 200] so a misbehaving client can't force a
-    megabyte-scale payload. `offset` is non-negative; negatives are
-    treated as 0.
+    Query params (all optional):
+      - q          substring search across title / original_name /
+                   topic / tags. Case-insensitive.
+      - sort       created_desc (default) | created_asc | score_desc |
+                   score_asc | duration_desc | duration_asc.
+      - date_from  ISO 8601 timestamp; recordings created before this
+                   are excluded.
+      - date_to    ISO 8601 timestamp; recordings created after this
+                   are excluded.
+      - min_score  inclusive lower bound on score_avg (0-100).
+      - max_score  inclusive upper bound on score_avg.
+      - tag        exact tag match (lower-cased server-side).
+
+    `limit` is clamped to [1, 200] so a misbehaving client can't force
+    a megabyte-scale payload. `offset` is non-negative; negatives are
+    treated as 0. `total` reflects the FILTERED count, not the global
+    one — which is what the "N of M" UI label needs.
+
+    Scoped to the authenticated user — other users' recordings never
+    appear in the response, with or without filters.
     """
+    from datetime import datetime as _dt
+
+    def _parse_dt(s: str | None) -> _dt | None:
+        if not s:
+            return None
+        try:
+            # fromisoformat handles both naive and aware ISO strings
+            # in 3.11+. Frontend always sends UTC ISO so this is safe.
+            return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
     limit = max(1, min(200, int(limit)))
     offset = max(0, int(offset))
-    return _list_session_recordings(limit=limit, offset=offset)
+    return _list_session_recordings(
+        limit=limit,
+        offset=offset,
+        user_id=user.id,
+        q=q,
+        sort=sort,
+        date_from=_parse_dt(date_from),
+        date_to=_parse_dt(date_to),
+        min_score=min_score,
+        max_score=max_score,
+        tag=tag,
+    )
 
 
 @app.get("/api/recordings/{session_id}/video")
-def get_recording_video(session_id: str, request: Request):
+def get_recording_video(
+    session_id: str,
+    request: Request,
+    user: User = Depends(get_current_user_for_media),
+):
     if not _safe_media_id(session_id):
         return JSONResponse({"error": "Invalid session id"}, status_code=400)
+    with SessionLocal() as db:
+        m = db.get(Media, session_id)
+        if not media_readable_by(user.id, m):
+            return JSONResponse({"error": "Not found"}, status_code=404)
     path = RECORDINGS_DIR / f"{session_id}_video.webm"
     return _serve_with_range(request, str(path), media_type="video/webm")
 
 
 @app.get("/api/report/{session_id}")
-def get_session_report(session_id: str):
-    """Get a saved media report by its id.
+def get_session_report(
+    session_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Get a saved media report by its id, scoped to the current user.
 
     Returns the stored Media.report_json payload, spread at the top level,
     with `kind` and `media_id` added so the /result/:id frontend can branch
     between upload / session / analyzer_audio shapes without sniffing.
 
-    Rejects anything that doesn't match the id character class — not to
-    guard the DB (ORM parameters are safe) but to match the behaviour of
-    the file endpoints so callers get a consistent 400 vs 404.
+    Returns 404 not just when the row doesn't exist, but also when it
+    exists but belongs to another user. Returning a "this isn't yours"
+    distinct from "not found" would let an attacker enumerate which
+    media ids are real across the whole product.
     """
     if not _safe_media_id(session_id):
         return JSONResponse({"error": "Invalid session id"}, status_code=400)
     with SessionLocal() as db:
         media = db.get(Media, session_id)
-        if media is None or media.report_json is None:
+        if media is None or media.report_json is None or not media_readable_by(user.id, media):
             return JSONResponse({"error": "Report not found"}, status_code=404)
         payload = dict(media.report_json)
         payload["kind"] = media.source_kind
         payload["media_id"] = media.id
+        # User-supplied metadata: surface so the Result page can render
+        # editable fields without a second round-trip.
+        payload["title"] = media.title
+        payload["topic"] = media.topic
+        payload["tags"] = media.tags or []
+        # Latest persisted duration — a trim updates this; if the
+        # report_json has its own duration_s it stays for the chart but
+        # the canonical "how long is the file now" is here.
+        payload["duration_s_current"] = media.duration_s
+        # Sharing context — the frontend uses these to decide whether
+        # to render the editor + share modal (owner) or a "shared by
+        # X" badge + read-only metadata (recipient).
+        payload["is_owner"] = media.user_id == user.id
+        payload["shared_with"] = media.shared_with or []
+        if media.user_id != user.id:
+            owner = db.get(User, media.user_id)
+            payload["shared_by"] = (
+                {"id": owner.id, "name": owner.name, "email": owner.email}
+                if owner else None
+            )
+        else:
+            payload["shared_by"] = None
         return payload
 
 
-@app.get("/api/report/{session_id}/csv")
-def export_report_csv(session_id: str):
-    """Download the per-chunk score timeline as CSV.
+@app.patch("/api/media/{media_id}")
+def update_media_metadata(
+    media_id: str,
+    payload: dict,
+    user: User = Depends(get_current_user),
+):
+    """Edit user-supplied metadata on a recording.
 
-    Lets users take the raw data into Excel/Sheets/pandas and do their
-    own aggregation — or push back on a headline number they disagree
-    with by looking at the underlying chunks.
+    Accepts any subset of {title, topic, tags}; only present keys are
+    updated. Owner-only — returns 404 (not 403) on cross-user attempts
+    so other users' media-ids stay un-enumerable.
 
-    Columns: t_s, total, voice_steadiness, eye_contact, speech_pace,
-             filler_words, vocal_variety.
-
-    Works only for reports whose report_json has a `timeline` key (i.e.
-    sessions and analyzer_audio). Upload-kind reports use a different
-    shape — returns 404 with a clear message rather than silently empty.
+    Validation:
+      - title: trimmed; max 200 chars; empty string clears it (null)
+      - topic: trimmed; max 120 chars; empty string clears it
+      - tags : array of strings, each ≤ 40 chars; max 20 tags;
+               whitespace-only entries are dropped; lower-cased and
+               de-duplicated to keep the Library tag-cloud sane.
     """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "Body must be a JSON object."}, status_code=400)
+
+    updates: dict = {}
+
+    if "title" in payload:
+        v = payload["title"]
+        if v is None or v == "":
+            updates["title"] = None
+        elif isinstance(v, str):
+            t = v.strip()[:200]
+            updates["title"] = t or None
+        else:
+            return JSONResponse({"error": "title must be a string."}, status_code=400)
+
+    if "topic" in payload:
+        v = payload["topic"]
+        if v is None or v == "":
+            updates["topic"] = None
+        elif isinstance(v, str):
+            updates["topic"] = v.strip()[:120] or None
+        else:
+            return JSONResponse({"error": "topic must be a string."}, status_code=400)
+
+    if "tags" in payload:
+        v = payload["tags"]
+        if v is None:
+            updates["tags"] = None
+        elif isinstance(v, list):
+            cleaned: list[str] = []
+            seen: set[str] = set()
+            for raw in v:
+                if not isinstance(raw, str):
+                    continue
+                t = raw.strip().lower()[:40]
+                if not t or t in seen:
+                    continue
+                seen.add(t)
+                cleaned.append(t)
+                if len(cleaned) >= 20:
+                    break
+            updates["tags"] = cleaned or None
+        else:
+            return JSONResponse({"error": "tags must be an array."}, status_code=400)
+
+    if not updates:
+        return JSONResponse({"error": "No editable fields supplied."}, status_code=400)
+
+    with SessionLocal() as db:
+        media = db.get(Media, media_id)
+        if media is None or media.user_id != user.id:
+            return JSONResponse({"error": "Media not found"}, status_code=404)
+        for k, v in updates.items():
+            setattr(media, k, v)
+        db.commit()
+        return {
+            "media_id": media.id,
+            "title": media.title,
+            "topic": media.topic,
+            "tags": media.tags or [],
+        }
+
+
+@app.post("/api/media/{media_id}/discard")
+def discard_media(
+    media_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Re-take helper — exact same effect as DELETE but framed as a
+    deliberate workflow choice ("I want to redo this take, throw the
+    last one away"). The frontend uses this from the Result page so the
+    Library never accumulates throwaway practice attempts.
+
+    Reuses the DELETE handler verbatim — owner-only, files cleaned up
+    best-effort. Returns the same shape.
+    """
+    return delete_media(media_id, user)
+
+
+@app.post("/api/media/{media_id}/trim")
+async def trim_media(
+    media_id: str,
+    payload: dict,
+    user: User = Depends(get_current_user),
+):
+    """Cut the playback file in-place to [start_s, end_s].
+
+    Uses ffmpeg's stream-copy mode (-c copy), so the operation is fast
+    (no re-encode) and lossless. Audio + video tracks are kept as-is.
+
+    Scope (intentional, documented in the response):
+      - This trims the FILE the user plays back. duration_s is updated.
+      - The CHUNK SCORES (the timeline, signal_averages, etc.) reflect
+        the ORIGINAL recording, not the trimmed segment. Recomputing
+        those would require re-running the audio + face pipelines,
+        which is a much bigger feature and lives behind a future
+        "Re-analyze trimmed clip" button.
+      - The Result page surfaces this caveat so users aren't misled.
+
+    Validation:
+      - start_s ≥ 0
+      - end_s   > start_s
+      - end_s   ≤ current duration_s (clamped)
+      - trimmed length ≥ 3 s (matches the upload pipeline's min)
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    try:
+        start_s = float(payload.get("start_s", 0))
+        end_s = float(payload.get("end_s", 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "start_s and end_s must be numbers."}, status_code=400)
+
+    with SessionLocal() as db:
+        media = db.get(Media, media_id)
+        if media is None or media.user_id != user.id:
+            return JSONResponse({"error": "Media not found"}, status_code=404)
+        kind = media.source_kind
+        playback = media.playback_path
+        current_duration = float(media.duration_s or 0)
+
+    # Resolve the file to trim. Layout differs per kind.
+    if kind == "upload":
+        if not playback:
+            return JSONResponse({"error": "No playback file to trim."}, status_code=400)
+        src = Path(UPLOAD_DIR) / playback
+    elif kind == "session":
+        src = RECORDINGS_DIR / f"{media_id}_video.webm"
+    elif kind == "analyzer_audio":
+        # Suffix-agnostic — find whichever file matches.
+        matches = list(RECORDINGS_DIR.glob(f"{media_id}.*"))
+        if not matches:
+            return JSONResponse({"error": "No playback file to trim."}, status_code=400)
+        src = matches[0]
+    else:
+        return JSONResponse({"error": f"Trim not supported for kind '{kind}'."}, status_code=400)
+    if not src.is_file():
+        return JSONResponse({"error": "Playback file is missing on disk."}, status_code=404)
+
+    # When the DB doesn't know the duration (legacy or partially-failed
+    # row), fall back to ffprobe so we still have a real upper bound.
+    # Without this the only failure would be ffmpeg producing a zero-byte
+    # output later — handled, but a clear 400 here is better UX.
+    if current_duration <= 0:
+        try:
+            probe = subprocess.run(
+                [FFMPEG, "-i", str(src), "-hide_banner"],
+                capture_output=True, timeout=10,
+            )
+            # ffmpeg writes "Duration: HH:MM:SS.xx" to stderr; parse it.
+            stderr = (probe.stderr or b"").decode("utf-8", errors="ignore")
+            import re as _re
+            m = _re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", stderr)
+            if m:
+                h, mi, se = m.groups()
+                current_duration = int(h) * 3600 + int(mi) * 60 + float(se)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    # Clamp to file bounds, validate ordering + minimum length.
+    if current_duration > 0:
+        end_s = min(end_s, current_duration)
+    else:
+        # Still no duration after probing → reject rather than feed
+        # ffmpeg arbitrary bounds.
+        return JSONResponse(
+            {"error": "Could not determine recording duration; cannot trim safely."},
+            status_code=400,
+        )
+    if start_s < 0:
+        start_s = 0.0
+    new_len = end_s - start_s
+    if new_len < 3.0:
+        return JSONResponse(
+            {"error": "Trimmed clip must be at least 3 seconds."},
+            status_code=400,
+        )
+
+    # Write to a temp file in the same directory, then atomic-rename.
+    # Doing the rename means a crash mid-trim leaves the original file
+    # intact rather than half-written garbage.
+    tmp = src.with_suffix(src.suffix + ".trim.tmp")
+    cmd = [
+        FFMPEG, "-y",
+        "-err_detect", "crccheck+bitstream",
+        "-fflags", "+discardcorrupt",
+        "-i", str(src),
+        "-ss", f"{start_s:.3f}",
+        "-to", f"{end_s:.3f}",
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        str(tmp),
+    ]
+
+    def _run_ffmpeg_sync():
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=120,
+            )
+            if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+                tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
+                return "ffmpeg trim failed: " + " | ".join(tail)
+            return None
+        except FileNotFoundError:
+            return "ffmpeg binary not found on the server."
+        except subprocess.TimeoutExpired:
+            return "ffmpeg trim timed out after 120 s."
+
+    err = await asyncio.get_event_loop().run_in_executor(None, _run_ffmpeg_sync)
+    if err is not None:
+        try: tmp.unlink(missing_ok=True)
+        except OSError: pass
+        return JSONResponse({"error": err}, status_code=500)
+
+    # Atomic-replace the original. os.replace works across drives and
+    # is atomic on the same volume.
+    try:
+        os.replace(tmp, src)
+    except OSError as e:
+        try: tmp.unlink(missing_ok=True)
+        except OSError: pass
+        return JSONResponse({"error": f"Could not replace original file: {e}"}, status_code=500)
+
+    # Persist the new duration. We deliberately leave score_avg /
+    # report_json unchanged — those reflect the original recording.
+    with SessionLocal() as db:
+        media = db.get(Media, media_id)
+        if media is not None:
+            media.duration_s = round(new_len, 2)
+            db.commit()
+
+    log.info(
+        "media.trim",
+        extra={
+            "media_id": media_id,
+            "kind": kind,
+            "start_s": round(start_s, 2),
+            "end_s": round(end_s, 2),
+            "new_duration_s": round(new_len, 2),
+        },
+    )
+
+    return {
+        "status": "trimmed",
+        "media_id": media_id,
+        "duration_s": round(new_len, 2),
+        "scores_recomputed": False,
+        "note": (
+            "Playback file was trimmed. Scores still reflect the original "
+            "recording — they were not recomputed for the trimmed segment."
+        ),
+    }
+
+
+# ============================================================
+# SHARE — owner grants/revokes read+comment access by email
+# ============================================================
+def _user_brief(u: User) -> dict:
+    """Standard short-form user shape used in share + comment payloads.
+    Never includes password_hash or anything sensitive."""
+    return {"id": u.id, "name": u.name, "email": u.email}
+
+
+@app.get("/api/media/{media_id}/shares")
+def list_shares(media_id: str, user: User = Depends(get_current_user)):
+    """List the users this Media is shared with. Owner-only.
+
+    Returns [{id, name, email}, ...] in the same order they were added.
+    Used by the Share modal to render the existing access list with a
+    Revoke button next to each entry.
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if not media_owned_by(user.id, m):
+            return JSONResponse({"error": "Media not found"}, status_code=404)
+        ids = m.shared_with or []
+        if not ids:
+            return []
+        rows = db.query(User).filter(User.id.in_(ids)).all()
+        # Preserve original ordering (DB query doesn't honour the
+        # array order otherwise).
+        by_id = {u.id: u for u in rows}
+        return [_user_brief(by_id[i]) for i in ids if i in by_id]
+
+
+@app.post("/api/media/{media_id}/share")
+def share_media(
+    media_id: str,
+    payload: dict,
+    user: User = Depends(get_current_user),
+):
+    """Grant another user read+comment access by email.
+
+    Body: { "email": "friend@example.com" }
+
+    Only the owner can share. The target email must already correspond
+    to a registered account — we don't auto-invite people in this
+    iteration. Sharing is idempotent (re-sharing is a no-op).
+
+    Returns the updated full list of share recipients so the Share
+    modal can re-render without a follow-up GET.
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    target_email = (payload.get("email") or "").strip().lower()
+    if not target_email:
+        return JSONResponse({"error": "Email is required."}, status_code=400)
+
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if not media_owned_by(user.id, m):
+            return JSONResponse({"error": "Media not found"}, status_code=404)
+        target = db.query(User).filter(User.email == target_email).first()
+        if target is None:
+            return JSONResponse(
+                {"error": "No account with that email. Ask them to sign up first."},
+                status_code=404,
+            )
+        if target.id == user.id:
+            return JSONResponse(
+                {"error": "You already own this recording."},
+                status_code=400,
+            )
+        current = list(m.shared_with or [])
+        if target.id not in current:
+            current.append(target.id)
+            m.shared_with = current
+            db.commit()
+        # Always re-fetch the names for the response to keep the
+        # client's modal in sync.
+        rows = db.query(User).filter(User.id.in_(current)).all() if current else []
+        by_id = {u.id: u for u in rows}
+        return {
+            "media_id": media_id,
+            "shared_with": [_user_brief(by_id[i]) for i in current if i in by_id],
+        }
+
+
+@app.delete("/api/media/{media_id}/share/{recipient_id}")
+def unshare_media(
+    media_id: str,
+    recipient_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Revoke a previously-granted share. Owner-only.
+
+    Idempotent: removing an id that wasn't in the list is a no-op,
+    not a 404 — the end state ("recipient does not have access") is
+    the same either way.
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if not media_owned_by(user.id, m):
+            return JSONResponse({"error": "Media not found"}, status_code=404)
+        current = [x for x in (m.shared_with or []) if x != recipient_id]
+        m.shared_with = current or None
+        db.commit()
+        return {"media_id": media_id, "shared_with_count": len(current)}
+
+
+# ============================================================
+# COMMENTS — threaded discussion attached to a Media
+# ============================================================
+def _comment_dict(c: Comment, author: User | None) -> dict:
+    """Standard comment payload. The author lookup is done by the
+    caller — we don't lazy-load to avoid N+1 selects on the list
+    endpoint."""
+    return {
+        "id": c.id,
+        "media_id": c.media_id,
+        "author": _user_brief(author) if author else None,
+        "body": c.body,
+        "t_s": c.t_s,
+        "t_end_s": c.t_end_s,
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+        "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        "edited": (
+            c.updated_at and c.created_at
+            and (c.updated_at - c.created_at).total_seconds() > 1
+        ),
+    }
+
+
+@app.get("/api/media/{media_id}/comments")
+def list_comments(
+    media_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Return all comments on a Media, oldest-first.
+
+    Visible to anyone with read access (owner or shared-with). One
+    SELECT for the comments + one for the authors (joined by id),
+    keeps it cheap regardless of thread length.
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if not media_readable_by(user.id, m):
+            return JSONResponse({"error": "Media not found"}, status_code=404)
+        comments = (
+            db.query(Comment)
+              .filter(Comment.media_id == media_id)
+              .order_by(Comment.created_at.asc())
+              .all()
+        )
+        if not comments:
+            return []
+        author_ids = {c.author_user_id for c in comments}
+        authors = {u.id: u for u in db.query(User).filter(User.id.in_(author_ids)).all()}
+        return [_comment_dict(c, authors.get(c.author_user_id)) for c in comments]
+
+
+@app.post("/api/media/{media_id}/comments")
+@limiter.limit("60/hour")
+def create_comment(
+    media_id: str,
+    payload: dict,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """Post a new comment. Visible to anyone with read access.
+
+    Body: {
+        "body":    "...",       (required)
+        "t_s":     12.5,        (optional — single-moment anchor)
+        "t_end_s": 28.0         (optional — when set, comment spans
+                                 the range [t_s, t_end_s]; click in
+                                 the UI seeks AND auto-pauses at end)
+    }
+
+    Body is required, max 5000 chars. `t_s` is clamped to >= 0;
+    upper-bound clamping (against the recording's actual duration) is
+    NOT enforced here — a comment timestamped past end-of-recording
+    just won't seek anywhere useful, which is honest UX, and it lets
+    a future "trim" not invalidate older comments.
+
+    Validation rules for the range:
+      - t_end_s without t_s = error (a range needs both endpoints).
+      - t_end_s must be > t_s (zero-length ranges are nonsense).
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    body_text = (payload.get("body") or "").strip()
+    if not body_text:
+        return JSONResponse({"error": "Comment body is required."}, status_code=400)
+    if len(body_text) > 5000:
+        return JSONResponse({"error": "Comment too long (max 5000 chars)."}, status_code=400)
+    t_s = payload.get("t_s")
+    if t_s is not None:
+        try:
+            t_s = max(0.0, float(t_s))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "t_s must be a number."}, status_code=400)
+    t_end_s = payload.get("t_end_s")
+    if t_end_s is not None:
+        try:
+            t_end_s = max(0.0, float(t_end_s))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "t_end_s must be a number."}, status_code=400)
+        if t_s is None:
+            return JSONResponse(
+                {"error": "t_end_s requires t_s as the start of the range."},
+                status_code=400,
+            )
+        if t_end_s <= t_s:
+            return JSONResponse(
+                {"error": "t_end_s must be greater than t_s."},
+                status_code=400,
+            )
+
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if not media_readable_by(user.id, m):
+            return JSONResponse({"error": "Media not found"}, status_code=404)
+        c = Comment(
+            id=uuid.uuid4().hex,
+            media_id=media_id,
+            author_user_id=user.id,
+            body=body_text,
+            t_s=t_s,
+            t_end_s=t_end_s,
+        )
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return _comment_dict(c, user)
+
+
+@app.patch("/api/comments/{comment_id}")
+def update_comment(
+    comment_id: str,
+    payload: dict,
+    user: User = Depends(get_current_user),
+):
+    """Edit a comment's body. Author-only — even the media owner
+    can't edit someone else's comment (only delete it).
+
+    Body: { "body": "..." }  (t_s edits not supported — re-create
+    the comment if you want to re-anchor it).
+    """
+    if not _safe_media_id(comment_id):
+        return JSONResponse({"error": "Invalid comment id"}, status_code=400)
+    body_text = (payload.get("body") or "").strip()
+    if not body_text:
+        return JSONResponse({"error": "Comment body is required."}, status_code=400)
+    if len(body_text) > 5000:
+        return JSONResponse({"error": "Comment too long (max 5000 chars)."}, status_code=400)
+
+    with SessionLocal() as db:
+        c = db.get(Comment, comment_id)
+        if c is None or c.author_user_id != user.id:
+            return JSONResponse({"error": "Comment not found"}, status_code=404)
+        c.body = body_text
+        from datetime import datetime as _dt, timezone as _tz
+        c.updated_at = _dt.now(_tz.utc)
+        db.commit()
+        db.refresh(c)
+        return _comment_dict(c, user)
+
+
+@app.delete("/api/comments/{comment_id}")
+def delete_comment(
+    comment_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Delete a comment. Allowed by:
+      - the comment's author, OR
+      - the owner of the Media the comment is on (so the owner can
+        moderate their own discussion thread).
+    """
+    if not _safe_media_id(comment_id):
+        return JSONResponse({"error": "Invalid comment id"}, status_code=400)
+    with SessionLocal() as db:
+        c = db.get(Comment, comment_id)
+        if c is None:
+            return JSONResponse({"error": "Comment not found"}, status_code=404)
+        # Allow if author OR media owner.
+        is_author = c.author_user_id == user.id
+        is_media_owner = False
+        if not is_author:
+            m = db.get(Media, c.media_id)
+            is_media_owner = media_owned_by(user.id, m)
+        if not (is_author or is_media_owner):
+            return JSONResponse({"error": "Comment not found"}, status_code=404)
+        db.delete(c)
+        db.commit()
+        return {"status": "deleted", "id": comment_id}
+
+
+@app.get("/api/report/{session_id}/csv")
+def export_report_csv(
+    session_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Download the per-chunk score timeline as CSV. Owner-only."""
     import csv
     import io
 
@@ -1679,7 +2546,7 @@ def export_report_csv(session_id: str):
 
     with SessionLocal() as db:
         media = db.get(Media, session_id)
-        if media is None or media.report_json is None:
+        if media is None or media.report_json is None or not media_readable_by(user.id, media):
             return JSONResponse({"error": "Report not found"}, status_code=404)
         report = media.report_json
         timeline = report.get("timeline")
@@ -1717,13 +2584,19 @@ def export_report_csv(session_id: str):
 
 
 @app.delete("/api/media/{media_id}")
-def delete_media(media_id: str):
+def delete_media(
+    media_id: str,
+    user: User = Depends(get_current_user),
+):
     """Hard-delete a media row + its segments + its on-disk files.
 
     Why this exists:
       - GDPR / "right to erasure": once a user records something they
         regret, they need a way to get rid of it without psql.
       - Housekeeping: the Library can grow forever otherwise.
+
+    Owner-only. Returns 404 (not 403) when the row exists but isn't
+    yours, so other users' media ids stay un-enumerable.
 
     What it deletes:
       - Media row (cascades to media_segments via FK)
@@ -1742,7 +2615,7 @@ def delete_media(media_id: str):
 
     with SessionLocal() as db:
         media = db.get(Media, media_id)
-        if media is None:
+        if media is None or media.user_id != user.id:
             return JSONResponse({"error": "Media not found"}, status_code=404)
         # Snapshot filesystem paths before dropping the row.
         stored_path = media.stored_path

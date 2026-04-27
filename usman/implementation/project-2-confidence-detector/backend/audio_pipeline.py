@@ -507,9 +507,17 @@ class AudioPipeline:
         # 9. Compute scores (imported from signal_scorer)
         from signal_scorer import SignalScorer
         pace_score = SignalScorer.speech_pace(words, vad_segments)
-        # Apply silence gap penalty (>2s gaps reduce speech pace score)
-        silence_pen = SignalScorer.silence_penalty(vad_segments, chunk_duration_ms=3000)
-        pace_score = max(0, pace_score - silence_pen)
+        # speech_pace returns None for silence/near-silence chunks so we
+        # can exclude them from the session-wide average rather than let
+        # a hard zero drag it down. For display in this chunk we fall
+        # back to None → the aggregate skipper handles it; downstream
+        # consumers use `50` only when they explicitly want a default.
+        if pace_score is not None:
+            # Apply silence gap penalty only when we actually scored
+            # pace (>2 s gaps in a speaking chunk still deserve the
+            # penalty — the silence_penalty sees the real vad_segments).
+            silence_pen = SignalScorer.silence_penalty(vad_segments, chunk_duration_ms=3000)
+            pace_score = max(0, pace_score - silence_pen)
 
         scores = {
             "voice_steadiness": SignalScorer.voice_steadiness(pitch, rms_std),

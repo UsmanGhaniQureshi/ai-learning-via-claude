@@ -1,15 +1,35 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import useLiveSession from '../hooks/useLiveSession'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
 import FeedbackTips from '../components/FeedbackTips'
 import SessionGraph from '../components/SessionGraph'
+import PracticeSetup from '../components/PracticeSetup'
+import CountdownOverlay from '../components/CountdownOverlay'
+import PracticeTimer from '../components/PracticeTimer'
 
 function formatDuration(s) {
   const m = Math.floor(s / 60)
   const sec = Math.floor(s % 60)
   return `${m}:${String(sec).padStart(2, '0')}`
+}
+
+// Maps a hand_position label to a colour + short user-facing message.
+// Used by the live gesture badge during recording.
+function gestureBadge(label) {
+  switch (label) {
+    case 'gesturing':
+      return { color: '#00c853', text: '✋ Hands gesturing' }
+    case 'mid-level':
+      return { color: '#4a90e2', text: '✋ Hands mid-level' }
+    case 'low/resting':
+      return { color: '#aaa', text: '✋ Hands resting' }
+    case 'not visible':
+      return { color: '#ffb84d', text: '✋ Hands not visible' }
+    default:
+      return null
+  }
 }
 
 export default function LiveSession() {
@@ -22,14 +42,56 @@ export default function LiveSession() {
   const navigate = useNavigate()
   const navigatedRef = useRef(false)
 
-  // Once the report arrives, redirect to /result/:id. useRef guard so the
-  // navigation only fires once even if the effect re-runs.
+  // Two new local UI states layered on top of useLiveSession's state:
+  //   showCountdown   — full-screen 3-2-1 overlay before WS opens
+  //   setup           — { promptTitle, promptBody, durationMin }
+  // We keep these LOCAL because they're pure pre-roll UX; the existing
+  // hook's state machine (idle / starting / active / stopping / report)
+  // already represents the actual session lifecycle once we hit Start.
+  const [setup, setSetup] = useState(null)
+  const [showCountdown, setShowCountdown] = useState(false)
+  const [recStartedAt, setRecStartedAt] = useState(null)
+
+  // Once the report arrives, redirect to /result/:id.
   useEffect(() => {
     if (sessionState === 'report' && report?.session_id && !navigatedRef.current) {
       navigatedRef.current = true
       navigate(`/result/${report.session_id}`, { replace: true })
     }
   }, [sessionState, report, navigate])
+
+  // Capture the wall-clock moment recording actually starts so the
+  // PracticeTimer can drive its own clock independent of the hook's
+  // duration counter (which can lag by 1 s on first render).
+  useEffect(() => {
+    if (sessionState === 'active' && !recStartedAt) {
+      setRecStartedAt(Date.now())
+    }
+    if (sessionState === 'idle') {
+      setRecStartedAt(null)
+    }
+  }, [sessionState, recStartedAt])
+
+  // Timer reached zero → auto-stop. We guard with a ref-equivalent to
+  // avoid double-calling stopSession (timer fires once, but defensive).
+  const handleTimeUp = useCallback(() => {
+    if (sessionState === 'active') {
+      stopSession().catch(() => {})
+    }
+  }, [sessionState, stopSession])
+
+  // Setup → countdown → real start. Splitting these means the user sees
+  // the camera permission prompt during the countdown, which makes the
+  // 3-second wait useful instead of dead.
+  function handleSetupComplete(s) {
+    setSetup(s)
+    setShowCountdown(true)
+  }
+
+  function handleCountdownComplete() {
+    setShowCountdown(false)
+    startSession()
+  }
 
   // Map backend session scores to SignalBars format
   const barScores = scores
@@ -44,6 +106,7 @@ export default function LiveSession() {
     : null
 
   const totalScore = scores?.total ?? 50
+  const gesture = gestureBadge(faceScores.hand_position)
 
   return (
     <div className="live-session-container">
@@ -54,22 +117,14 @@ export default function LiveSession() {
 
       {error && <div className="session-error">{error}</div>}
 
-      {/* IDLE STATE — Start button */}
-      {sessionState === 'idle' && (
-        <div className="session-idle">
-          <div className="idle-info">
-            <p className="info-large">Ready to start your practice session?</p>
-            <p className="info-small">
-              We'll need access to your camera and microphone. Everything is
-              analyzed locally — your video never leaves this page (audio is
-              sent only for speech analysis).
-            </p>
-          </div>
-          <button className="start-session-btn" onClick={startSession}>
-            <span className="start-icon">&#x25B6;</span>
-            Start Session
-          </button>
-        </div>
+      {/* IDLE STATE — show the practice-setup picker */}
+      {sessionState === 'idle' && !showCountdown && (
+        <PracticeSetup onStart={handleSetupComplete} />
+      )}
+
+      {/* COUNTDOWN OVERLAY — shows before camera permission resolves */}
+      {showCountdown && (
+        <CountdownOverlay onComplete={handleCountdownComplete} />
       )}
 
       {/* STARTING STATE — Requesting permissions */}
@@ -99,15 +154,58 @@ export default function LiveSession() {
             </div>
           )}
 
+          {/* Topic banner — what the user is practising */}
+          {setup?.promptTitle && (
+            <div
+              style={{
+                marginBottom: 12,
+                padding: '10px 14px',
+                background: '#1a1a22',
+                borderLeft: '3px solid #4a90e2',
+                borderRadius: 4,
+                fontSize: '0.92rem',
+              }}
+            >
+              <div style={{ opacity: 0.7, fontSize: '0.78rem', marginBottom: 2 }}>
+                Topic
+              </div>
+              <div><strong>{setup.promptTitle}</strong></div>
+            </div>
+          )}
+
+          {/* Practice timer — elapsed/remaining + bar + auto-stop */}
+          {setup?.durationMin && (
+            <div style={{ marginBottom: 12 }}>
+              <PracticeTimer
+                targetMin={setup.durationMin}
+                startedAtMs={recStartedAt}
+                onTimeUp={handleTimeUp}
+              />
+            </div>
+          )}
+
           {/* Status bar */}
           <div className="session-status-bar">
             <div className="status-left">
               <span className="rec-indicator">
                 <span className="rec-dot"></span> REC
               </span>
-              <span className="session-duration">{formatDuration(duration)}</span>
+              {!setup && (
+                <span className="session-duration">{formatDuration(duration)}</span>
+              )}
             </div>
-            <div className="status-right">
+            <div className="status-right" style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+              {gesture && (
+                <span
+                  style={{
+                    fontSize: '0.85rem',
+                    color: gesture.color,
+                    fontWeight: 500,
+                  }}
+                >
+                  {gesture.text}
+                </span>
+              )}
               {faceScores.face_detected ? (
                 <span className="face-status ok">&#x2713; Face detected</span>
               ) : (

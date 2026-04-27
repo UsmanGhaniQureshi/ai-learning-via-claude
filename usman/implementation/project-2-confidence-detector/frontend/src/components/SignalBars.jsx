@@ -1,3 +1,5 @@
+import SignalInfoTooltip from './SignalInfoTooltip'
+
 /**
  * Horizontal bar display for each sub-score signal.
  * Each bar shows label, numeric value, and colored fill bar.
@@ -5,14 +7,18 @@
  * `faceUnavailable`: when true, the face-dependent signals (eye contact,
  * expression) show N/A instead of a synthesised default — otherwise a
  * blank wall reads as "moderate 50" which is misleading.
+ *
+ * `info` (the camelCase key used here matches SignalBars' API; we map
+ * it to the snake_case key SIGNAL_DEFS uses inside SignalInfoTooltip
+ * via the `signalDef` field).
  */
 const SIGNALS = [
-  { key: 'voiceSteadiness', label: 'Voice Steadiness', weight: '24%', face: false },
-  { key: 'eyeContact', label: 'Eye Contact', weight: '24%', face: true },
-  { key: 'speechPace', label: 'Speech Pace', weight: '20%', face: false },
-  { key: 'fillerWords', label: 'Filler Words', weight: '20%', face: false },
-  { key: 'vocalVariety', label: 'Vocal Variety', weight: '12%', face: false },
-  { key: 'expression', label: 'Expression', weight: 'display-only', face: true },
+  { key: 'voiceSteadiness', signalDef: 'voice_steadiness', label: 'Voice Steadiness', weight: '24%', face: false },
+  { key: 'eyeContact',     signalDef: 'eye_contact',      label: 'Eye Contact',      weight: '24%', face: true },
+  { key: 'speechPace',     signalDef: 'speech_pace',      label: 'Speech Pace',      weight: '20%', face: false },
+  { key: 'fillerWords',    signalDef: 'filler_words',     label: 'Filler Words',     weight: '20%', face: false },
+  { key: 'vocalVariety',   signalDef: 'vocal_variety',    label: 'Vocal Variety',    weight: '12%', face: false },
+  { key: 'expression',     signalDef: 'expression',       label: 'Expression',       weight: 'display-only', face: true },
 ]
 
 function barColor(val) {
@@ -24,13 +30,13 @@ function barColor(val) {
 export default function SignalBars({ scores = {}, faceUnavailable = false }) {
   return (
     <div className="signal-bars">
-      {SIGNALS.map(({ key, label, weight, face }) => {
+      {SIGNALS.map(({ key, signalDef, label, weight, face }) => {
         const hide = face && faceUnavailable
         const value = scores[key] ?? 50
         return (
           <div key={key} className="signal-row">
             <div className="signal-label">
-              <span>{label}</span>
+              <span>{label}<SignalInfoTooltip signal={signalDef} /></span>
               <span className="signal-weight">({weight})</span>
             </div>
             <div className="signal-bar-bg">

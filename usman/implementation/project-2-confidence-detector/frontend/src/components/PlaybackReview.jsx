@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useMemo, forwardRef, useImperativeHandle } from 'react'
-import { API_BASE } from '../config'
+import { API_BASE, mediaUrl } from '../config'
 
 /**
  * PlaybackReview — Poised-style synchronised playback.
@@ -36,6 +36,36 @@ const PlaybackReview = forwardRef(function PlaybackReview(
       video.play().catch(() => {})
       if (rootRef.current) {
         rootRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }
+    },
+    getCurrentTime() {
+      return videoRef.current?.currentTime || 0
+    },
+    // Same shape as AudioPlaybackReview's seekAndPlay so CommentsThread
+    // can call it without caring whether the player is audio or video.
+    // When `endS` is set, attaches a one-shot timeupdate listener that
+    // pauses at the range end. See AudioPlaybackReview for rationale.
+    seekAndPlay(startS, endS) {
+      const video = videoRef.current
+      if (!video) return
+      video.currentTime = Math.max(0, Number(startS) || 0)
+      video.play().catch(() => {})
+      if (rootRef.current) {
+        rootRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }
+      if (endS != null && Number(endS) > Number(startS)) {
+        if (video._cdRangePauseHandler) {
+          video.removeEventListener('timeupdate', video._cdRangePauseHandler)
+        }
+        const handler = () => {
+          if (video.currentTime >= Number(endS)) {
+            video.pause()
+            video.removeEventListener('timeupdate', handler)
+            video._cdRangePauseHandler = null
+          }
+        }
+        video._cdRangePauseHandler = handler
+        video.addEventListener('timeupdate', handler)
       }
     },
   }), [])
@@ -129,7 +159,7 @@ const PlaybackReview = forwardRef(function PlaybackReview(
           <video
             key={processedVideo}
             ref={videoRef}
-            src={`${API_BASE}/api/video/${processedVideo}`}
+            src={mediaUrl(`/api/video/${processedVideo}`)}
             controls
             playsInline
             preload="auto"

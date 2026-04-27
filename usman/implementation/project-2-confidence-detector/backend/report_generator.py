@@ -36,8 +36,15 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
     duration_s = len(snapshots) * 3
 
     def avg(key):
-        vals = [s.get(key, 0) for s in all_scores]
-        return round(sum(vals) / max(len(vals), 1))
+        # Exclude None values — these mean "signal not available for
+        # this chunk" (e.g. speech_pace on a silent chunk). Previously
+        # Nones became 0 via .get(key, 0) and dragged the session
+        # average down; a speaker with a quiet pause shouldn't have
+        # their pace score halved because of it.
+        vals = [s.get(key) for s in all_scores if s.get(key) is not None]
+        if not vals:
+            return 0
+        return round(sum(vals) / len(vals))
 
     def stderr(key):
         """Standard error of the mean: std / sqrt(N).
@@ -48,7 +55,7 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         consistent; if large, the signal swung a lot and the average
         hides that.
         """
-        vals = [s.get(key, 0) for s in all_scores]
+        vals = [s.get(key) for s in all_scores if s.get(key) is not None]
         n = len(vals)
         if n < 2:
             return 0
@@ -276,13 +283,18 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
     ]
 
     # ── Score timeline (one point per 3s chunk) ──────────────────────
+    # speech_pace may be None on silent chunks; expose as null in the
+    # payload so the frontend chart can render a gap rather than a
+    # misleading zero dip.
+    def _or_null(v):
+        return v if v is not None else None
     timeline = [
         {
             "t_s": i * 3,
             "total": s.get("total", 0),
             "eye_contact": s.get("eye_contact", 0),
             "voice_steadiness": s.get("voice_steadiness", 0),
-            "speech_pace": s.get("speech_pace", 0),
+            "speech_pace": _or_null(s.get("speech_pace")),
             "filler_words": s.get("filler_words", 0),
             "vocal_variety": s.get("vocal_variety", 0),
         }

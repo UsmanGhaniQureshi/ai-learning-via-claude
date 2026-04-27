@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { API_BASE, apiFetch, wsUrl } from '../config'
+import { API_BASE, apiFetch, mediaUrl, wsUrl } from '../config'
 import { SessionVideoRecorder } from '../components/VideoRecorder'
 import useFaceDetection from './useFaceDetection'
 
@@ -177,7 +177,7 @@ export default function useLiveSession() {
           if (data && !data.error) {
             setReport(data)
             if (data.recording?.video_url) {
-              setRemoteVideoUrl(`${API_BASE}${data.recording.video_url}`)
+              setRemoteVideoUrl(mediaUrl(data.recording.video_url))
             }
             setSessionState('report')
           }
@@ -298,7 +298,7 @@ export default function useLiveSession() {
             reportRef.current = data.report
             setReport(data.report)
             if (data.report.recording?.video_url) {
-              setRemoteVideoUrl(`${API_BASE}${data.report.recording.video_url}`)
+              setRemoteVideoUrl(mediaUrl(data.report.recording.video_url))
             }
             setSessionState('report')
             return

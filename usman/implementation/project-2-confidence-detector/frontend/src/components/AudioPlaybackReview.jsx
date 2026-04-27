@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { API_BASE } from '../config'
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
+import { API_BASE, mediaUrl } from '../config'
 
 /**
  * AudioPlaybackReview — Poised-style synchronised playback for audio-only
@@ -16,20 +16,61 @@ import { API_BASE } from '../config'
  *     a "live score" panel from it (speech pace / filler-words / total).
  *   - Finds the active word (start_ms ≤ currentTime*1000 ≤ next.start_ms)
  *     and highlights it. Clicking any word jumps the audio to that moment.
+ *
+ * forwardRef exposes:
+ *   - getCurrentTime()        → seconds (float). Used by the comments
+ *                               composer's "Set start/end at current"
+ *                               buttons.
+ *   - seekAndPlay(start, end?) → seek to `start` and play. If `end`
+ *                               is provided AND > start, attach a
+ *                               timeupdate listener that auto-pauses
+ *                               at `end` and removes itself, so the
+ *                               playback respects the comment's range.
  */
-export default function AudioPlaybackReview({ report }) {
+const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, ref) {
   const audioRef = useRef(null)
   const transcriptContainerRef = useRef(null)
   const activeWordRef = useRef(null)
   const [currentSegment, setCurrentSegment] = useState(null)
   const [currentWordIdx, setCurrentWordIdx] = useState(-1)
 
+  // Imperative handle so parent (Result.jsx) can plumb the audio
+  // element through to CommentsThread without lifting state.
+  useImperativeHandle(ref, () => ({
+    getCurrentTime() {
+      return audioRef.current?.currentTime || 0
+    },
+    seekAndPlay(startS, endS) {
+      const audio = audioRef.current
+      if (!audio) return
+      audio.currentTime = Math.max(0, Number(startS) || 0)
+      audio.play().catch(() => { /* autoplay blocked, ignore */ })
+      if (endS != null && Number(endS) > Number(startS)) {
+        // Attach a one-shot listener that pauses at the range end
+        // and removes itself. We also clear it on the next call to
+        // seekAndPlay (via a ref) so range comments don't stack
+        // pause-handlers on top of each other.
+        if (audio._cdRangePauseHandler) {
+          audio.removeEventListener('timeupdate', audio._cdRangePauseHandler)
+        }
+        const handler = () => {
+          if (audio.currentTime >= Number(endS)) {
+            audio.pause()
+            audio.removeEventListener('timeupdate', handler)
+            audio._cdRangePauseHandler = null
+          }
+        }
+        audio._cdRangePauseHandler = handler
+        audio.addEventListener('timeupdate', handler)
+      }
+    },
+  }), [])
+
   const rawAudioUrl = report?.recording?.audio_url
-  // Prefix with API_BASE so the frontend (localhost:5173) hits the backend
-  // (localhost:8000) and not itself. Skip prefix if already absolute.
-  const audioUrl = rawAudioUrl
-    ? (rawAudioUrl.startsWith('http') ? rawAudioUrl : `${API_BASE}${rawAudioUrl}`)
-    : null
+  // mediaUrl prefixes API_BASE for relative paths AND appends the
+  // current JWT as ?token=, since <audio src=...> can't send the
+  // Authorization header. Absolute URLs and data:/blob: pass through.
+  const audioUrl = rawAudioUrl ? mediaUrl(rawAudioUrl) : null
   const timeline = useMemo(() => report?.timeline || [], [report])
 
   // Prefer speech_timeline.words — each chunk there is built server-side
@@ -184,4 +225,6 @@ export default function AudioPlaybackReview({ report }) {
       )}
     </div>
   )
-}
+})
+
+export default AudioPlaybackReview

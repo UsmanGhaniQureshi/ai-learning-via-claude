@@ -1,8 +1,10 @@
+import { useRef } from 'react'
 import ScoreGauge from './ScoreGauge'
 import SignalBars from './SignalBars'
 import SessionGraph from './SessionGraph'
 import TranscriptView from './TranscriptView'
-import { API_BASE, apiFetch } from '../config'
+import SignalInfoTooltip from './SignalInfoTooltip'
+import { API_BASE, apiFetch, mediaUrl } from '../config'
 
 /**
  * Shared report UI — used by both live session post-report and standalone analyzer.
@@ -18,7 +20,45 @@ export default function SessionReport({
   onDownloadJSON,
   onCopyTranscript,
   showRecording = false,
+  // Optional. When provided, the inner <video> element registers a
+  // seekAndPlay/getCurrentTime API on this ref so CommentsThread can
+  // anchor + play ranged comments against this exact element. The
+  // shape mirrors what AudioPlaybackReview / PlaybackReview expose,
+  // so the comments thread is player-agnostic.
+  playerHandleRef = null,
 }) {
+  const videoElRef = useRef(null)
+  // Set up the imperative API on the parent's ref. We can't use
+  // forwardRef here because SessionReport already accepts a default
+  // export, and we want a NAMED prop to make the wiring explicit at
+  // call sites that DON'T need playback control (Library card, etc.).
+  if (playerHandleRef) {
+    playerHandleRef.current = {
+      getCurrentTime() {
+        return videoElRef.current?.currentTime || 0
+      },
+      seekAndPlay(startS, endS) {
+        const video = videoElRef.current
+        if (!video) return
+        video.currentTime = Math.max(0, Number(startS) || 0)
+        video.play().catch(() => {})
+        if (endS != null && Number(endS) > Number(startS)) {
+          if (video._cdRangePauseHandler) {
+            video.removeEventListener('timeupdate', video._cdRangePauseHandler)
+          }
+          const handler = () => {
+            if (video.currentTime >= Number(endS)) {
+              video.pause()
+              video.removeEventListener('timeupdate', handler)
+              video._cdRangePauseHandler = null
+            }
+          }
+          video._cdRangePauseHandler = handler
+          video.addEventListener('timeupdate', handler)
+        }
+      },
+    }
+  }
   if (!report) return null
   if (report.error) return <div className="report-error">{report.error}</div>
 
@@ -37,7 +77,7 @@ export default function SessionReport({
   const faceUnavailable = kind === 'analyzer_audio'
 
   const recordingVideoUrl = recording?.video_url
-    ? `${API_BASE}${recording.video_url}`
+    ? mediaUrl(recording.video_url)
     : null
 
   // Convert signal_averages to the format SignalBars expects
@@ -85,6 +125,7 @@ export default function SessionReport({
       {showRecording && recordingVideoUrl && (
         <div className="report-section">
           <video
+            ref={videoElRef}
             src={recordingVideoUrl}
             controls
             playsInline
@@ -244,7 +285,7 @@ function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
         return (
           <div key={key} className="signal-row">
             <div className="signal-label">
-              <span>{label}</span>
+              <span>{label}<SignalInfoTooltip signal={key} /></span>
               {reason && !hide && (
                 <div style={{
                   fontSize: '0.72em',
