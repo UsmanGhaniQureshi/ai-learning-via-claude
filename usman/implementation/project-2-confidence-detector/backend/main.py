@@ -1463,12 +1463,30 @@ def _run_upload_pipeline_sync(
                 'fidget_score': 0,
             }
 
-        # Build speech result for scoring
+        # Build speech result for scoring. The new filler_words path
+        # in ScoringEngine.compute_sub_scores delegates to
+        # SignalScorer.filler_words, which needs lexical+acoustic
+        # counts and total voiced seconds (NOT the legacy per-100-words
+        # filler_rate). Total voiced_s is summed from per-chunk
+        # vad_segments below — same source the per-chunk scorer uses,
+        # so the live and upload paths now compute identical scores
+        # for the same speech.
+        total_voiced_s = (
+            sum(
+                sum(
+                    (seg_end - seg_start)
+                    for seg_start, seg_end in s["raw"].get("vad_segments", [])
+                )
+                for s in snapshots
+            ) / 1000.0
+        ) if snapshots else 0.0
         avg_speech_result = None
         if speech_summary:
             avg_speech_result = {
                 'wpm': speech_summary['average_wpm'],
-                'filler_rate': speech_summary['filler_rate'],
+                'lexical_filler_count': len(lex_fillers),
+                'acoustic_filler_count': acoustic_fillers_total,
+                'voiced_s': total_voiced_s,
             }
 
         # Build audio result for scoring. pitch_std is what the scoring engine
@@ -1481,9 +1499,52 @@ def _run_upload_pipeline_sync(
                 'pitch_std': speech_summary.get('pitch_std', 0),
             }
 
-        # Compute sub-scores via scoring engine
+        # ── Language gate (Fix 5). Mirrors the live WS path: inspect
+        # the first 2 chunks' detected_language; if both come back as
+        # non-English with high confidence, mark the report and zero
+        # out the speech-derived signals so they show as N/A in the
+        # breakdown rather than producing nonsense English-trained
+        # numbers (filler_words=100 because no English fillers were
+        # found, etc).
+        language_warning = None
+        if snapshots:
+            lang_chunks_seen = 0
+            lang_non_en = 0
+            non_en_code = None
+            for s in snapshots[:2]:
+                lang = s.get("detected_language") or "en"
+                conf = float(s.get("language_confidence") or 0.0)
+                lang_chunks_seen += 1
+                if lang != "en" and conf > 0.6:
+                    lang_non_en += 1
+                    non_en_code = lang
+            if lang_chunks_seen >= 2 and lang_non_en >= 2:
+                language_warning = non_en_code or "unknown"
+
+        # Compute sub-scores via scoring engine. Missing inputs return
+        # None now (not 50) — see scoring_engine.compute_sub_scores
+        # docstring for why.
         upload_scoring = ScoringEngine()
         sub_scores = upload_scoring.compute_sub_scores(avg_face_result, avg_speech_result, avg_audio_result)
+
+        # Fix 4: when no face was detected anywhere in the clip, the
+        # face_result we built was None already so eye_contact and
+        # expression came back None from compute_sub_scores. The check
+        # here is belt-and-braces (and forces None for the "few face
+        # frames but garbage data" edge case where face_result existed
+        # but is unreliable).
+        if len(all_face_scores) == 0:
+            sub_scores['eye_contact'] = None
+            sub_scores['expression'] = None
+
+        # Fix 5: when language gate fires, the speech-derived signals
+        # are unreliable (the English-trained scorers can't be trusted
+        # on Spanish/Hindi/etc) — N/A them so the headline reflects
+        # only voice_steadiness + vocal_variety + face signals.
+        if language_warning:
+            sub_scores['speech_pace'] = None
+            sub_scores['filler_words'] = None
+
         final_scores = upload_scoring.update(sub_scores)
         overall_score = final_scores['total']
 
@@ -1528,22 +1589,18 @@ def _run_upload_pipeline_sync(
         ss = speech_summary or {}
         eye_pct_avg = (avg_face_result or {}).get("eye_contact_pct")
         expr_mode = (avg_face_result or {}).get("expression")
-        # fillers/min derived from speech_summary's per-100-words rate
-        # and the actual word count + duration. Fall back to 0 when
-        # we don't have voiced time to divide by.
+        # Fillers per minute computed against the canonical voiced
+        # seconds (sum of VAD segments) — same denominator
+        # SignalScorer.filler_words uses, so the displayed rate
+        # matches the rate that produced the score. The old logic
+        # used `total_words / wpm` which broke when total_words==0
+        # but acoustic_fillers > 0 (that's the actual Fix 1 bug).
         fillers_total = ss.get("total_fillers", 0) or 0
         lex_count = len(ss.get("filler_words", []) or [])
         acoustic_count = max(0, fillers_total - lex_count)
-        # Use voiced minutes from average_wpm + total_words (wpm = words/min)
-        # rather than wall-clock duration so silent gaps don't deflate the
-        # filler RATE. If wpm is missing, fall back to total duration.
-        wpm = ss.get("average_wpm") or 0
-        words = ss.get("total_words") or 0
-        if wpm > 0 and words > 0:
-            voiced_min = words / wpm
-        else:
-            voiced_min = max(duration / 60.0, 0.01)
+        voiced_min = max(total_voiced_s / 60.0, 0.01)
         fillers_per_min = round(fillers_total / voiced_min, 1)
+        wpm = ss.get("average_wpm") or 0
         signal_reasons = {
             "voice_steadiness": (
                 f"{_band(final_scores['voiceSteadiness'])}: "
@@ -1551,19 +1608,23 @@ def _run_upload_pipeline_sync(
                 f"volume consistency {ss.get('volume_consistency', 0)}/100"
             ),
             "eye_contact": (
-                f"{_band(final_scores['eyeContact'])}: "
-                + (f"eyes on camera {eye_pct_avg}% of frames"
-                   if eye_pct_avg is not None
-                   else "no face detected — defaulted to 50")
+                "no face detected in this clip — score unavailable"
+                if sub_scores.get('eye_contact') is None
+                else f"{_band(final_scores['eyeContact'])}: "
+                     f"eyes on camera {eye_pct_avg}% of frames"
             ),
             "speech_pace": (
-                f"{_band(final_scores['speechPace'])}: "
-                f"avg {wpm} WPM (ideal 130-160)"
+                "non-English speech detected — English-trained scorer skipped"
+                if sub_scores.get('speech_pace') is None
+                else f"{_band(final_scores['speechPace'])}: "
+                     f"avg {wpm} WPM (ideal 130-160)"
             ),
             "filler_words": (
-                f"{_band(final_scores['fillerWords'])}: "
-                f"{fillers_total} fillers total ({fillers_per_min}/min) — "
-                f"{lex_count} lexical, {acoustic_count} acoustic"
+                "non-English speech detected — English-trained scorer skipped"
+                if sub_scores.get('filler_words') is None
+                else f"{_band(final_scores['fillerWords'])}: "
+                     f"{fillers_total} fillers total ({fillers_per_min}/min) — "
+                     f"{lex_count} lexical, {acoustic_count} acoustic"
             ),
             "vocal_variety": (
                 f"{_band(final_scores['vocalVariety'])}: "
@@ -1571,7 +1632,9 @@ def _run_upload_pipeline_sync(
                 f"(monotone <5, natural 15-50, animated 50+)"
             ),
             "expression": (
-                f"{expr_mode or 'unknown'}: excluded from total score — display only"
+                "no face detected in this clip — display unavailable"
+                if sub_scores.get('expression') is None
+                else f"{expr_mode or 'unknown'}: excluded from total score — display only"
             ),
         }
 
@@ -1583,6 +1646,11 @@ def _run_upload_pipeline_sync(
             'has_audio': has_audio,
             'no_face_detected': len(all_face_scores) == 0,
             'multi_face_warning': multi_face_warning,
+            # When set, the frontend renders a yellow banner explaining
+            # that English-trained scorers were skipped for this clip.
+            # `language_warning` mirrors the field already produced by
+            # the live WS path (handled by useLiveSession.js).
+            'language_warning': language_warning,
             'audio_extraction_error': audio_extraction_error,
             'video_encode_error': video_encode_error,
             'processed_video': video_serve,
@@ -1871,6 +1939,18 @@ async def session_ws(ws: WebSocket, session_id: str):
                     f"/api/recordings/{session_id}/video", ws_user_id,
                 ),
             }
+        # If the language gate fired during the session (warning was
+        # already pushed via WS in real time), zero out the speech
+        # signals on every snapshot before report generation so the
+        # session aggregator skips them rather than producing
+        # nonsense English-trained numbers. Same as the upload +
+        # analyzer paths.
+        if _lang_warning_sent:
+            for s in snapshots:
+                s["scores"]["speech_pace"] = None
+                s["scores"]["filler_words"] = None
+                s["scores"]["total"] = SignalScorer.aggregate(s["scores"])
+
         # Per-user baseline. exclude_media_id is THIS session — never
         # include a row in its own baseline (would bias toward "you're
         # exactly average" since the new row hasn't been written yet
@@ -1880,6 +1960,10 @@ async def session_ws(ws: WebSocket, session_id: str):
             snapshots, session_id, user_baseline=user_baseline,
         )
         report["recording"] = recording_info
+        # Persist the language warning so re-opening the saved report
+        # still surfaces the banner — the WS-time push is one-shot.
+        if _lang_warning_sent and _lang_non_en_code:
+            report["language_warning"] = _lang_non_en_code
         # Phase 2: report JSON is now stored inside Media.report_json via
         # _persist_media_and_segments below. No on-disk {session_id}_report.json.
 
@@ -2208,9 +2292,14 @@ def _run_analyzer_pipeline_sync(
                     buf = buf[chunk_bytes:]
                     arr = np.frombuffer(piece, dtype=np.int16).astype(np.float32) / 32768.0
                     result = pipeline.process_chunk(arr, sr=16000)
-                    # Audio-only: no face data, set to neutral
-                    result["scores"]["eye_contact"] = 50
-                    result["scores"]["expression"] = 50
+                    # Audio-only: no face data — leave eye_contact /
+                    # expression as None (the new SignalScorer.aggregate
+                    # skips them and renormalizes the remaining
+                    # weights). The old "set to 50" path silently
+                    # inflated the headline by ~12 points on every
+                    # audio-only clip.
+                    result["scores"]["eye_contact"] = None
+                    result["scores"]["expression"] = None
                     result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
                     snapshots.append(result)
                 leftover = buf
@@ -2219,8 +2308,8 @@ def _run_analyzer_pipeline_sync(
                 if len(arr) < chunk_samples:
                     arr = np.pad(arr, (0, chunk_samples - len(arr)))
                 result = pipeline.process_chunk(arr, sr=16000)
-                result["scores"]["eye_contact"] = 50
-                result["scores"]["expression"] = 50
+                result["scores"]["eye_contact"] = None
+                result["scores"]["expression"] = None
                 result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
                 snapshots.append(result)
             try:
@@ -2257,6 +2346,32 @@ def _run_analyzer_pipeline_sync(
             _set_media_status(media_id, "failed", error=decode_error)
             return
 
+        # Language gate (Fix 5). Same logic as the upload + WS paths:
+        # if both of the first 2 chunks come back as non-English with
+        # high confidence, mark the report so the frontend can warn,
+        # and zero out the speech-derived signals on each snapshot so
+        # the session aggregator skips them rather than producing
+        # nonsense English-trained numbers.
+        language_warning = None
+        if snapshots:
+            lang_chunks_seen = 0
+            lang_non_en = 0
+            non_en_code = None
+            for s in snapshots[:2]:
+                lang = s.get("detected_language") or "en"
+                conf = float(s.get("language_confidence") or 0.0)
+                lang_chunks_seen += 1
+                if lang != "en" and conf > 0.6:
+                    lang_non_en += 1
+                    non_en_code = lang
+            if lang_chunks_seen >= 2 and lang_non_en >= 2:
+                language_warning = non_en_code or "unknown"
+        if language_warning:
+            for s in snapshots:
+                s["scores"]["speech_pace"] = None
+                s["scores"]["filler_words"] = None
+                s["scores"]["total"] = SignalScorer.aggregate(s["scores"])
+
         # Per-user baseline (last 5 finished sessions). See main.py:_fetch_user_baseline.
         user_baseline = _fetch_user_baseline(user_id, exclude_media_id=media_id)
         report = generate_post_session_report(
@@ -2266,6 +2381,8 @@ def _run_analyzer_pipeline_sync(
         report["source"] = "file_upload"
         report["filename"] = original_filename
         report["note"] = "Eye contact and expression scores not available for audio-only files."
+        if language_warning:
+            report["language_warning"] = language_warning
         report["recording"] = {
             "media_id": media_id,
             "audio_url": sign_media_url(

@@ -39,18 +39,45 @@ export default function ScoreBreakdownPanel({
   const scored = Object.values(SIGNAL_DEFS).filter((s) => s.weight_pct > 0)
   const expression = SIGNAL_DEFS.expression
 
-  let sumContribs = 0
+  // Build rows with N/A handling. A signal whose value is null /
+  // undefined is "no data" — we show it but skip it in the math, then
+  // renormalize the remaining weights so the displayed total still
+  // sums to 100%. This matches what the backend's
+  // SignalScorer.aggregate now does (Fix 3).
+  let weightedSum = 0
+  let weightTotal = 0
   const rows = scored.map((def) => {
-    const score = Number(signalAverages[def.key] ?? 0)
-    const weight = def.weight_pct / 100
-    const contribution = score * weight
-    sumContribs += contribution
-    return { def, score: Math.round(score), weight, contribution }
+    const raw = signalAverages[def.key]
+    const available = raw !== null && raw !== undefined
+    const score = available ? Math.round(Number(raw)) : null
+    if (available) {
+      weightedSum += score * (def.weight_pct / 100)
+      weightTotal += def.weight_pct / 100
+    }
+    return { def, score, available }
   })
-
-  const computedTotal = Math.round(sumContribs * 10) / 10  // one decimal
-  const headline = Math.round(Number(avgScore ?? 0))
-  const gap = Math.abs(headline - sumContribs)
+  // Recompute with renormalized weights for display so each
+  // contribution column reflects the renormalized share, not the
+  // original 24/24/20/20/12.
+  const renormScale = weightTotal > 0 ? 1 / weightTotal : 1
+  const rowsWithContribs = rows.map((r) => {
+    const renormalizedWeight = r.available
+      ? (r.def.weight_pct / 100) * renormScale
+      : 0
+    return {
+      ...r,
+      renormalizedPct: Math.round(renormalizedWeight * 1000) / 10,  // 0.0–100.0
+      contribution: r.available ? r.score * renormalizedWeight : 0,
+    }
+  })
+  const skippedCount = rows.filter((r) => !r.available).length
+  const computedTotal = weightTotal > 0
+    ? Math.round((weightedSum / weightTotal) * 10) / 10
+    : null
+  const headline = avgScore == null ? null : Math.round(Number(avgScore))
+  const gap = (computedTotal != null && headline != null)
+    ? Math.abs(headline - computedTotal)
+    : 0
 
   return (
     <div className="report-section">
@@ -87,44 +114,57 @@ export default function ScoreBreakdownPanel({
               </tr>
             </thead>
             <tbody>
-              {rows.map(({ def, score, weight, contribution }) => (
-                <tr key={def.key}>
+              {rowsWithContribs.map(({ def, score, available, renormalizedPct, contribution }) => (
+                <tr key={def.key} style={available ? null : { opacity: 0.5 }}>
                   <td style={tdStyle}>{def.label}</td>
-                  <td style={{ ...tdStyle, textAlign: 'right' }}>{score}</td>
+                  <td style={{ ...tdStyle, textAlign: 'right' }}>
+                    {available ? score : <em>N/A</em>}
+                  </td>
                   <td style={{ ...tdStyle, textAlign: 'right', opacity: 0.7 }}>
-                    × {def.weight_pct}%
+                    {available ? `× ${renormalizedPct}%` : '—'}
                   </td>
                   <td style={{ ...tdStyle, textAlign: 'right' }}>
-                    {contribution.toFixed(1)}
+                    {available ? contribution.toFixed(1) : <em>skipped</em>}
                   </td>
                 </tr>
               ))}
               <tr>
                 <td style={{ ...tdStyle, fontWeight: 600 }} colSpan={3}>
-                  Sum (weighted average of your signals)
+                  Sum (renormalized weighted average)
                 </td>
                 <td style={{ ...tdStyle, fontWeight: 600, textAlign: 'right' }}>
-                  {computedTotal.toFixed(1)}
+                  {computedTotal != null ? computedTotal.toFixed(1) : 'N/A'}
                 </td>
               </tr>
               <tr>
                 <td style={{ ...tdStyle, fontWeight: 600 }} colSpan={3}>
-                  Headline score (rounded, computed per chunk)
+                  Headline score (rounded)
                 </td>
                 <td style={{ ...tdStyle, fontWeight: 600, textAlign: 'right' }}>
-                  {headline}
+                  {headline != null ? headline : 'N/A'}
                 </td>
               </tr>
             </tbody>
           </table>
 
-          {gap > 0.5 && (
+          {skippedCount > 0 && (
             <p style={footnoteStyle}>
-              The headline is averaged at the chunk level (every 3 s of
-              recording), where silent moments treat Speech Pace as
-              neutral 50 instead of being excluded. That handling is
-              the source of the {gap.toFixed(1)}-point gap with the
-              row sum above.
+              {skippedCount === 1 ? '1 signal was' : `${skippedCount} signals were`}{' '}
+              skipped because no data was available (audio-only clip,
+              no face detected, or non-English speech). The remaining
+              weights were renormalized so they still sum to 100%.
+            </p>
+          )}
+
+          {gap > 1.5 && (
+            <p style={footnoteStyle}>
+              The {gap.toFixed(1)}-point gap between the row sum and
+              the headline comes from per-chunk averaging — each 3-s
+              chunk gets its own weighted score, then those are
+              averaged across the session. Computing on per-signal
+              session averages (the row sum above) and per-chunk
+              totals (the headline) won't match exactly when signals
+              are missing for some chunks.
             </p>
           )}
 

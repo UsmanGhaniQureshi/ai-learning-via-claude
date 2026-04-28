@@ -2,6 +2,8 @@
 import time
 from collections import deque
 
+from signal_scorer import SignalScorer
+
 
 # Unified weights — matches signal_scorer.py.
 #
@@ -41,36 +43,61 @@ class ScoringEngine:
 
     def compute_sub_scores(self, face_result=None, speech_result=None, audio_result=None):
         """Convert raw signal data into 6 sub-scores (each 0-100).
-        Returns dict with each sub-score. Defaults to 50 if signal unavailable."""
 
+        Returns dict with each sub-score. Missing source data → None
+        (NOT 50) so the aggregate can skip it and renormalize. The
+        old "default to 50" behaviour silently faked eye_contact for
+        audio-only clips and speech signals for non-English clips,
+        producing inflated/misleading headlines.
+        """
         scores = {}
 
-        # --- Voice Steadiness (0.22) ---
+        # --- Voice Steadiness ---
         if audio_result and audio_result.get('voice_steadiness') is not None:
             scores['voice_steadiness'] = max(0, min(100, audio_result['voice_steadiness']))
         else:
-            scores['voice_steadiness'] = 50
+            scores['voice_steadiness'] = None
 
-        # --- Eye Contact (0.22) ---
+        # --- Eye Contact ---
         if face_result and face_result.get('eye_contact_pct') is not None:
             scores['eye_contact'] = max(0, min(100, face_result['eye_contact_pct']))
         else:
-            scores['eye_contact'] = 50
+            scores['eye_contact'] = None
 
-        # --- Speech Pace (0.18) ---
+        # --- Speech Pace ---
         if speech_result and speech_result.get('wpm') is not None:
             scores['speech_pace'] = _wpm_to_score(speech_result['wpm'])
         else:
-            scores['speech_pace'] = 50
+            scores['speech_pace'] = None
 
-        # --- Filler Words (0.18) ---
-        if speech_result and speech_result.get('filler_rate') is not None:
-            filler_rate = speech_result['filler_rate']
-            scores['filler_words'] = max(0, min(100, int(100 - filler_rate * 10)))
+        # --- Filler Words (0.20) ---
+        # Single source of truth: delegate to SignalScorer so the live
+        # WS path and the upload path produce the same score for the
+        # same speech. The old local formula `100 - filler_rate * 10`
+        # operated on the per-100-words filler percentage, while
+        # SignalScorer uses the canonical fillers-per-voiced-minute
+        # step table — different units and different curves, so the
+        # same audio scored differently depending on which code path
+        # ran. Caller must pass `lexical_filler_count`,
+        # `acoustic_filler_count`, and `voiced_s` for the canonical
+        # formula. Falls back to None (no data) if the inputs are
+        # missing — the new aggregate() skips Nones.
+        if (
+            speech_result
+            and speech_result.get('voiced_s') is not None
+            and speech_result.get('voiced_s') > 0
+            and speech_result.get('lexical_filler_count') is not None
+            and speech_result.get('acoustic_filler_count') is not None
+        ):
+            scores['filler_words'] = SignalScorer.filler_words(
+                lexical_count=speech_result['lexical_filler_count'],
+                acoustic_count=speech_result['acoustic_filler_count'],
+                voiced_s=speech_result['voiced_s'],
+            )
         else:
-            scores['filler_words'] = 50
+            scores['filler_words'] = None
 
-        # --- Vocal Variety (0.12) ---
+        # --- Vocal Variety ---
         # Derived from pitch standard deviation. Monotone = low, natural = high.
         if audio_result and audio_result.get('pitch_std') is not None:
             std = audio_result['pitch_std']
@@ -85,9 +112,9 @@ class ScoringEngine:
             else:
                 scores['vocal_variety'] = max(50, 100 - int((std - 80) * 2))
         else:
-            scores['vocal_variety'] = 50
+            scores['vocal_variety'] = None
 
-        # --- Expression (0.08) ---
+        # --- Expression (display-only — excluded from total) ---
         if face_result and face_result.get('expression'):
             expr = face_result['expression']
             expr_scores = {
@@ -97,34 +124,54 @@ class ScoringEngine:
             }
             scores['expression'] = expr_scores.get(expr, 50)
         else:
-            scores['expression'] = 50
+            scores['expression'] = None
 
         return scores
 
     def update(self, sub_scores):
         """Push sub-scores into rolling average and compute weighted total.
-        Returns smoothed scores + weighted total."""
 
-        # Push each sub-score into its rolling deque (tracks displayed
-        # signals including expression, even though expression has no
-        # weight in the aggregate).
+        `None` for a signal means "no data" — we DON'T push it into
+        the history (so the rolling average reflects only real
+        measurements) and we EXCLUDE it from the weighted total via
+        renormalization. This keeps a clip with no face data from
+        getting a fake eye_contact=50 contribution that inflates the
+        headline by ~12 points.
+        """
         for key in DISPLAYED_SIGNALS:
-            value = sub_scores.get(key, 50)
+            value = sub_scores.get(key)
+            if value is None:
+                continue
             self.history[key].append(value)
 
-        # Compute rolling averages for every displayed signal.
+        # Rolling averages — None when the deque is still empty
+        # (signal has never had data this session). Preserves the "no
+        # data" semantics through to the aggregate below and the UI.
         smoothed = {}
         for key in DISPLAYED_SIGNALS:
             if self.history[key]:
                 smoothed[key] = int(sum(self.history[key]) / len(self.history[key]))
             else:
-                smoothed[key] = 50
+                smoothed[key] = None
 
-        # Weighted total — expression intentionally excluded.
-        total = sum(smoothed[key] * WEIGHTS[key] for key in WEIGHTS)
-        total = max(0, min(100, int(total)))
-
-        self.total_history.append(total)
+        # Weighted total — expression intentionally excluded; missing
+        # signals (None) are skipped and remaining weights are
+        # renormalized so the headline reflects only what was actually
+        # measured. If every weighted signal is None the total is 50
+        # (neutral display value — not stored in history).
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for key, w in WEIGHTS.items():
+            v = smoothed[key]
+            if v is None:
+                continue
+            weighted_sum += v * w
+            weight_total += w
+        if weight_total > 0:
+            total = max(0, min(100, int(round(weighted_sum / weight_total))))
+            self.total_history.append(total)
+        else:
+            total = 50
 
         return {
             'total': total,

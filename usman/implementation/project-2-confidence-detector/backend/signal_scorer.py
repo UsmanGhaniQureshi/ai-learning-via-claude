@@ -147,6 +147,16 @@ class SignalScorer:
         The remaining 5 weights sum to 1.0 after redistributing the
         old 0.08 expression weight. Must stay in sync with the
         WEIGHTS dict in scoring_engine.py.
+
+        `None` for a signal means "no data was available" (silent
+        chunk for speech_pace, no face for eye_contact, non-English
+        clip for the speech-derived signals, etc.). We SKIP missing
+        signals and renormalize the remaining weights instead of
+        treating them as neutral 50 — the old "treat None as 50"
+        logic dragged thoughtful pauses and audio-only clips toward
+        50 even when the available signals were excellent. Returns
+        None if every signal is None (caller / session aggregator
+        already handles that case).
         """
         weights = {
             "voice_steadiness": 0.24,
@@ -155,12 +165,14 @@ class SignalScorer:
             "filler_words": 0.20,
             "vocal_variety": 0.12,
         }
-        # `None` means "no signal available for this chunk" (e.g.
-        # speech_pace on a silent chunk). Treat it as neutral 50 so a
-        # silent chunk gets a reasonable total rather than dragging it
-        # to zero. The session-wide average below excludes Nones from
-        # the speech_pace denominator separately.
-        def _val(k):
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for k, w in weights.items():
             v = signals.get(k)
-            return 50 if v is None else v
-        return round(sum(_val(k) * w for k, w in weights.items()))
+            if v is None:
+                continue
+            weighted_sum += v * w
+            weight_total += w
+        if weight_total <= 0:
+            return None
+        return round(weighted_sum / weight_total)

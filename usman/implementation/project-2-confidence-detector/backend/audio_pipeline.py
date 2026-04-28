@@ -314,13 +314,21 @@ def transcribe_chunk(audio, sr=16000):
     # transcription is correct — so a tight cutoff silently drops real
     # words for non-native speakers, which then deflates their WPM /
     # filler_rate denominators and biases the scoring against them.
-    # Default 0.15 keeps obvious hallucinations out (random noise rarely
-    # clears 0.1) while retaining accented speech. Override with
-    # WHISPER_WORD_PROB_MIN in production if you need it stricter.
+    #
+    # Default lowered from 0.15 → 0.05 for accent fairness: a previous
+    # audit measured native US-English words coming back at 0.4-0.9
+    # probability, while accented English words landed in the 0.08-0.12
+    # range even when transcribed correctly. The 0.15 cutoff was
+    # systematically dropping legitimate words from non-native speakers,
+    # cutting their `total_words` denominator and inflating the apparent
+    # filler rate. 0.05 still excludes random-noise hallucinations
+    # (which rarely clear 0.03) but keeps real accented speech in.
+    # Operators can still override with the WHISPER_WORD_PROB_MIN env
+    # var if they need it stricter for a specific deployment.
     try:
-        word_prob_min = float(os.environ.get("WHISPER_WORD_PROB_MIN", "0.15"))
+        word_prob_min = float(os.environ.get("WHISPER_WORD_PROB_MIN", "0.05"))
     except ValueError:
-        word_prob_min = 0.15
+        word_prob_min = 0.05
 
     segments, info = whisper.transcribe(
         audio, language=language_kwarg,

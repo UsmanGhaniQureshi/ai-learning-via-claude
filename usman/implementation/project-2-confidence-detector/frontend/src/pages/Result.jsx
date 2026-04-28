@@ -365,8 +365,27 @@ function UploadResult({
         {data.no_face_detected && (
           <div className="session-error">
             No face was detected in this video. Face-based scores
-            (eye contact, expression) defaulted to neutral and may not
-            reflect the speaker.
+            (eye contact, expression) are marked unavailable and
+            were excluded from the headline score.
+          </div>
+        )}
+        {data.language_warning && (
+          <div
+            style={{
+              background: '#3b2f00',
+              border: '1px solid #8a7100',
+              color: '#ffd95a',
+              padding: '10px 14px',
+              borderRadius: 6,
+              marginTop: 10,
+              marginBottom: 10,
+              fontSize: '0.92em',
+            }}
+          >
+            We detected non-English speech (<strong>{data.language_warning}</strong>).
+            Speech Pace and Filler Words are tuned for English and have
+            been skipped — only Voice Steadiness, Vocal Variety, and
+            face signals (when available) contribute to your score.
           </div>
         )}
         {data.multi_face_warning && (
@@ -408,6 +427,7 @@ function UploadResult({
           <SignalBars
             scores={data.sub_scores}
             faceUnavailable={!!data.no_face_detected}
+            languageWarning={data.language_warning}
           />
         )}
 

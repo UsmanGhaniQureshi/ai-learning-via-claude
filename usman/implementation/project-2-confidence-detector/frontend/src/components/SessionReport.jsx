@@ -69,7 +69,7 @@ export default function SessionReport({
     signal_averages, signal_stderrs, signal_reasons, filler_breakdown,
     total_fillers, acoustic_fillers, pace, insights, action_items,
     timeline, transcript, duration_s, weakest_signal, note, session_id,
-    recording, kind, topic,
+    recording, kind, topic, language_warning,
     signal_baseline_adjusted, user_baseline, baseline_note,
   } = report
 
@@ -125,6 +125,30 @@ export default function SessionReport({
 
       {note && <div className="report-note">{note}</div>}
 
+      {/* Non-English warning banner — speech-derived signals were
+          skipped because the English-trained scorers can't be
+          trusted on this clip. Same yellow styling used on the live
+          session page. */}
+      {language_warning && (
+        <div
+          style={{
+            background: '#3b2f00',
+            border: '1px solid #8a7100',
+            color: '#ffd95a',
+            padding: '10px 14px',
+            borderRadius: 6,
+            marginTop: 12,
+            marginBottom: 12,
+            fontSize: '0.92em',
+          }}
+        >
+          We detected non-English speech (<strong>{language_warning}</strong>).
+          Speech Pace and Filler Words are tuned for English and have
+          been skipped — only Voice Steadiness, Vocal Variety, and
+          face signals (when available) contribute to your score.
+        </div>
+      )}
+
       {showRecording && recordingVideoUrl && (
         <div className="report-section">
           <video
@@ -147,6 +171,7 @@ export default function SessionReport({
           stderrs={signal_stderrs}
           reasons={signal_reasons}
           faceUnavailable={faceUnavailable}
+          languageWarning={language_warning}
         />
       </div>
 
@@ -288,8 +313,12 @@ export default function SessionReport({
   )
 }
 
-function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
+function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable, languageWarning }) {
   if (!signals) return null
+  // Speech-derived signals — skipped (set to null by backend) when
+  // the language gate fired because the English-trained scorers can't
+  // be trusted on non-English speech.
+  const SPEECH_KEYS = new Set(['speech_pace', 'filler_words'])
   const items = [
     { key: 'voice_steadiness', label: 'Voice Steadiness', face: false },
     { key: 'eye_contact', label: 'Eye Contact', face: true },
@@ -304,11 +333,25 @@ function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
   return (
     <div className="signal-bars">
       {items.map(({ key, label, face }) => {
-        const hide = face && faceUnavailable
-        const value = signals[key] ?? 50
+        const rawValue = signals[key]
+        const noData = rawValue === null || rawValue === undefined
+        const faceMissing = face && faceUnavailable
+        const langSkipped = languageWarning && SPEECH_KEYS.has(key)
+        const hide = noData || faceMissing || langSkipped
+        const value = noData ? 0 : Number(rawValue)
         const raw = stderrs?.[key]
         const se = typeof raw === 'number' ? Math.round(raw) : null
         const reason = reasons?.[key]
+        // Pick the right "why is this N/A" caption in priority order
+        // — the user only needs the most specific reason.
+        let unavailableNote = null
+        if (langSkipped) {
+          unavailableNote = 'Non-English speech — English-trained scorer skipped.'
+        } else if (faceMissing) {
+          unavailableNote = 'No face data available for this recording.'
+        } else if (noData) {
+          unavailableNote = 'No data available for this signal.'
+        }
         return (
           <div key={key} className="signal-row">
             <div className="signal-label">
@@ -322,13 +365,13 @@ function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
                   {reason}
                 </div>
               )}
-              {hide && (
+              {hide && unavailableNote && (
                 <div style={{
                   fontSize: '0.72em',
                   opacity: 0.55,
                   marginTop: 2,
                 }}>
-                  No face data available for this recording.
+                  {unavailableNote}
                 </div>
               )}
             </div>
