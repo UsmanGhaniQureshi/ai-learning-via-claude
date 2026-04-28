@@ -1509,6 +1509,72 @@ def _run_upload_pipeline_sync(
                     "which may not be you."
                 )
 
+        # Per-signal "what fed each score" strings, mirroring the
+        # session-path output in report_generator.py:signal_reasons so
+        # the frontend "How was this computed?" panel can show the
+        # raw numbers behind each sub-score (pitch SD, WPM, fillers
+        # per minute, etc.) rather than just the bare number. The
+        # session pipeline produces these via the same labelling
+        # convention (`great / solid / developing / below average / weak`).
+        def _band(score: int) -> str:
+            if score is None:
+                return ""
+            if score >= 80: return "great"
+            if score >= 65: return "solid"
+            if score >= 50: return "developing"
+            if score >= 35: return "below average"
+            return "weak"
+
+        ss = speech_summary or {}
+        eye_pct_avg = (avg_face_result or {}).get("eye_contact_pct")
+        expr_mode = (avg_face_result or {}).get("expression")
+        # fillers/min derived from speech_summary's per-100-words rate
+        # and the actual word count + duration. Fall back to 0 when
+        # we don't have voiced time to divide by.
+        fillers_total = ss.get("total_fillers", 0) or 0
+        lex_count = len(ss.get("filler_words", []) or [])
+        acoustic_count = max(0, fillers_total - lex_count)
+        # Use voiced minutes from average_wpm + total_words (wpm = words/min)
+        # rather than wall-clock duration so silent gaps don't deflate the
+        # filler RATE. If wpm is missing, fall back to total duration.
+        wpm = ss.get("average_wpm") or 0
+        words = ss.get("total_words") or 0
+        if wpm > 0 and words > 0:
+            voiced_min = words / wpm
+        else:
+            voiced_min = max(duration / 60.0, 0.01)
+        fillers_per_min = round(fillers_total / voiced_min, 1)
+        signal_reasons = {
+            "voice_steadiness": (
+                f"{_band(final_scores['voiceSteadiness'])}: "
+                f"pitch SD {avg_pitch_std:.1f} Hz, "
+                f"volume consistency {ss.get('volume_consistency', 0)}/100"
+            ),
+            "eye_contact": (
+                f"{_band(final_scores['eyeContact'])}: "
+                + (f"eyes on camera {eye_pct_avg}% of frames"
+                   if eye_pct_avg is not None
+                   else "no face detected — defaulted to 50")
+            ),
+            "speech_pace": (
+                f"{_band(final_scores['speechPace'])}: "
+                f"avg {wpm} WPM (ideal 130-160)"
+            ),
+            "filler_words": (
+                f"{_band(final_scores['fillerWords'])}: "
+                f"{fillers_total} fillers total ({fillers_per_min}/min) — "
+                f"{lex_count} lexical, {acoustic_count} acoustic"
+            ),
+            "vocal_variety": (
+                f"{_band(final_scores['vocalVariety'])}: "
+                f"pitch SD {avg_pitch_std:.1f} Hz "
+                f"(monotone <5, natural 15-50, animated 50+)"
+            ),
+            "expression": (
+                f"{expr_mode or 'unknown'}: excluded from total score — display only"
+            ),
+        }
+
         response_payload = {
             'media_id': upload_id,
             'filename': original_name,
@@ -1535,6 +1601,7 @@ def _run_upload_pipeline_sync(
             'face_confidence': avg_face_confidence,
             'speech_score': speech_score,
             'pace_score': pace_score,
+            'signal_reasons': signal_reasons,
             'sub_scores': {
                 'voiceSteadiness': final_scores['voiceSteadiness'],
                 'eyeContact': final_scores['eyeContact'],

@@ -11,6 +11,7 @@ import SessionReport from '../components/SessionReport'
 import MetadataEditor from '../components/MetadataEditor'
 import CommentsThread from '../components/CommentsThread'
 import ShareModal from '../components/ShareModal'
+import ScoreBreakdownPanel from '../components/ScoreBreakdownPanel'
 
 /**
  * Result — shared page for every analysis result.
@@ -410,6 +411,29 @@ function UploadResult({
           />
         )}
 
+        {/* "How was this computed?" — same panel SessionReport uses,
+            with the camelCase upload sub_scores translated to the
+            snake_case shape the panel expects. The upload pipeline
+            computes sub_scores once on aggregate values, so the
+            weighted-sum table will exactly match the headline (no
+            chunk-vs-session gap). signal_reasons is populated by the
+            upload backend so the panel's "What fed each signal"
+            list shows the raw measurements behind each score. */}
+        {data.sub_scores && (
+          <ScoreBreakdownPanel
+            avgScore={data.overall_confidence}
+            signalAverages={{
+              voice_steadiness: data.sub_scores.voiceSteadiness,
+              eye_contact: data.sub_scores.eyeContact,
+              speech_pace: data.sub_scores.speechPace,
+              filler_words: data.sub_scores.fillerWords,
+              vocal_variety: data.sub_scores.vocalVariety,
+              expression: data.sub_scores.expression,
+            }}
+            signalReasons={data.signal_reasons}
+          />
+        )}
+
         {data.tips && <FeedbackTips tips={data.tips} />}
 
         {/* Score Breakdown Cards */}
@@ -489,6 +513,65 @@ function UploadResult({
         {data.face_timeline && data.face_timeline.length > 0 && (
           <div className="timeline-section">
             <h3>Timeline — Confidence Over Time</h3>
+            <details
+              style={{
+                marginBottom: 10, padding: '8px 12px',
+                background: '#161620', border: '1px solid #2a2a35',
+                borderRadius: 6, fontSize: '0.9em',
+              }}
+            >
+              <summary style={{ cursor: 'pointer', fontWeight: 600 }}>
+                What am I looking at?
+              </summary>
+              <div style={{ marginTop: 8, opacity: 0.9, lineHeight: 1.6 }}>
+                <p style={{ margin: '4px 0' }}>
+                  Every 2 seconds during the recording, the app took
+                  a quick snapshot of your face and noted what it
+                  saw. Each row below is one of those snapshots.
+                </p>
+                <ul style={{ margin: '8px 0 4px 18px', padding: 0 }}>
+                  <li style={{ marginBottom: 6 }}>
+                    <strong>Time</strong> — when in the recording
+                    this snapshot was taken (minutes:seconds from
+                    the start).
+                  </li>
+                  <li style={{ marginBottom: 6 }}>
+                    <strong>Expression</strong> — what your face was
+                    doing: smiling, focused, neutral, and so on.
+                    You'll see <em>calibrating</em> at the very
+                    start — that's the app figuring out what your
+                    relaxed face normally looks like, so it can
+                    measure changes from there.
+                  </li>
+                  <li style={{ marginBottom: 6 }}>
+                    <strong>Face: X/100</strong> — an overall score
+                    for this 2-second window. It looks at whether
+                    you're facing the camera, what your face is
+                    doing, how often you blink, how much your head
+                    moves, your posture, and any fidgeting.{' '}
+                    <span style={{ color: '#00c853' }}>Green</span>{' '}
+                    is good (71+),{' '}
+                    <span style={{ color: '#ffd600' }}>yellow</span>{' '}
+                    is okay (40–70), and{' '}
+                    <span style={{ color: '#ff7a7a' }}>red</span>{' '}
+                    means it needs work.
+                  </li>
+                  <li style={{ marginBottom: 6 }}>
+                    <strong>Eye: X%</strong> — how much of this
+                    2-second window you spent looking at the camera
+                    (instead of at notes, the floor, or a second
+                    screen). 100% means you held eye contact the
+                    whole time.
+                  </li>
+                </ul>
+                <p style={{ margin: '8px 0 0 0', opacity: 0.85 }}>
+                  Click any row to see the actual video frame the
+                  numbers came from. All these snapshots get added
+                  up to produce your overall score at the top of
+                  the page.
+                </p>
+              </div>
+            </details>
             {data.face_timeline.map((entry, i) => (
               <button
                 key={i}

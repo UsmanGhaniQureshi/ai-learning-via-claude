@@ -5,6 +5,7 @@ import SessionGraph from './SessionGraph'
 import TranscriptView from './TranscriptView'
 import SignalInfoTooltip from './SignalInfoTooltip'
 import ProgressChart from './ProgressChart'
+import ScoreBreakdownPanel from './ScoreBreakdownPanel'
 import { API_BASE, apiFetch, mediaUrl } from '../config'
 
 /**
@@ -69,6 +70,7 @@ export default function SessionReport({
     total_fillers, acoustic_fillers, pace, insights, action_items,
     timeline, transcript, duration_s, weakest_signal, note, session_id,
     recording, kind, topic,
+    signal_baseline_adjusted, user_baseline, baseline_note,
   } = report
 
   // Analyzer audio has no face signal by definition; live/upload sessions
@@ -147,6 +149,18 @@ export default function SessionReport({
           faceUnavailable={faceUnavailable}
         />
       </div>
+
+      {/* "How was this computed?" — math worked out with the user's
+          actual numbers. Default-collapsed (most users skip), but
+          available for anyone who wants to verify the headline. */}
+      <ScoreBreakdownPanel
+        avgScore={avg_score}
+        signalAverages={signal_averages}
+        signalReasons={signal_reasons}
+        signalBaselineAdjusted={signal_baseline_adjusted}
+        userBaseline={user_baseline}
+        baselineNote={baseline_note}
+      />
 
       {/* Score Timeline */}
       {graphHistory.length > 2 && (
