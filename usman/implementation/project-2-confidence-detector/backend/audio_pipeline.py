@@ -538,6 +538,13 @@ class AudioPipeline:
             "transcript_words": words,
             "transcript_text": " ".join(w['word'] for w in words),
             "chunk_index": self.chunk_count,
+            # Top-level language signals so callers (WebSocket handler,
+            # report generator) don't have to dig into `raw`. Same
+            # values that already lived under raw["language"] /
+            # raw["language_probability"] — just surfaced where the
+            # downstream consumer is looking.
+            "detected_language": language,
+            "language_confidence": language_probability,
         }
 
     def reset(self):

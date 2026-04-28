@@ -13,7 +13,7 @@ upload handler). Keeping the types as-is avoids backward-compat work.
 from datetime import datetime
 from typing import Any, List, Optional, TYPE_CHECKING
 
-from sqlalchemy import String, Integer, Float, Boolean, DateTime, ForeignKey, func
+from sqlalchemy import String, Integer, Float, Boolean, DateTime, ForeignKey, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -48,6 +48,17 @@ class Media(Base):
     )
     score_avg: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     score_grade: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
+
+    # Background-pipeline state. Defaults to 'completed' on the column so
+    # legacy rows (created before the async pipeline existed) are
+    # indistinguishable from finished new rows for the status endpoint.
+    # New uploads insert with status='pending' and a BackgroundTask
+    # advances pending → processing → completed/failed.
+    processing_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="completed", server_default="completed",
+        index=True,
+    )
+    processing_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # User-supplied metadata for Library organisation. All nullable so
     # existing rows stay valid; new rows can pre-fill `topic` from the

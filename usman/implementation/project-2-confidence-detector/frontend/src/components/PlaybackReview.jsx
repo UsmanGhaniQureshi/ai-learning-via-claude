@@ -20,7 +20,7 @@ import { API_BASE, mediaUrl } from '../config'
  * into view without needing to own the DOM ref.
  */
 const PlaybackReview = forwardRef(function PlaybackReview(
-  { processedVideo, faceTimeline, speechTimeline },
+  { processedVideo, processedVideoUrl, faceTimeline, speechTimeline },
   ref,
 ) {
   const videoRef = useRef(null)
@@ -157,9 +157,9 @@ const PlaybackReview = forwardRef(function PlaybackReview(
       <div className="pb-grid">
         <div className="pb-video-wrap">
           <video
-            key={processedVideo}
+            key={processedVideoUrl || processedVideo}
             ref={videoRef}
-            src={mediaUrl(`/api/video/${processedVideo}`)}
+            src={processedVideoUrl || mediaUrl(`/api/video/${processedVideo}`)}
             controls
             playsInline
             preload="auto"

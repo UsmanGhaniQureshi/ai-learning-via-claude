@@ -81,28 +81,21 @@ export function wsUrl(path) {
 }
 
 /**
- * Build a fully-qualified URL for a backend-served media file (video,
- * audio, image) and append ?token=... so the browser's <video>,
- * <audio>, and <img> tags can authenticate.
+ * Build a fully-qualified URL for a backend-served media file.
  *
- * Why this exists: those tags issue plain GETs when their `src` is
- * set — they CANNOT attach the Authorization header that `apiFetch`
- * uses for normal API calls. Without this, every authed media URL
- * silently 401s and the player shows an error icon.
+ * The backend now hands back HMAC-signed URLs (?sig=&exp=&uid=) that
+ * are bound to the calling user and expire in 1 h, so this helper is
+ * a thin path-to-absolute-URL prepender — it does NOT attach the JWT
+ * any more. Slapping a 30-day token onto every <video src=> was the
+ * old behaviour; signed URLs replace it because they're tighter and
+ * shorter-lived.
  *
- * `path` may be either a relative API path ("/api/video/foo.mp4") or
- * a fully-qualified URL — we detect and handle both. The function is
- * a no-op when the path is already absolute and points elsewhere
- * (e.g. an external CDN or a data: URL), so it's safe to wrap any
- * media src.
+ * `path` may be a relative API path ("/api/video/foo.mp4?sig=...") or
+ * a fully-qualified URL; absolute URLs (http/https/data/blob) pass
+ * through untouched so external CDNs / data URLs still work.
  */
 export function mediaUrl(path) {
   if (!path) return path
-  // External / data URLs pass through untouched.
   if (/^(https?:|data:|blob:)/i.test(path)) return path
-  const base = path.startsWith('/') ? `${API_BASE}${path}` : path
-  const token = getAuthToken()
-  if (!token) return base
-  const sep = base.includes('?') ? '&' : '?'
-  return `${base}${sep}token=${encodeURIComponent(token)}`
+  return path.startsWith('/') ? `${API_BASE}${path}` : path
 }

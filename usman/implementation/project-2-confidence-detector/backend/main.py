@@ -30,7 +30,7 @@ import tempfile
 import numpy as np
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
-from fastapi import Request, Depends, HTTPException
+from fastapi import Request, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, EmailStr
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,6 +70,67 @@ def _grade_for(score: int) -> str:
         if score >= threshold:
             return grade
     return "F"
+
+
+def _fetch_user_baseline(
+    user_id: str,
+    exclude_media_id: str | None = None,
+) -> dict:
+    """Compute per-signal mean+std from the user's last 5 finished
+    Media rows. Used by report_generator to add `signal_baseline_
+    adjusted` scores so the user is rated against their own history,
+    not a global ideal.
+
+    "Finished" is currently approximated as `report_json IS NOT NULL`
+    — every successful pipeline run sets it. Once Task 5 introduces a
+    `media.status` column we'll tighten this to `status='completed'`.
+
+    Returns a dict either way:
+      - {ready: True,  n_sessions: 5, voice_steadiness: {mean, std, n}, ...}
+      - {ready: False, n_sessions: <whatever they have>}  (when < 3)
+
+    Always returning a dict (not None) keeps the downstream check
+    simple: `if user_baseline.get("ready")`.
+    """
+    SIGNALS = ("voice_steadiness", "speech_pace", "filler_words", "vocal_variety")
+    with SessionLocal() as db:
+        q = (
+            select(Media)
+            .where(Media.user_id == user_id)
+            .where(Media.report_json.isnot(None))
+            .order_by(Media.created_at.desc())
+            .limit(5)
+        )
+        if exclude_media_id is not None:
+            q = q.where(Media.id != exclude_media_id)
+        rows = db.execute(q).scalars().all()
+
+    n = len(rows)
+    if n < 3:
+        return {"ready": False, "n_sessions": n}
+
+    per_signal: dict[str, list[float]] = {s: [] for s in SIGNALS}
+    for r in rows:
+        avgs = (r.report_json or {}).get("signal_averages") or {}
+        for s in SIGNALS:
+            v = avgs.get(s)
+            if isinstance(v, (int, float)):
+                per_signal[s].append(float(v))
+
+    out: dict = {"ready": True, "n_sessions": n}
+    for s in SIGNALS:
+        vals = per_signal[s]
+        if len(vals) < 3:
+            # Not enough samples for THIS signal — older rows might
+            # pre-date a signal being computed (analyzer_audio rows
+            # don't have face signals; legacy rows might be missing
+            # baseline_adjusted). Skip the signal rather than fake it.
+            continue
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+        std = var ** 0.5
+        out[s] = {"mean": round(mean, 1), "std": round(std, 2), "n": len(vals)}
+    return out
 
 
 # ── Path-traversal guard ────────────────────────────────────────────────
@@ -192,6 +253,351 @@ def _persist_media_and_segments(
             db.add_all(segments)
         db.commit()
 
+
+def _create_pending_media_row(
+    *,
+    media_id: str,
+    source_kind: str,
+    user_id: str,
+    original_name: str | None,
+    stored_path: str | None,
+    content_sha256: str | None,
+    title: str | None,
+) -> None:
+    """Insert a Media row with status='pending' before the heavy work begins.
+
+    The /api/upload + /api/analyze-audio handlers return 202 immediately
+    after this insert so the browser sees a media_id it can poll, while
+    the actual ffmpeg + face + scoring work runs in a BackgroundTask.
+    Fields the pipeline produces (duration_s, score_avg, report_json,
+    playback_path, has_video/has_audio, segments) are filled in later by
+    `_complete_media_processing`.
+    """
+    with SessionLocal() as db:
+        db.add(Media(
+            id=media_id,
+            source_kind=source_kind,
+            user_id=user_id,
+            original_name=original_name,
+            stored_path=stored_path,
+            content_sha256=content_sha256,
+            title=(title.strip()[:200] if isinstance(title, str) and title.strip() else None),
+            processing_status="pending",
+        ))
+        db.commit()
+
+
+def _set_media_status(
+    media_id: str,
+    status: str,
+    *,
+    error: str | None = None,
+) -> None:
+    """Advance the row through pending → processing → completed/failed.
+
+    Best-effort: a missing row (e.g. user deleted while job was running)
+    is silently ignored — there's no point reviving a deleted row just
+    to mark it failed.
+    """
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if m is None:
+            return
+        m.processing_status = status
+        m.processing_error = error
+        db.commit()
+
+
+def _complete_media_processing(
+    *,
+    media_id: str,
+    playback_path: str | None,
+    duration_s: float | None,
+    has_video: bool,
+    has_audio: bool,
+    score_avg: int | None,
+    face_timeline: list[dict],
+    speech_timeline: list[dict],
+    report_json: dict | None,
+) -> None:
+    """Finalize a row that started life via `_create_pending_media_row`.
+
+    Updates the row in place (so the caller's media_id stays stable for
+    pollers) and writes face/speech segments. Sets status='completed'.
+    Any exception here propagates to the BackgroundTask wrapper which
+    catches it and flips status='failed' with the error string.
+    """
+    grade = _grade_for(score_avg) if score_avg is not None else None
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if m is None:
+            return
+        m.playback_path = playback_path
+        m.duration_s = duration_s
+        m.has_video = has_video
+        m.has_audio = has_audio
+        m.score_avg = score_avg
+        m.score_grade = grade
+        m.report_json = report_json
+        m.processing_status = "completed"
+        m.processing_error = None
+
+        segments: list[MediaSegment] = []
+        for entry in face_timeline or []:
+            t_start = int(float(entry.get("timestamp", 0)) * 1000)
+            segments.append(MediaSegment(
+                media_id=media_id,
+                t_start_ms=t_start,
+                t_end_ms=t_start + 2000,
+                kind="face",
+                score=entry.get("face_confidence"),
+                label=entry.get("expression"),
+                extras={
+                    "eye_contact_pct": entry.get("eye_contact_pct"),
+                    "blink_rate": entry.get("blink_rate"),
+                    "tension_score": entry.get("tension_score"),
+                },
+            ))
+        for entry in speech_timeline or []:
+            t_start = int(float(entry.get("timestamp", 0)) * 1000)
+            segments.append(MediaSegment(
+                media_id=media_id,
+                t_start_ms=t_start,
+                t_end_ms=t_start + 3000,
+                kind="speech",
+                score=entry.get("speech_score"),
+                label=(entry.get("text") or "")[:500],
+                extras={
+                    "fillers": entry.get("fillers", []),
+                    "hedges": entry.get("hedges", []),
+                },
+            ))
+            for w in entry.get("words", []) or []:
+                segments.append(MediaSegment(
+                    media_id=media_id,
+                    t_start_ms=int(w.get("start_ms", 0)),
+                    t_end_ms=int(w.get("end_ms", 0)),
+                    kind="word",
+                    score=None,
+                    label=w.get("word"),
+                    extras={"is_filler": bool(w.get("is_filler"))},
+                ))
+        if segments:
+            db.add_all(segments)
+        db.commit()
+
+
+# Pre-upload trim — caps and helpers. Kept near the persist helpers so
+# all the "things upload_video orchestrates" live in one place.
+_TRIM_MAX_SEGMENTS = 20      # arbitrary sane cap; 20 distinct slices is
+                             # already a wild edit, and the filter_complex
+                             # string grows linearly per segment.
+_TRIM_MIN_TOTAL_S  = 3.0     # AudioPipeline's chunk size — anything
+                             # shorter just gets zero-padded and skews
+                             # pitch / WPM stats by ~2x.
+
+
+def _parse_trim_segments(raw: str | None):
+    """Validate the `trim_segments` form field and return a normalized
+    `list[(start, end)]` of floats — or a JSONResponse(400) describing
+    the validation failure.
+
+    Returning the response object directly lets the caller do
+    `if isinstance(...)` as a tiny FSM, avoiding raise/except for
+    user-input errors.
+    """
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"error": "trim_segments must be a JSON array, e.g. [[10, 20], [30, 40]]."},
+            status_code=400,
+        )
+    if not isinstance(parsed, list) or not parsed:
+        return JSONResponse(
+            {"error": "trim_segments must be a non-empty array of [start, end] pairs."},
+            status_code=400,
+        )
+    if len(parsed) > _TRIM_MAX_SEGMENTS:
+        return JSONResponse(
+            {"error": f"At most {_TRIM_MAX_SEGMENTS} trim segments are allowed."},
+            status_code=400,
+        )
+    out: list[tuple[float, float]] = []
+    total = 0.0
+    for i, entry in enumerate(parsed):
+        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+            return JSONResponse(
+                {"error": f"Segment {i} must be a [start, end] pair."},
+                status_code=400,
+            )
+        try:
+            s = float(entry[0])
+            e = float(entry[1])
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": f"Segment {i} has non-numeric bounds."},
+                status_code=400,
+            )
+        if not (s >= 0 and e > s):
+            return JSONResponse(
+                {"error": f"Segment {i} must satisfy 0 <= start < end."},
+                status_code=400,
+            )
+        out.append((s, e))
+        total += (e - s)
+    if total < _TRIM_MIN_TOTAL_S:
+        return JSONResponse(
+            {"error": f"Combined trimmed duration must be at least {_TRIM_MIN_TOTAL_S:.0f} s."},
+            status_code=400,
+        )
+    return out
+
+
+def _ffmpeg_input_has_audio(filepath: str) -> bool:
+    """Best-effort probe — ffmpeg `-i` with no output prints stream info
+    to stderr and exits non-zero. We just look for an Audio stream
+    line. Defaults to True on probe failure so the concat filter still
+    asks for audio (and if there really isn't any, ffmpeg's failure
+    will surface in the status row's `error` string instead of
+    silently producing a video-only result the user didn't ask for).
+    """
+    try:
+        proc = subprocess.run(
+            [FFMPEG, "-hide_banner", "-i", filepath],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return True
+    return b"Audio:" in (proc.stderr or b"")
+
+
+def _apply_trim_segments(
+    filepath: str, safe_ext: str, segments: list[tuple[float, float]],
+) -> None:
+    """Concatenate the given segments of `filepath` in place.
+
+    Uses `-filter_complex` with the `concat` filter so arbitrary cut
+    points work regardless of keyframe alignment. That forces a
+    re-encode (filters are incompatible with `-c copy`), but the
+    downstream upload pipeline re-encodes anyway when it overlays the
+    face engine output, so the cost is one extra pass — acceptable.
+
+    Overlapping segments are NOT merged: if the user lists 5:10–6:10
+    and 6:00–6:30, the kept video plays 5:10–6:10 then 6:00–6:30
+    back-to-back. That matches the explicit composer behaviour.
+
+    Raises RuntimeError on ffmpeg failure; the caller maps that to a
+    'failed' processing_status with the error text.
+    """
+    has_audio = _ffmpeg_input_has_audio(filepath)
+    n = len(segments)
+    parts: list[str] = []
+    for i, (s, e) in enumerate(segments):
+        parts.append(f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{i}]")
+        if has_audio:
+            parts.append(f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{i}]")
+    if has_audio:
+        labels = "".join(f"[v{i}][a{i}]" for i in range(n))
+        parts.append(f"{labels}concat=n={n}:v=1:a=1[outv][outa]")
+    else:
+        labels = "".join(f"[v{i}]" for i in range(n))
+        parts.append(f"{labels}concat=n={n}:v=1:a=0[outv]")
+    filter_str = ";".join(parts)
+
+    tmp_path = filepath + ".trim.tmp" + safe_ext
+    cmd = [
+        FFMPEG, "-y", "-i", filepath,
+        "-filter_complex", filter_str,
+        "-map", "[outv]",
+    ]
+    if has_audio:
+        cmd += ["-map", "[outa]", "-c:a", "aac"]
+    cmd += [
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-movflags", "+faststart",
+        tmp_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600,
+        )
+        ok = (
+            proc.returncode == 0
+            and os.path.exists(tmp_path)
+            and os.path.getsize(tmp_path) > 0
+        )
+        if not ok:
+            tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
+            raise RuntimeError("ffmpeg trim/concat failed: " + " | ".join(tail))
+        os.replace(tmp_path, filepath)
+    finally:
+        if os.path.exists(tmp_path):
+            try: os.unlink(tmp_path)
+            except OSError: pass
+
+
+def _apply_trim_segments_audio(
+    filepath: str, segments: list[tuple[float, float]],
+) -> str:
+    """Audio-only sibling of `_apply_trim_segments`.
+
+    Concatenates the listed [start, end] windows of an audio file in
+    place. Always re-encodes to .m4a/AAC because:
+      - filter_complex requires re-encoding (no `-c copy`),
+      - AAC in m4a plays in every browser without extra mime fiddling,
+      - the existing /api/analyzer/{id}/audio endpoint globs by
+        media_id so a suffix change is invisible to the serving path.
+
+    Returns the new on-disk path (extension may differ from input).
+    The caller updates `saved_name` / `playback_path` accordingly.
+    """
+    n = len(segments)
+    parts = []
+    for i, (s, e) in enumerate(segments):
+        parts.append(f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{i}]")
+    labels = "".join(f"[a{i}]" for i in range(n))
+    parts.append(f"{labels}concat=n={n}:v=0:a=1[outa]")
+    filter_str = ";".join(parts)
+
+    new_path = str(Path(filepath).with_suffix(".m4a"))
+    tmp_path = new_path + ".trim.tmp"
+    cmd = [
+        FFMPEG, "-y", "-i", filepath,
+        "-filter_complex", filter_str,
+        "-map", "[outa]",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        tmp_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600,
+        )
+        ok = (
+            proc.returncode == 0
+            and os.path.exists(tmp_path)
+            and os.path.getsize(tmp_path) > 0
+        )
+        if not ok:
+            tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
+            raise RuntimeError("ffmpeg trim/concat failed: " + " | ".join(tail))
+        # Original input file may share the new path (same .m4a ext) or
+        # differ; either way os.replace handles it. If the extension
+        # changed, delete the old file so we don't leak it.
+        if filepath != new_path and os.path.exists(filepath):
+            try: os.unlink(filepath)
+            except OSError: pass
+        os.replace(tmp_path, new_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try: os.unlink(tmp_path)
+            except OSError: pass
+    return new_path
+
+
 # Hedging phrases swept over the Whisper transcript in the upload flow.
 # Whisper drops these structurally, so we surface them via a regex pass.
 HEDGING_PHRASES = [
@@ -275,6 +681,7 @@ from auth import (
     decode_token, get_current_user, get_current_user_for_media,
     media_readable_by, media_owned_by,
 )
+from signed_urls import sign_media_url
 if JWT_SECRET == _DEFAULT_SECRET:
     log.warning(
         "auth.jwt_secret_default",
@@ -513,38 +920,33 @@ def get_prompts(user: User = Depends(get_current_user)):
 @limiter.limit("10/hour")
 async def upload_video(
     request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    trim_segments: str | None = Form(default=None),
     user: User = Depends(get_current_user),
 ):
-    # Per-upload id namespaces all artifacts (extracted audio, processed video,
-    # evidence frames) so concurrent uploads — or repeat uploads of files with
-    # the same name — don't overwrite each other's outputs.
-    # Full 32-char uuid4 hex = 128 bits of entropy. The previous 8-char
-    # id had a 50% collision probability at ~65k rows (birthday bound)
-    # which would surface as a 500 on Media.id unique-constraint
-    # violation. The full hex effectively eliminates that risk.
-    upload_id = uuid.uuid4().hex
-    audio_extraction_error = None
-    video_encode_error = None
+    """Phase-1 endpoint: take bytes, return media_id, kick off pipeline.
 
-    # Save uploaded file with size validation AND compute sha256 as we go.
-    #
-    # Store under {upload_id}{safe_ext} rather than the user-supplied
-    # filename. This:
-    #   - prevents two uploads with the same name from overwriting each
-    #     other's source file on disk;
-    #   - closes the path-traversal hole (file.filename is user input and
-    #     could contain "../..");
-    #   - keeps a clean 1:1 relationship between upload_id and stored bytes.
-    # The original filename is preserved in `original_name` (display only).
-    #
-    # The sha256 is stored on the Media row as a content fingerprint for
-    # future analytics (e.g. "you've uploaded this before") but is NOT
-    # used to short-circuit processing — every upload runs the full
-    # pipeline so the user sees a predictable spinner → result flow.
+    Used to do all 30-120 s of ffmpeg + face + speech work inline on the
+    event loop, blocking the worker from serving anything else for the
+    duration. Now the heavy work runs in a BackgroundTask and the client
+    polls GET /api/media/{id}/status to follow progress.
+
+    Optional `trim_segments` form field: a JSON array of `[start_s,
+    end_s]` pairs (in original-clip seconds). When set, ffmpeg
+    concatenates the listed segments — in the supplied order, with
+    duplicates allowed — BEFORE the analysis pipeline runs, so
+    face_timeline / scores / transcript only reflect the kept windows.
+    Example: `[[310.0, 370.0], [360.0, 390.0]]` produces a 1:30 clip
+    spanning 5:10–6:10 + 6:00–6:30 of the original.
+    """
+    segments = _parse_trim_segments(trim_segments)
+    if isinstance(segments, JSONResponse):
+        return segments  # validation error
+
+    upload_id = uuid.uuid4().hex
     original_name = file.filename or "upload"
     safe_ext = Path(original_name).suffix.lower()
-    # Allow only a small set of suffixes so a nonsense one can't pollute disk.
     if safe_ext not in {".mp4", ".webm", ".mov", ".m4v", ".mkv", ".avi", ".ogv"}:
         safe_ext = ".mp4"
     filepath = os.path.join(UPLOAD_DIR, f"{upload_id}{safe_ext}")
@@ -552,7 +954,7 @@ async def upload_video(
     hasher = hashlib.sha256()
     with open(filepath, "wb") as f:
         while True:
-            chunk = await file.read(1024 * 1024)  # Read 1MB at a time
+            chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
             size += len(chunk)
@@ -564,11 +966,67 @@ async def upload_video(
             f.write(chunk)
     content_sha256 = hasher.hexdigest()
 
-    # If processing fails mid-way, the saved source file must not linger.
-    # A single outer try/except around the full pipeline catches every
-    # uncaught exception, deletes the source, then re-raises so FastAPI
-    # still produces its 500 response.
+    # Insert the row in 'pending' so the very first poll from the client
+    # finds it. Without this, the browser sees the media_id we hand back
+    # but the row doesn't exist yet — race that surfaces as a phantom 404.
+    _create_pending_media_row(
+        media_id=upload_id,
+        source_kind="upload",
+        user_id=user.id,
+        original_name=original_name,
+        stored_path=f"{upload_id}{safe_ext}",
+        content_sha256=content_sha256,
+        title=Path(original_name).stem if original_name else None,
+    )
+    background_tasks.add_task(
+        _run_upload_pipeline_sync,
+        upload_id, filepath, original_name, safe_ext, user.id,
+        segments,
+    )
+    return JSONResponse(
+        {"media_id": upload_id, "status": "pending"},
+        status_code=202,
+    )
+
+
+def _run_upload_pipeline_sync(
+    upload_id: str,
+    filepath: str,
+    original_name: str,
+    safe_ext: str,
+    user_id: str,
+    trim_segments: list[tuple[float, float]] | None = None,
+) -> None:
+    """All the heavy lifting that used to run inline in upload_video.
+
+    Runs in a worker thread via FastAPI's BackgroundTasks. Updates the
+    pre-created Media row in place. On any uncaught exception the row is
+    flipped to processing_status='failed' with the exception text so the
+    client poll surfaces a real error instead of a generic timeout.
+
+    When `trim_segments` is set, ffmpeg concatenates each [start, end]
+    window in the listed order BEFORE the cv2 open, so every downstream
+    step (audio extract, face engine, scoring) sees only the kept
+    bytes. Overlapping segments are NOT de-duplicated — duplicate
+    seconds replay back-to-back, which matches what the user
+    explicitly asked for in the trim composer.
+    """
+    _set_media_status(upload_id, "processing")
+    audio_extraction_error = None
+    video_encode_error = None
+
     try:
+        # Pre-analysis trim/concat. Failure here is fatal (we mark the
+        # row failed) because the user explicitly asked for a specific
+        # set of windows; falling back to the full clip would silently
+        # produce the wrong report.
+        if trim_segments:
+            try:
+                _apply_trim_segments(filepath, safe_ext, trim_segments)
+            except FileNotFoundError:
+                raise RuntimeError("ffmpeg binary not found on the server.")
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("ffmpeg trim timed out after 600 s.")
         cap = cv2.VideoCapture(filepath)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -585,18 +1043,17 @@ async def upload_video(
             cap.release()
             try: os.unlink(filepath)
             except OSError: pass
-            return JSONResponse(
-                {
-                    "error": "Recording too short",
-                    "detail": (
-                        f"The clip is {duration:.1f} s. "
-                        "Please upload at least 3 s of footage so the "
-                        "speech and face analysis have enough signal to "
-                        "produce meaningful scores."
-                    ),
-                },
-                status_code=400,
+            _set_media_status(
+                upload_id,
+                "failed",
+                error=(
+                    f"Recording too short ({duration:.1f} s). "
+                    "Please upload at least 3 s of footage so the "
+                    "speech and face analysis have enough signal to "
+                    "produce meaningful scores."
+                ),
             )
+            return
 
         # Stream audio through ffmpeg's stdout in 3-second windows and
         # process each window through AudioPipeline as it arrives, so the
@@ -682,9 +1139,7 @@ async def upload_video(
                     try: proc.stderr.close()
                     except Exception: pass
 
-            audio_extraction_error = await asyncio.get_event_loop().run_in_executor(
-                None, _stream_and_process_sync
-            )
+            audio_extraction_error = _stream_and_process_sync()
 
         # Process video frames with face engine
         output_name = f"processed_{upload_id}.mp4"
@@ -770,9 +1225,7 @@ async def upload_video(
             writer.release()
             return face_results_by_time, all_face_scores
 
-        face_results_by_time, all_face_scores = await asyncio.get_event_loop().run_in_executor(
-            None, _frame_loop_sync
-        )
+        face_results_by_time, all_face_scores = _frame_loop_sync()
 
         # Snapshots were already produced during streaming audio extraction
         # above — AudioPipeline processed each 3s window as it came off
@@ -978,9 +1431,7 @@ async def upload_video(
             except subprocess.TimeoutExpired:
                 return False, "ffmpeg re-encode timed out after 300s."
 
-        ffmpeg_ok, _ffmpeg_err = await asyncio.get_event_loop().run_in_executor(
-            None, _reencode_sync
-        )
+        ffmpeg_ok, _ffmpeg_err = _reencode_sync()
         if _ffmpeg_err is not None:
             video_encode_error = _ffmpeg_err
         video_serve = web_name if ffmpeg_ok else output_name
@@ -1069,6 +1520,17 @@ async def upload_video(
             'audio_extraction_error': audio_extraction_error,
             'video_encode_error': video_encode_error,
             'processed_video': video_serve,
+            # `recording.video_url` is what SessionReport + Result render
+            # in the player. The backend hands back a signed path bound
+            # to the uploader's user_id; the report endpoint re-signs
+            # this for whichever caller fetches the report later, so a
+            # share-recipient gets a sig bound to THEIR uid.
+            'recording': {
+                'media_id': upload_id,
+                'video_url': sign_media_url(
+                    f"/api/video/{video_serve}", user_id,
+                ),
+            },
             'overall_confidence': overall_score,
             'face_confidence': avg_face_confidence,
             'speech_score': speech_score,
@@ -1087,56 +1549,38 @@ async def upload_video(
             'speech_timeline': speech_timeline,
         }
 
-        # Phase 2: persist Media + MediaSegment rows. Failure here is logged
-        # so the response still returns successfully, but Library + Report
-        # endpoints won't see this upload. Warn loudly in logs.
-        #
-        # Strip base64 thumbs before saving: each `face_timeline[n].thumb`
-        # is ~3-8 KB, and at 1 thumb per 2 s of video a 10-minute clip
-        # racks up ~900 KB of inline base64 in report_json. That bloats
-        # every GET /api/report/{id} response forever. The fresh upload
-        # response still carries them (user expects to see evidence on
-        # first view); subsequent Library revisits render placeholders.
-        slim_face_timeline = [
-            {k: v for k, v in e.items() if k != 'thumb'}
-            for e in face_results_by_time
-        ]
-        slim_report = {**response_payload, 'face_timeline': slim_face_timeline}
-        try:
-            _persist_media_and_segments(
-                media_id=upload_id,
-                source_kind="upload",
-                user_id=user.id,
-                original_name=original_name,
-                stored_path=f"{upload_id}{safe_ext}",
-                playback_path=video_serve,
-                duration_s=float(duration),
-                has_video=len(all_face_scores) > 0,
-                has_audio=has_audio,
-                score_avg=overall_score,
-                face_timeline=face_results_by_time,
-                speech_timeline=speech_timeline,
-                report_json=slim_report,
-                content_sha256=content_sha256,
-                # Default title = uploaded filename minus extension.
-                # The user can rename via the inline editor later.
-                title=Path(original_name).stem if original_name else None,
-            )
-        except Exception as e:
-            log.warning(
-                "db.dual_write_failed",
-                extra={"media_id": upload_id, "source": "upload", "error": str(e)},
-            )
-
-        return JSONResponse(response_payload)
-    except Exception:
-        # Processing failed mid-way — delete the orphaned source file before
-        # re-raising so FastAPI still produces its 500 response.
+        # Persist the FULL face_timeline (thumbs included) into report_json.
+        # Earlier this slimmed thumbs out to save bandwidth on revisits,
+        # since the synchronous response carried them once for the fresh
+        # view. The async pipeline removed that fresh-response path —
+        # the client always reads via GET /api/report/{id} — so slimming
+        # now means thumbs are missing on every visit. ~900 KB inline
+        # base64 for a 10-min clip is acceptable: gzip cuts that to
+        # ~600 KB on the wire, and the alternative is a noticeably
+        # blank Face Timeline column.
+        # Row already exists (created with status='pending' by the
+        # handler); fill in the produced fields and flip to 'completed'.
+        _complete_media_processing(
+            media_id=upload_id,
+            playback_path=video_serve,
+            duration_s=float(duration),
+            has_video=len(all_face_scores) > 0,
+            has_audio=has_audio,
+            score_avg=overall_score,
+            face_timeline=face_results_by_time,
+            speech_timeline=speech_timeline,
+            report_json=response_payload,
+        )
+    except Exception as e:
+        # Processing failed mid-way — delete the orphaned source file
+        # and mark the row failed so the polling client surfaces the
+        # error instead of spinning forever.
         try:
             os.unlink(filepath)
         except OSError:
             pass
-        raise
+        log.exception("upload.pipeline_failed", extra={"media_id": upload_id})
+        _set_media_status(upload_id, "failed", error=str(e) or "Pipeline error")
 
 
 def _serve_with_range(request: Request, path: str, media_type: str):
@@ -1233,6 +1677,32 @@ def serve_video(
     return _serve_with_range(request, filepath, media_type="video/mp4")
 
 
+@app.get("/api/media/{media_id}/status")
+def get_media_status(
+    media_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Polled by Upload.jsx + Analyzer.jsx after kicking off a job.
+
+    Returns the current `processing_status` plus the error message (if
+    failed). Owner-or-shared access only — same shape as the rest of
+    the media endpoints to avoid leaking media-id existence to other
+    users.
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "Invalid media id"}, status_code=400)
+    with SessionLocal() as db:
+        m = db.get(Media, media_id)
+        if m is None or not media_readable_by(user.id, m):
+            return JSONResponse({"error": "Not found"}, status_code=404)
+        return {
+            "media_id": m.id,
+            "status": m.processing_status,
+            "error": m.processing_error,
+            "ready": m.processing_status == "completed",
+        }
+
+
 # ============================================================
 # MODE 3: SESSION WebSocket (V2 — production audio pipeline)
 # ============================================================
@@ -1296,6 +1766,16 @@ async def session_ws(ws: WebSocket, session_id: str):
     latest_browser_face = {}  # Face scores from browser MediaPipe
     client_requested_stop = False
     _finalized = False  # Guard against double-finalize races.
+    # Language-warning gate: if the FIRST 2 chunks both detect a
+    # non-English language with confidence > 0.6, send a one-shot
+    # `language_warning` JSON message to the client. Doesn't block
+    # the session — scoring continues, the UI shows a banner.
+    # (When WHISPER_AUTODETECT is off or the model is `.en`, the
+    # detected language is always "en" so this gate never fires.)
+    _lang_chunks_seen = 0
+    _lang_non_en_count = 0
+    _lang_non_en_code: str | None = None
+    _lang_warning_sent = False
 
     async def finalize_and_send_report():
         """Generate report and send via WebSocket while still open.
@@ -1313,14 +1793,25 @@ async def session_ws(ws: WebSocket, session_id: str):
         if kind == "analyzer_audio":
             recording_info = {
                 "media_id": session_id,
-                "audio_url": f"/api/analyzer/{session_id}/audio",
+                "audio_url": sign_media_url(
+                    f"/api/analyzer/{session_id}/audio", ws_user_id,
+                ),
             }
         else:
             recording_info = {
                 "session_id": session_id,
-                "video_url": f"/api/recordings/{session_id}/video",
+                "video_url": sign_media_url(
+                    f"/api/recordings/{session_id}/video", ws_user_id,
+                ),
             }
-        report = generate_post_session_report(snapshots, session_id)
+        # Per-user baseline. exclude_media_id is THIS session — never
+        # include a row in its own baseline (would bias toward "you're
+        # exactly average" since the new row hasn't been written yet
+        # anyway, but cheap belt-and-braces).
+        user_baseline = _fetch_user_baseline(ws_user_id, exclude_media_id=session_id)
+        report = generate_post_session_report(
+            snapshots, session_id, user_baseline=user_baseline,
+        )
         report["recording"] = recording_info
         # Phase 2: report JSON is now stored inside Media.report_json via
         # _persist_media_and_segments below. No on-disk {session_id}_report.json.
@@ -1441,6 +1932,31 @@ async def session_ws(ws: WebSocket, session_id: str):
                     result["scores"]["expression"] = latest_browser_face.get("expression", 50)
                     result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
 
+                # Language-warning gate. Inspect the first 2 chunks
+                # only; if both come back as non-English with high
+                # confidence, send a single-shot warning. We track
+                # ALL chunks (not just voiced ones) — a 30-s session
+                # of mostly silence still has 2 chunks, and we'd
+                # rather warn early than wait.
+                if not _lang_warning_sent and _lang_chunks_seen < 2:
+                    lang = result.get("detected_language") or "en"
+                    conf = float(result.get("language_confidence") or 0.0)
+                    _lang_chunks_seen += 1
+                    if lang != "en" and conf > 0.6:
+                        _lang_non_en_count += 1
+                        _lang_non_en_code = lang
+                    if _lang_chunks_seen >= 2 and _lang_non_en_count >= 2:
+                        _lang_warning_sent = True
+                        try:
+                            await ws.send_json({
+                                "type": "language_warning",
+                                "detected": _lang_non_en_code or "unknown",
+                            })
+                        except Exception:
+                            # Don't let a transient WS error break the
+                            # main scoring path.
+                            pass
+
                 snapshots.append(result)
                 await ws.send_json(result)
 
@@ -1482,23 +1998,32 @@ async def session_ws(ws: WebSocket, session_id: str):
 @limiter.limit("10/hour")
 async def analyze_audio_file(
     request: Request,
+    background_tasks: BackgroundTasks,
     audio_file: UploadFile = File(...),
     session_label: str = Form(default="uploaded"),
+    trim_segments: str | None = Form(default=None),
     user: User = Depends(get_current_user),
 ):
+    """Accepts any audio file. Returns 202 + media_id immediately.
+
+    The full speech-intelligence pipeline runs in a BackgroundTask;
+    Analyzer.jsx polls /api/media/{id}/status until the row flips to
+    'completed' (or 'failed'), then loads the report.
+
+    Optional `trim_segments` form field: same shape as on /api/upload —
+    a JSON array of `[start_s, end_s]` pairs. When set, ffmpeg
+    concatenates the listed windows BEFORE the analysis runs, so the
+    transcript / scores reflect only the kept segments.
     """
-    Accepts any audio file (WAV, MP3, M4A, WebM, OGG).
-    Runs full speech intelligence pipeline.
-    Persists a Media row (source_kind='analyzer_audio') so the Library
-    lists this analysis alongside uploads and live sessions. The audio
-    file itself is saved to RECORDINGS_DIR for later playback.
-    """
+    segments = _parse_trim_segments(trim_segments)
+    if isinstance(segments, JSONResponse):
+        return segments
+
     media_id = f"analyzer_{uuid.uuid4().hex}"
     suffix = Path(audio_file.filename or "recording.webm").suffix or ".webm"
     saved_name = f"{media_id}{suffix}"
     saved_path = RECORDINGS_DIR / saved_name
 
-    # Stream to disk, computing sha256 as a content fingerprint for the row.
     hasher = hashlib.sha256()
     with open(saved_path, "wb") as f:
         while True:
@@ -1509,20 +2034,74 @@ async def analyze_audio_file(
             f.write(chunk_bytes)
     content_sha256 = hasher.hexdigest()
 
-    # Every analyzer run is processed fresh. sha256 is stored on the row
-    # as a fingerprint (see upload_video for rationale) but NOT used to
-    # short-circuit — predictable spinner → result is preferred over the
-    # "sometimes instant" dedup behaviour.
+    default_title = (
+        Path(audio_file.filename).stem
+        if audio_file.filename else None
+    )
+    _create_pending_media_row(
+        media_id=media_id,
+        source_kind="analyzer_audio",
+        user_id=user.id,
+        original_name=audio_file.filename,
+        stored_path=saved_name,
+        content_sha256=content_sha256,
+        title=default_title,
+    )
+    background_tasks.add_task(
+        _run_analyzer_pipeline_sync,
+        media_id, saved_path, saved_name, audio_file.filename, user.id,
+        segments,
+    )
+    return JSONResponse(
+        {"media_id": media_id, "status": "pending"},
+        status_code=202,
+    )
 
-    # Stream through ffmpeg stdout in 3-second windows, pipelining each
-    # window into AudioPipeline as it arrives. librosa.load() — the old
-    # path — materialised the entire waveform at 16 kHz float32, which
-    # OOMs on hour-scale uploads (~230 MB/hour). This approach keeps at
-    # most one 3-second chunk (~192 KB) in memory at a time.
+
+def _run_analyzer_pipeline_sync(
+    media_id: str,
+    saved_path: Path,
+    saved_name: str,
+    original_filename: str | None,
+    user_id: str,
+    trim_segments: list[tuple[float, float]] | None = None,
+) -> None:
+    """Background-thread version of the analyzer pipeline.
+
+    Same shape as `_run_upload_pipeline_sync`: updates the pre-created
+    Media row in place and flips status to completed/failed at the end.
+
+    When `trim_segments` is set, runs `_apply_trim_segments_audio`
+    BEFORE the s16le extraction. The trim helper may change the file
+    extension (always re-encodes to .m4a/AAC) so we re-bind
+    `saved_path` / `saved_name` to whatever it returns.
+    """
+    _set_media_status(media_id, "processing")
     chunk_samples = 16000 * 3
     chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
     pipeline = AudioPipeline()
     snapshots: list[dict] = []
+
+    if trim_segments:
+        try:
+            new_path = _apply_trim_segments_audio(str(saved_path), trim_segments)
+            saved_path = Path(new_path)
+            saved_name = saved_path.name
+        except FileNotFoundError:
+            _set_media_status(media_id, "failed",
+                              error="ffmpeg binary not found on the server.")
+            return
+        except subprocess.TimeoutExpired:
+            _set_media_status(media_id, "failed",
+                              error="ffmpeg trim timed out after 600 s.")
+            return
+        except Exception as e:
+            log.exception("analyzer.trim_failed", extra={"media_id": media_id})
+            _set_media_status(media_id, "failed",
+                              error=str(e) or "ffmpeg trim failed")
+            try: saved_path.unlink()
+            except OSError: pass
+            return
 
     try:
         # Same hardening flags as upload_video — input-side only. No
@@ -1540,10 +2119,11 @@ async def analyze_audio_file(
     except FileNotFoundError:
         try: saved_path.unlink()
         except OSError: pass
-        return JSONResponse(
-            {"error": "ffmpeg binary not found on the server."},
-            status_code=500,
+        _set_media_status(
+            media_id, "failed",
+            error="ffmpeg binary not found on the server.",
         )
+        return
 
     def _stream_and_process_sync():
         total_bytes = 0
@@ -1602,83 +2182,72 @@ async def analyze_audio_file(
             try: proc.stderr.close()
             except Exception: pass
 
-    decode_error = await asyncio.get_event_loop().run_in_executor(
-        None, _stream_and_process_sync
-    )
-    if decode_error:
-        try: saved_path.unlink()
-        except OSError: pass
-        return JSONResponse({"error": decode_error}, status_code=400)
-
-    report = generate_post_session_report(snapshots, media_id)
-    report["media_id"] = media_id
-    report["source"] = "file_upload"
-    report["filename"] = audio_file.filename
-    report["note"] = "Eye contact and expression scores not available for audio-only files."
-    report["recording"] = {
-        "media_id": media_id,
-        "audio_url": f"/api/analyzer/{media_id}/audio",
-    }
-
-    # Build timelines so Library listings + report retrieval round-trip.
-    speech_tl = []
-    for i, s in enumerate(snapshots):
-        chunk_offset_ms = i * 3000
-        speech_tl.append({
-            "timestamp": i * 3,
-            "text": s.get("transcript_text", ""),
-            "fillers": s.get("raw", {}).get("lexical_fillers", []),
-            "hedges": [],
-            "speech_score": s["scores"].get("speech_pace", 50),
-            "words": [
-                {
-                    "word": w.get("word"),
-                    "start_ms": int(w.get("start_ms", 0) + chunk_offset_ms),
-                    "end_ms": int(w.get("end_ms", 0) + chunk_offset_ms),
-                    "is_filler": bool(w.get("is_filler")),
-                }
-                for w in s.get("transcript_words", [])
-            ],
-        })
-
-    # Attach speech_timeline to the stored report so AudioPlaybackReview
-    # can always reach absolute-timestamped words even if report.transcript
-    # is ever off.
-    report["speech_timeline"] = speech_tl
-
-    # Default title for an UPLOADED audio file: filename without
-    # extension (matches video-upload convention). For LIVE audio
-    # captures the WS handler sets a "Recording <ts> - Audio" title
-    # instead — see session_ws's finalize block.
-    default_title = (
-        Path(audio_file.filename).stem
-        if audio_file.filename else None
-    )
     try:
-        _persist_media_and_segments(
+        decode_error = _stream_and_process_sync()
+        if decode_error:
+            try: saved_path.unlink()
+            except OSError: pass
+            _set_media_status(media_id, "failed", error=decode_error)
+            return
+
+        # Per-user baseline (last 5 finished sessions). See main.py:_fetch_user_baseline.
+        user_baseline = _fetch_user_baseline(user_id, exclude_media_id=media_id)
+        report = generate_post_session_report(
+            snapshots, media_id, user_baseline=user_baseline,
+        )
+        report["media_id"] = media_id
+        report["source"] = "file_upload"
+        report["filename"] = original_filename
+        report["note"] = "Eye contact and expression scores not available for audio-only files."
+        report["recording"] = {
+            "media_id": media_id,
+            "audio_url": sign_media_url(
+                f"/api/analyzer/{media_id}/audio", user_id,
+            ),
+        }
+
+        # Build timelines so Library listings + report retrieval round-trip.
+        speech_tl = []
+        for i, s in enumerate(snapshots):
+            chunk_offset_ms = i * 3000
+            speech_tl.append({
+                "timestamp": i * 3,
+                "text": s.get("transcript_text", ""),
+                "fillers": s.get("raw", {}).get("lexical_fillers", []),
+                "hedges": [],
+                "speech_score": s["scores"].get("speech_pace", 50),
+                "words": [
+                    {
+                        "word": w.get("word"),
+                        "start_ms": int(w.get("start_ms", 0) + chunk_offset_ms),
+                        "end_ms": int(w.get("end_ms", 0) + chunk_offset_ms),
+                        "is_filler": bool(w.get("is_filler")),
+                    }
+                    for w in s.get("transcript_words", [])
+                ],
+            })
+
+        # Attach speech_timeline to the stored report so AudioPlaybackReview
+        # can always reach absolute-timestamped words even if report.transcript
+        # is ever off.
+        report["speech_timeline"] = speech_tl
+
+        _complete_media_processing(
             media_id=media_id,
-            source_kind="analyzer_audio",
-            user_id=user.id,
-            original_name=audio_file.filename,
-            stored_path=saved_name,
             playback_path=saved_name,
             duration_s=float(report.get("duration_s") or (len(snapshots) * 3)),
             has_video=False,
             has_audio=True,
             score_avg=report.get("avg_score"),
-            face_timeline=[],  # no face rows for audio-only
+            face_timeline=[],
             speech_timeline=speech_tl,
             report_json=report,
-            content_sha256=content_sha256,
-            title=default_title,
         )
     except Exception as e:
-        log.warning(
-            "db.dual_write_failed",
-            extra={"media_id": media_id, "source": "analyzer_audio", "error": str(e)},
-        )
-
-    return report
+        log.exception("analyzer.pipeline_failed", extra={"media_id": media_id})
+        try: saved_path.unlink()
+        except OSError: pass
+        _set_media_status(media_id, "failed", error=str(e) or "Pipeline error")
 
 
 @app.get("/api/analyzer/{media_id}/audio")
@@ -1751,7 +2320,9 @@ async def upload_session_video(
     size_mb = round(size / 1e6, 2)
     return {
         "status": "saved",
-        "video_url": f"/api/recordings/{session_id}/video",
+        "video_url": sign_media_url(
+            f"/api/recordings/{session_id}/video", user.id,
+        ),
         "size_mb": size_mb,
     }
 
@@ -1818,7 +2389,9 @@ async def upload_session_audio(
 
     return {
         "status": "saved",
-        "audio_url": f"/api/analyzer/{session_id}/audio",
+        "audio_url": sign_media_url(
+            f"/api/analyzer/{session_id}/audio", user.id,
+        ),
         "size_mb": size_mb,
     }
 
@@ -1889,6 +2462,65 @@ def list_recordings(
     )
 
 
+@app.get("/api/progress")
+def get_progress(
+    topic: str | None = None,
+    limit: int = 10,
+    user: User = Depends(get_current_user),
+):
+    """Return the user's last N finished sessions, oldest-first, for
+    progress charting on the dashboard + Result page.
+
+    Each entry has only what the chart + delta-pill need — we keep
+    the response small so a page-load fetch doesn't pull megabytes
+    when the user has dozens of sessions.
+
+    Query params:
+      topic  optional case-insensitive substring filter on Media.topic
+             (so a user can chart "Job interview" sessions only).
+      limit  1..50, default 10. Larger limits are clamped.
+
+    "Finished" = report_json IS NOT NULL (same proxy as the
+    baseline fetch — Task 5 will tighten this to status='completed'
+    once the column exists).
+    """
+    limit = max(1, min(50, int(limit)))
+    with SessionLocal() as db:
+        q = (
+            select(Media)
+            .where(Media.user_id == user.id)
+            .where(Media.report_json.isnot(None))
+            .order_by(Media.created_at.desc())
+            .limit(limit)
+        )
+        if topic:
+            # Case-insensitive substring match — same convention as
+            # /api/recordings?q. ILIKE on a single column doesn't need
+            # an index for the row counts we expect per user.
+            q = q.where(Media.topic.ilike(f"%{topic.strip()}%"))
+        rows = db.execute(q).scalars().all()
+
+    # Reverse so the result is OLDEST first → easier for sparkline
+    # rendering (left-to-right time axis).
+    items = []
+    for m in reversed(rows):
+        rj = m.report_json or {}
+        items.append({
+            "session_id": m.id,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "topic": m.topic,
+            "title": m.title,
+            "kind": m.source_kind,
+            "score_avg": m.score_avg,
+            "signal_averages": rj.get("signal_averages") or {},
+            # baseline-adjusted may be null on older rows that pre-date
+            # Task 3. Keep the key so the frontend doesn't have to
+            # branch on its presence.
+            "signal_baseline_adjusted": rj.get("signal_baseline_adjusted"),
+        })
+    return {"items": items, "topic": topic, "limit": limit}
+
+
 @app.get("/api/recordings/{session_id}/video")
 def get_recording_video(
     session_id: str,
@@ -1952,6 +2584,35 @@ def get_session_report(
             )
         else:
             payload["shared_by"] = None
+        # Re-sign any media URLs in the report for the CALLING user.
+        # The URLs stored in report_json were signed when the row was
+        # created — they may be expired, or signed for a different user
+        # (owner vs recipient). Replace them in-place so the response
+        # always carries a fresh, caller-bound capability.
+        rec = payload.get("recording") or {}
+        if not isinstance(rec, dict):
+            rec = {}
+        # Back-fill `recording` for legacy upload rows whose report_json
+        # was written before the upload handler started emitting it.
+        # Without this, Result.jsx falls back to a bare /api/video/{name}
+        # URL which the new signed-URL gate will 401 on.
+        if not rec.get("video_url") and not rec.get("audio_url") and media.playback_path:
+            if media.source_kind == "upload":
+                rec["video_url"] = f"/api/video/{media.playback_path}"
+            elif media.source_kind == "session":
+                rec["video_url"] = f"/api/recordings/{media.id}/video"
+            elif media.source_kind == "analyzer_audio":
+                rec["audio_url"] = f"/api/analyzer/{media.id}/audio"
+        if rec.get("video_url"):
+            rec["video_url"] = sign_media_url(
+                rec["video_url"].split("?", 1)[0], user.id,
+            )
+        if rec.get("audio_url"):
+            rec["audio_url"] = sign_media_url(
+                rec["audio_url"].split("?", 1)[0], user.id,
+            )
+        if rec:
+            payload["recording"] = rec
         return payload
 
 

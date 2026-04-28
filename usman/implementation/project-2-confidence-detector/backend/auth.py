@@ -24,7 +24,7 @@ from typing import Optional
 
 import bcrypt
 import jwt
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from db import SessionLocal
@@ -155,42 +155,47 @@ def get_current_user_optional(
 
 
 def get_current_user_for_media(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
-    token: Optional[str] = None,
 ) -> User:
     """Auth for endpoints whose response goes into a browser <video> /
     <audio> / <img> tag.
 
-    Why this exists: those tags issue a plain GET when their `src` is
-    set — they CANNOT attach an Authorization header. So requiring
-    `Authorization: Bearer <token>` (the normal `get_current_user`
-    dependency) makes the tag silently fail with a 401 and the user
-    sees an unplayable video.
+    Those tags issue a plain GET when their `src` is set — they CANNOT
+    attach an Authorization header — so we also accept HMAC-signed
+    query params produced by `signed_urls.sign_media_url`:
 
-    The fix is to ALSO accept the token via the `?token=` query
-    parameter, the same convention the WebSocket handler uses.
-    Frontend builds the URL via the `mediaUrl()` helper in
-    `frontend/src/config.js` which appends the current token.
+        /api/video/foo.mp4?sig=...&exp=...&uid=...
 
-    Order of preference: Authorization header first (so a future
-    desktop client / cURL test still works), then `?token=`.
+    Order of preference:
+      1. Authorization: Bearer <jwt>     — desktop/cURL clients
+      2. ?sig=&exp=&uid=                  — browser media tags
 
-    Same 401 behaviour, same WWW-Authenticate header on failure as the
-    standard dependency.
+    The legacy `?token=<jwt>` query param is no longer accepted on
+    media endpoints; long-lived JWTs in URLs end up cached/copied
+    around and outlive the access decision. Signed URLs bind to
+    (path, uid, exp) and expire by default in 1 hour.
     """
-    # Try header first — preserves the canonical Bearer-token UX for
-    # any non-browser caller.
     if authorization and authorization.lower().startswith("bearer "):
         return get_current_user(authorization)
 
-    # Fall back to query param. Build a synthetic Authorization value
-    # so we can reuse the existing get_current_user logic verbatim.
-    if token:
-        return get_current_user(f"Bearer {token}")
+    # Lazy-import to keep auth.py free of the signed_urls dependency
+    # for callers that never need media auth (login, register, etc).
+    from signed_urls import verify_media_signature
+    qp = request.query_params
+    uid = verify_media_signature(
+        request.url.path, qp.get("sig"), qp.get("exp"), qp.get("uid"),
+    )
+    if uid:
+        with SessionLocal() as db:
+            user = db.get(User, uid)
+            if user is not None:
+                db.expunge(user)
+                return user
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Missing token (header `Authorization: Bearer …` or query `?token=…`).",
+        detail="Missing or invalid signed media URL.",
         headers={"WWW-Authenticate": "Bearer"},
     )
 

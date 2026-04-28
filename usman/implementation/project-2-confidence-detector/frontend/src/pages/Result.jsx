@@ -9,7 +9,6 @@ import AudioPlaybackReview from '../components/AudioPlaybackReview'
 import TimelineModal from '../components/TimelineModal'
 import SessionReport from '../components/SessionReport'
 import MetadataEditor from '../components/MetadataEditor'
-import TrimPanel from '../components/TrimPanel'
 import CommentsThread from '../components/CommentsThread'
 import ShareModal from '../components/ShareModal'
 
@@ -37,20 +36,6 @@ export default function Result() {
   // the player's forwardRef / playerHandleRef on mount, consumed by
   // CommentsThread to seek + auto-pause for ranged comments.
   const playerRef = useRef(null)
-
-  // Refresh from server. Used after trim (file changed → duration_s
-  // refreshes) and after metadata edits that need a re-render.
-  async function reload() {
-    try {
-      const res = await apiFetch(`${API_BASE}/api/report/${id}`)
-      if (res.status === 404) { setError('not_found'); return }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const json = await res.json()
-      setData(json)
-    } catch (e) {
-      setError(e.message || 'Failed to reload result')
-    }
-  }
 
   // Discard + re-take: hard-deletes the recording then sends the user
   // back to the live page. Same backend path as DELETE — the framing
@@ -161,7 +146,6 @@ export default function Result() {
         data={data}
         mediaId={data.media_id || id}
         onUpdated={(saved) => setData((prev) => ({ ...prev, ...saved }))}
-        onTrimmed={() => reload()}
         onDiscard={discardAndRetake}
         discardBusy={discardBusy}
         isOwner={data.is_owner !== false}
@@ -261,14 +245,6 @@ export default function Result() {
         playerHandleRef={!isAnalyzerAudio ? playerRef : null}
       />
 
-      {isOwner && (
-        <TrimPanel
-          mediaId={data.media_id || id}
-          durationS={data.duration_s_current ?? data.duration_s ?? 0}
-          onTrimmed={() => reload()}
-        />
-      )}
-
       <CommentsThread
         mediaId={data.media_id || id}
         isMediaOwner={isOwner}
@@ -320,7 +296,7 @@ export default function Result() {
 
 // ── Upload-result view (same markup the old inline App.jsx block rendered) ──
 function UploadResult({
-  data, mediaId, onUpdated, onTrimmed, onDiscard, discardBusy,
+  data, mediaId, onUpdated, onDiscard, discardBusy,
   isOwner = true, sharedBy = null,
   onOpenShare, shareModalOpen, onCloseShare,
   // From parent — single ref used by both PlaybackReview (for its
@@ -330,9 +306,15 @@ function UploadResult({
 }) {
   const [modalEntry, setModalEntry] = useState(null)
 
-  const processedVideoUrl = data.processed_video
-    ? mediaUrl(`/api/video/${data.processed_video}`)
-    : null
+  // Prefer the backend-signed `recording.video_url` — the bare-filename
+  // fallback is left for older report payloads written before the
+  // upload handler started emitting a signed URL, but those URLs need
+  // a valid signature to play (the legacy ?token= flow is gone).
+  const processedVideoUrl = data.recording?.video_url
+    ? mediaUrl(data.recording.video_url)
+    : data.processed_video
+      ? mediaUrl(`/api/video/${data.processed_video}`)
+      : null
 
   const allWords = (data.speech_timeline || []).flatMap(
     (chunk) => chunk.words || []
@@ -488,7 +470,7 @@ function UploadResult({
         )}
 
         {/* Synced playback */}
-        {data.processed_video && (
+        {(processedVideoUrl || data.processed_video) && (
           <PlaybackReview
             // Pass the parent's ref directly. forwardRef +
             // useImperativeHandle in PlaybackReview attaches the
@@ -497,6 +479,7 @@ function UploadResult({
             // playback time when the user clicks Set start / Add end.
             ref={playerRef}
             processedVideo={data.processed_video}
+            processedVideoUrl={processedVideoUrl}
             faceTimeline={data.face_timeline}
             speechTimeline={data.speech_timeline}
           />
@@ -536,14 +519,6 @@ function UploadResult({
               </button>
             ))}
           </div>
-        )}
-
-        {isOwner && (
-          <TrimPanel
-            mediaId={mediaId}
-            durationS={data.duration_s_current ?? data.duration ?? 0}
-            onTrimmed={onTrimmed}
-          />
         )}
 
         <CommentsThread

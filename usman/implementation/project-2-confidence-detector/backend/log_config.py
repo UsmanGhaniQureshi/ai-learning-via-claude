@@ -25,8 +25,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
+
+
+# Redact short-term capability tokens out of logged URLs / strings.
+# `?sig=` / `&sig=` is the HMAC for signed media URLs; `?token=` /
+# `&token=` is the legacy JWT-in-URL (still used for the WebSocket
+# upgrade). Either string in a log line lets anyone reading the logs
+# replay the URL until expiry, which is exactly what we don't want.
+_SECRET_QUERY_RE = re.compile(r"([?&](?:sig|token|uid)=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact_secrets(text: str) -> str:
+    return _SECRET_QUERY_RE.sub(r"\1<redacted>", text)
 
 
 _RESERVED = {
@@ -54,20 +67,22 @@ class JsonFormatter(logging.Formatter):
             "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "level": record.levelname,
             "logger": record.name,
-            "event": record.getMessage(),
+            "event": _redact_secrets(record.getMessage()),
         }
         if record.exc_info:
-            payload["traceback"] = self.formatException(record.exc_info)
+            payload["traceback"] = _redact_secrets(self.formatException(record.exc_info))
         # Merge any `extra={...}` fields the caller attached.
         for key, val in record.__dict__.items():
             if key in _RESERVED or key in payload or key.startswith("_"):
                 continue
             # Best-effort serialisation; fall back to repr for weird types.
+            # Redact URL-shaped strings on the way out — uvicorn.access
+            # logs the raw request path including query string.
             try:
                 json.dumps(val)
-                payload[key] = val
+                payload[key] = _redact_secrets(val) if isinstance(val, str) else val
             except (TypeError, ValueError):
-                payload[key] = repr(val)
+                payload[key] = _redact_secrets(repr(val))
         return json.dumps(payload, ensure_ascii=False)
 
 

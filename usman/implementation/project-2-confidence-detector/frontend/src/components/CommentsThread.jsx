@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { API_BASE, apiFetch } from '../config'
 import { useAuth } from '../auth/AuthContext'
+import { parseTimeStr, fmtSecs } from '../utils/timeStr'
 
 /**
  * CommentsThread — list + post + edit + delete comments on a Media,
@@ -525,52 +526,6 @@ function fmtTime(iso) {
   } catch {
     return iso
   }
-}
-
-function fmtSecs(s) {
-  if (s == null) return '?'
-  const total = Math.max(0, Math.round(Number(s)))
-  const m = Math.floor(total / 60)
-  const sec = total % 60
-  return `${m}:${String(sec).padStart(2, '0')}`
-}
-
-/**
- * Parse a user-supplied time string into seconds.
- *
- * Accepted forms:
- *   "1:23"     → 83
- *   "1:23.5"   → 83.5
- *   "0:05"     → 5
- *   "83"       → 83
- *   "83.5"     → 83.5
- *   ""         → null   (caller treats as "no anchor")
- *
- * Returns null on any parse failure so the caller can show a clear
- * error message rather than silently falling back to 0.
- */
-function parseTimeStr(s) {
-  if (typeof s !== 'string') return null
-  const trimmed = s.trim()
-  if (!trimmed) return null
-
-  // MM:SS or M:SS (allow fractional seconds in the SS slot).
-  const colonMatch = trimmed.match(/^(\d+):(\d+(?:\.\d+)?)$/)
-  if (colonMatch) {
-    const m = parseInt(colonMatch[1], 10)
-    const sec = parseFloat(colonMatch[2])
-    if (Number.isNaN(m) || Number.isNaN(sec)) return null
-    if (sec >= 60) return null  // "1:75" is malformed
-    return m * 60 + sec
-  }
-
-  // Plain number (in seconds). parseFloat is too lenient — it accepts
-  // "12abc" → 12. Use Number() with a regex pre-check instead.
-  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
-    const n = Number(trimmed)
-    if (n >= 0) return n
-  }
-  return null
 }
 
 const textareaStyle = {

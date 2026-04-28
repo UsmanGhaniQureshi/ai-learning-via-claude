@@ -52,6 +52,12 @@ export default function useLiveSession() {
   // to 'lost' when the WS closes unexpectedly while the session is
   // still active; stays 'connected' during normal user-triggered stop.
   const [connectionStatus, setConnectionStatus] = useState('connected')
+  // null until the backend's first-2-chunks language gate fires (see
+  // session_ws in main.py). When set: { detected: 'es' } etc. Drives a
+  // non-blocking banner in LiveSession; scoring still continues so the
+  // user gets *some* report, just with the caveat that English-only
+  // heuristics may be off.
+  const [languageWarning, setLanguageWarning] = useState(null)
 
   const videoRef = useRef(null)
   const streamRef = useRef(null)
@@ -247,6 +253,7 @@ export default function useLiveSession() {
   const startSession = useCallback(async () => {
     setError(null)
     setConnectionStatus('connected')
+    setLanguageWarning(null)
     userStopRef.current = false
     setSessionState('starting')
     setScores(null)
@@ -290,6 +297,15 @@ export default function useLiveSession() {
           // Backend error (e.g., models still loading)
           if (data.type === 'error') {
             setError(data.message || 'Backend error')
+            return
+          }
+
+          // One-shot language warning — fired by main.py:session_ws
+          // when the first 2 chunks both detect a non-English language
+          // with confidence > 0.6. Doesn't block the session; UI shows
+          // a banner so the user knows scoring may be off.
+          if (data.type === 'language_warning' && data.detected) {
+            setLanguageWarning({ detected: data.detected })
             return
           }
 
@@ -521,6 +537,7 @@ export default function useLiveSession() {
     report,
     error,
     connectionStatus,
+    languageWarning,
     scoreHistory,
     duration,
     faceScores,

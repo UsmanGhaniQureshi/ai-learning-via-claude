@@ -4,14 +4,41 @@ Produces a comprehensive speech analysis report from session snapshots.
 Used by both live sessions (on stop) and standalone audio analyzer.
 """
 
+# Signals that the per-user baseline applies to. Both eye_contact and
+# expression are face-only and intentionally excluded — too noisy
+# across recordings to ground a personal mean. Filler_words and the
+# 3 audio signals are stable enough.
+_BASELINE_SIGNALS = (
+    "voice_steadiness",
+    "speech_pace",
+    "filler_words",
+    "vocal_variety",
+)
 
-def generate_post_session_report(snapshots: list, session_id: str) -> dict:
+
+def generate_post_session_report(
+    snapshots: list,
+    session_id: str,
+    user_baseline: dict | None = None,
+) -> dict:
     """
     Generate a detailed post-session report from pipeline snapshots.
 
     snapshots: list of dicts from AudioPipeline.process_chunk()
     session_id: unique session identifier
-    Returns: full report dict with grades, insights, timeline, transcript
+    user_baseline: optional dict produced by main.py:_fetch_user_baseline,
+        shape:
+          { "ready": bool, "n_sessions": int,
+            "voice_steadiness": {"mean": 75.2, "std": 8.4, "n": 5}, ... }
+        When present and ready=True, the report adds
+        `signal_baseline_adjusted` — per-signal scores that compare THIS
+        session against the user's own running mean (z-scored, mapped
+        onto a 0-100 scale anchored at 50 = the user's personal average).
+        The absolute `signal_averages` is always returned alongside; the
+        baseline_adjusted score is purely additive.
+
+    Returns: full report dict with grades, insights, timeline, transcript,
+    and (optionally) the baseline-adjusted scores.
     """
     if not snapshots:
         return {"error": "No data recorded", "session_id": session_id}
@@ -311,6 +338,50 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         for w in all_words
     ]
 
+    # ── Baseline-adjusted scores ───────────────────────────────────
+    # Compares THIS session's per-signal averages to the user's own
+    # running mean (their last 5 completed sessions, computed by the
+    # caller). Score is a z-score anchored at 50:
+    #   z=0  → 50 (right at the user's personal average)
+    #   z=+1 → 65 (one std above their average — improving)
+    #   z=-1 → 35 (one std below — regressing)
+    #   clamped to [0, 100].
+    # Std is floored at 1.0 so a near-flat history doesn't divide by
+    # ~0 and produce wild values.
+    #
+    # Returned ALONGSIDE signal_averages, never replacing it. The
+    # frontend can show "you scored 78 on pace (62 vs your average,
+    # +12 since last)" — both numbers stay meaningful.
+    signal_baseline_adjusted = None
+    baseline_note = None
+    if user_baseline is not None:
+        n_seen = int(user_baseline.get("n_sessions", 0) or 0)
+        if user_baseline.get("ready"):
+            signal_baseline_adjusted = {}
+            for sig in _BASELINE_SIGNALS:
+                stats = user_baseline.get(sig)
+                this_avg = signal_avgs.get(sig)
+                if not stats or not isinstance(this_avg, (int, float)):
+                    continue
+                if stats.get("n", 0) < 3:
+                    continue
+                std = max(float(stats.get("std", 0) or 0), 1.0)
+                mean = float(stats.get("mean", 0))
+                z = (this_avg - mean) / std
+                signal_baseline_adjusted[sig] = max(0, min(100, round(50 + z * 15)))
+            baseline_note = (
+                f"Personalized scoring based on your last {n_seen} sessions. "
+                "50 = your personal average; +15 per standard deviation."
+            )
+        else:
+            # Caller fetched the baseline but found too few sessions.
+            # Note it explicitly so the UI can show "X more sessions
+            # needed for personalized scoring" copy without guessing.
+            baseline_note = (
+                f"Need at least 3 prior sessions for personalized scoring "
+                f"(you have {n_seen})."
+            )
+
     return {
         "session_id": session_id,
         "duration_s": duration_s,
@@ -320,6 +391,9 @@ def generate_post_session_report(snapshots: list, session_id: str) -> dict:
         "grade": grade,
         "grade_label": label,
         "signal_averages": signal_avgs,
+        "signal_baseline_adjusted": signal_baseline_adjusted,
+        "user_baseline": user_baseline,
+        "baseline_note": baseline_note,
         "signal_stderrs": signal_stderrs,
         "signal_reasons": signal_reasons,
         "weakest_signal": sorted_signals[0][0] if sorted_signals else "unknown",

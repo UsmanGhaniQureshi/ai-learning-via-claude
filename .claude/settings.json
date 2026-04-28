@@ -197,7 +197,12 @@
       "Bash(\"../detector_env/Scripts/python.exe\" -m alembic upgrade head)",
       "Bash(npx --no-install vite build)",
       "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/python.exe\" \"d:/tmp/smoke_phase_1_to_6.py\")",
-      "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/python.exe\" \"d:/tmp/smoke_ranged_comments.py\")"
+      "Bash(\"d:/AI Learning/usman/implementation/project-2-confidence-detector/detector_env/Scripts/python.exe\" \"d:/tmp/smoke_ranged_comments.py\")",
+      "mcp__code-review-graph__list_flows_tool",
+      "mcp__code-review-graph__get_hub_nodes_tool",
+      "Bash(\"./detector_env/Scripts/pip.exe\" install *)",
+      "Bash(\"./detector_env/Scripts/python.exe\" -m pytest tests/test_pipeline_regression.py -v)",
+      "Bash(\"./detector_env/Scripts/python.exe\" -m pytest tests/ -v)"
     ],
     "additionalDirectories": [
       "\\dev",

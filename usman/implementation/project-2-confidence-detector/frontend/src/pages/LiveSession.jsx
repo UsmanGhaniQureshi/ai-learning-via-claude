@@ -8,6 +8,7 @@ import SessionGraph from '../components/SessionGraph'
 import PracticeSetup from '../components/PracticeSetup'
 import CountdownOverlay from '../components/CountdownOverlay'
 import PracticeTimer from '../components/PracticeTimer'
+import { languageDisplayName } from '../utils/language'
 
 function formatDuration(s) {
   const m = Math.floor(s / 60)
@@ -35,7 +36,7 @@ function gestureBadge(label) {
 export default function LiveSession() {
   const {
     sessionState, videoRef, scores, transcript, tips, report, error,
-    connectionStatus, scoreHistory, duration, faceScores,
+    connectionStatus, languageWarning, scoreHistory, duration, faceScores,
     startSession, stopSession,
   } = useLiveSession()
 
@@ -151,6 +152,23 @@ export default function LiveSession() {
             >
               <strong>Connection lost.</strong> Saving what was captured
               so far — we'll redirect you to the report in a moment.
+            </div>
+          )}
+          {languageWarning && (
+            <div
+              style={{
+                background: '#3b2f00',
+                border: '1px solid #8a7100',
+                color: '#ffd95a',
+                padding: '10px 14px',
+                borderRadius: 6,
+                marginBottom: 12,
+                fontSize: '0.92em',
+              }}
+            >
+              We detected <strong>{languageDisplayName(languageWarning.detected)}</strong>.
+              {' '}Confidence scoring currently supports English only.
+              Results may be inaccurate.
             </div>
           )}
 

@@ -12,6 +12,7 @@ from sqlalchemy import String, cast, or_, select, func
 
 from db import SessionLocal
 from models import Media, User
+from signed_urls import sign_media_url
 
 RECORDINGS_DIR = Path(__file__).parent / "recordings"
 RECORDINGS_DIR.mkdir(exist_ok=True)
@@ -184,12 +185,22 @@ def list_recordings(
                 "video_url": None,
                 "audio_url": None,
             }
+            # Sign URLs for the CALLING user. Each Library row carries
+            # its own short-lived capability — when a recipient opens
+            # the same row they get a sig bound to their uid, not the
+            # owner's. user_id may be None for legacy/unauth callers
+            # (kept for back-compat); skip signing in that case so the
+            # caller still gets a usable-shape URL.
+            url_user = user_id or (m.user_id or "")
             if m.source_kind == "session":
-                entry["video_url"] = f"/api/recordings/{m.id}/video"
+                path = f"/api/recordings/{m.id}/video"
+                entry["video_url"] = sign_media_url(path, url_user) if url_user else path
             elif m.source_kind == "upload" and m.playback_path:
-                entry["video_url"] = f"/api/video/{m.playback_path}"
+                path = f"/api/video/{m.playback_path}"
+                entry["video_url"] = sign_media_url(path, url_user) if url_user else path
             elif m.source_kind == "analyzer_audio":
-                entry["audio_url"] = f"/api/analyzer/{m.id}/audio"
+                path = f"/api/analyzer/{m.id}/audio"
+                entry["audio_url"] = sign_media_url(path, url_user) if url_user else path
 
             entries.append(entry)
         return {

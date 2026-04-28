@@ -4,6 +4,7 @@ import SignalBars from './SignalBars'
 import SessionGraph from './SessionGraph'
 import TranscriptView from './TranscriptView'
 import SignalInfoTooltip from './SignalInfoTooltip'
+import ProgressChart from './ProgressChart'
 import { API_BASE, apiFetch, mediaUrl } from '../config'
 
 /**
@@ -67,7 +68,7 @@ export default function SessionReport({
     signal_averages, signal_stderrs, signal_reasons, filler_breakdown,
     total_fillers, acoustic_fillers, pace, insights, action_items,
     timeline, transcript, duration_s, weakest_signal, note, session_id,
-    recording, kind,
+    recording, kind, topic,
   } = report
 
   // Analyzer audio has no face signal by definition; live/upload sessions
@@ -166,6 +167,18 @@ export default function SessionReport({
               </button>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Progress across sessions — scoped to topic when this session has one,
+          so a "Q4 sales pitch" trend isn't muddied by an "elevator pitch" run. */}
+      {session_id && (
+        <div className="report-section">
+          <ProgressChart
+            topic={topic || undefined}
+            currentSessionId={session_id}
+            limit={10}
+          />
         </div>
       )}
 

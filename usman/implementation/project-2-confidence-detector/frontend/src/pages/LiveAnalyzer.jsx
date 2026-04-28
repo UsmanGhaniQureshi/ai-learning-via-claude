@@ -6,6 +6,7 @@ import SignalBars from '../components/SignalBars'
 import PracticeSetup from '../components/PracticeSetup'
 import CountdownOverlay from '../components/CountdownOverlay'
 import PracticeTimer from '../components/PracticeTimer'
+import { languageDisplayName } from '../utils/language'
 
 /**
  * LiveAnalyzer — real-time audio analyzer.
@@ -50,6 +51,10 @@ export default function LiveAnalyzer() {
   const lastTranscriptRef = useRef('')
   const userStopRef = useRef(false)
   const [connectionLost, setConnectionLost] = useState(false)
+  // Same one-shot language warning the LiveSession hook surfaces. See
+  // backend/main.py:session_ws — fired when the first 2 chunks both
+  // detect a non-English language with confidence > 0.6.
+  const [languageWarning, setLanguageWarning] = useState(null)
   // Pre-session setup (topic + duration) and countdown overlay state.
   // Same pattern as LiveSession.jsx — see that file for the rationale.
   const [setup, setSetup] = useState(null)
@@ -115,6 +120,7 @@ export default function LiveAnalyzer() {
   const start = async () => {
     setError(null)
     setConnectionLost(false)
+    setLanguageWarning(null)
     userStopRef.current = false
     setState('starting')
     setScores(null)
@@ -154,6 +160,10 @@ export default function LiveAnalyzer() {
       try { data = JSON.parse(event.data) } catch { return }
       if (data.type === 'error') {
         setError(data.message || 'Backend error')
+        return
+      }
+      if (data.type === 'language_warning' && data.detected) {
+        setLanguageWarning({ detected: data.detected })
         return
       }
       if (data.type === 'session_ended') {
@@ -380,6 +390,23 @@ export default function LiveAnalyzer() {
             >
               <strong>Connection lost.</strong> Saving what was captured
               so far — we'll redirect you to the report in a moment.
+            </div>
+          )}
+          {languageWarning && (
+            <div
+              style={{
+                background: '#3b2f00',
+                border: '1px solid #8a7100',
+                color: '#ffd95a',
+                padding: '10px 14px',
+                borderRadius: 6,
+                marginBottom: 12,
+                fontSize: '0.92em',
+              }}
+            >
+              We detected <strong>{languageDisplayName(languageWarning.detected)}</strong>.
+              {' '}Confidence scoring currently supports English only.
+              Results may be inaccurate.
             </div>
           )}
 
