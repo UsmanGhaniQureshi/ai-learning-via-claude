@@ -35,15 +35,21 @@ SIGNAL_KEYS = (
 )
 
 
-def _snap(*, voiced_s=2.0, lang=None, scores=None):
+def _snap(*, voiced_s=2.0, lang=None, scores=None, n_words=3):
     """Build a snapshot dict in the shape AudioPipeline.process_chunk
     returns. `lang` is the value the multilingual probe would set on
     every chunk after the first voiced one (None = English / not
-    probed)."""
+    probed). `n_words` controls the per-chunk transcript word count
+    so callers can opt in/out of the Batch-5 ≥8-words session gate."""
+    words = [
+        {"word": f"word{i}", "start_ms": i * 200, "end_ms": i * 200 + 150,
+         "is_filler": False, "probability": 0.9}
+        for i in range(n_words)
+    ]
     return {
         "scores": scores or {k: 70 for k in (*SIGNAL_KEYS, "total")},
         "raw": {"voiced_s": voiced_s},
-        "transcript_words": [],
+        "transcript_words": words,
         "unsupported_language": lang,
     }
 

@@ -4,6 +4,7 @@ import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import { fmtSecs } from '../utils/timeStr'
 import TrimSegmentsEditor, { validateSegments } from '../components/TrimSegmentsEditor'
+import TopicSelector from '../components/TopicSelector'
 
 export default function Upload() {
   const [pickedFile, setPickedFile] = useState(null)
@@ -14,6 +15,8 @@ export default function Upload() {
   const [uploading, setUploading] = useState(false)
   const [statusText, setStatusText] = useState(null)
   const [uploadError, setUploadError] = useState(null)
+  // Topic info from <TopicSelector>; null = no topic, no LLM coaching.
+  const [topicMeta, setTopicMeta] = useState(null)
   const videoRef = useRef(null)
   const fileInputRef = useRef(null)
   const navigate = useNavigate()
@@ -80,6 +83,10 @@ export default function Upload() {
     formData.append('file', pickedFile)
     if (segmentsPayload) {
       formData.append('trim_segments', JSON.stringify(segmentsPayload))
+    }
+    if (topicMeta?.promptTitle) {
+      formData.append('prompt_title', topicMeta.promptTitle)
+      formData.append('prompt_body', topicMeta.promptBody || '')
     }
     try {
       const res = await apiFetch(`${API_BASE}/api/upload`, {
@@ -192,6 +199,8 @@ export default function Upload() {
               getCurrentTime={() => videoRef.current?.currentTime ?? 0}
             />
           )}
+
+          <TopicSelector value={topicMeta} onChange={setTopicMeta} />
 
           <div className="flex gap-3">
             <button onClick={handleSubmit} className="btn btn-primary">Analyze</button>

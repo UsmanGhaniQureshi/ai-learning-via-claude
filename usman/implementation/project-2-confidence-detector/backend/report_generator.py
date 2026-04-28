@@ -20,6 +20,7 @@ def generate_post_session_report(
     snapshots: list,
     session_id: str,
     user_baseline: dict | None = None,
+    prompt_meta: dict | None = None,
 ) -> dict:
     """
     Generate a detailed post-session report from pipeline snapshots.
@@ -76,7 +77,10 @@ def generate_post_session_report(
             "signal_averages": {k: None for k in signal_keys},
             "signal_stderrs": {},
             "signal_reasons": {},
+            "coaching": None,
             "coaching_status": "skipped",
+            "wins": [],
+            "improvements": [],
             "status_message": (
                 "This recording doesn't appear to be in English. The app "
                 "currently supports English only — please try again "
@@ -87,17 +91,24 @@ def generate_post_session_report(
             "timeline": [],
         }
 
-    # Session-level "did anything happen?" gate. Sum total voiced
-    # seconds across every chunk; if it's below 3 s (one chunk's worth)
-    # the user effectively didn't speak — return a clear
-    # `insufficient_speech` report instead of a fake number. Without
-    # this, a 30-s silent recording still produced a grade A in
-    # earlier passes (silent audio + visible face → ~82). The
-    # status_message text is exactly what the UI renders in place
-    # of the score gauge.
-    INSUFFICIENT_SPEECH_THRESHOLD_S = 3.0
+    # Session-level "did anything happen?" gate. Two conditions: enough
+    # voiced seconds AND enough transcribed words. Either failing
+    # produces an `insufficient_speech` report instead of a fake
+    # number. The voiced-seconds-only gate (3 s) wasn't enough on its
+    # own — ambient noise (AC / fan / keyboard) regularly cleared the
+    # per-chunk VAD threshold, accumulated past 3 s across a minute,
+    # and let Whisper's hallucinated phrases ("thank you", "you")
+    # masquerade as real speech in the report. Requiring at least 8
+    # transcribed words across the whole session catches this: a noisy
+    # silent room produces 0-3 hallucinated tokens, never 8+. Raising
+    # the time floor to 5 s also helps — 3 s of voiced audio is one
+    # chunk, well within ambient-noise margin. The status_message text
+    # is exactly what the UI renders in place of the score gauge.
+    INSUFFICIENT_SPEECH_THRESHOLD_S = 5.0
+    MIN_TOTAL_WORDS = 8
     total_voiced_s = sum(r.get("voiced_s", 0) for r in all_raw)
-    if total_voiced_s < INSUFFICIENT_SPEECH_THRESHOLD_S:
+    total_words = sum(len(s.get("transcript_words", [])) for s in snapshots)
+    if total_voiced_s < INSUFFICIENT_SPEECH_THRESHOLD_S or total_words < MIN_TOTAL_WORDS:
         return {
             "session_id": session_id,
             "insufficient_speech": True,
@@ -107,7 +118,10 @@ def generate_post_session_report(
             "signal_averages": {k: None for k in signal_keys},
             "signal_stderrs": {},
             "signal_reasons": {},
+            "coaching": None,
             "coaching_status": "skipped",
+            "wins": [],
+            "improvements": [],
             "status_message": (
                 "Not enough speech to score. Try recording again and "
                 "speak for at least a few seconds."
@@ -458,7 +472,7 @@ def generate_post_session_report(
                 f"(you have {n_seen})."
             )
 
-    return {
+    base_report = {
         "session_id": session_id,
         "duration_s": duration_s,
         "avg_score": avg_total,
@@ -479,6 +493,65 @@ def generate_post_session_report(
         "pace": pace,
         "insights": insights,
         "action_items": action_items,
+        # Top-level wins / improvements — always present on every
+        # scoreable report so the frontend can render the "What went
+        # well" + "What to Improve" cards uniformly across all modes.
+        # Defaults to the rule-based insights / action_items here, then
+        # GETS OVERWRITTEN below if Gemini coaching comes back ready
+        # (LLM english+confidence improvements merged into one flat list
+        # for the always-visible card; the structured per-side list is
+        # still available via report["coaching"] for CoachingPanel).
+        "wins": list(insights or []),
+        "improvements": list(action_items or []),
         "timeline": timeline,
         "transcript": transcript,
     }
+
+    # ── LLM coaching (Gemini Flash-Lite) ─────────────────────────────
+    # Runs only when a topic was supplied (practice session) and the
+    # report is otherwise scoreable. Off-topic transcripts and missing
+    # API keys both return None → coaching_status="skipped" so the
+    # frontend's <CoachingPanel> stays hidden and the rule-based
+    # insights/action_items above render instead.
+    coaching = None
+    coaching_status = "skipped"
+    if prompt_meta and prompt_meta.get("title"):
+        try:
+            from llm_coach import generate_practice_coaching
+            coaching = generate_practice_coaching(
+                base_report,
+                transcript_words=all_words,
+                prompt_title=prompt_meta.get("title", ""),
+                prompt_body=prompt_meta.get("body", ""),
+            )
+            coaching_status = "ready" if coaching else "skipped"
+        except Exception as e:
+            # Never let an LLM failure block the numeric report.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(f"[llm_coach] failed: {e}")
+            coaching_status = "failed"
+    base_report["coaching"] = coaching
+    base_report["coaching_status"] = coaching_status
+
+    # If Gemini produced structured coaching, prefer its wins +
+    # improvements over the rule-based ones for the top-level fields.
+    # We merge english + confidence into flat lists because the
+    # always-visible UI cards render them as a single bullet list.
+    # The structured per-side breakdown stays accessible via
+    # report["coaching"] for CoachingPanel.
+    if coaching_status == "ready" and coaching:
+        en = coaching.get("english") or {}
+        cf = coaching.get("confidence") or {}
+        merged_wins = []
+        for w in (en.get("wins") or []) + (cf.get("wins") or []):
+            if isinstance(w, str) and w.strip():
+                merged_wins.append(w.strip())
+        merged_imps = []
+        for imp in (en.get("improvements") or []) + (cf.get("improvements") or []):
+            if isinstance(imp, str) and imp.strip():
+                merged_imps.append(imp.strip())
+        if merged_wins:
+            base_report["wins"] = merged_wins
+        if merged_imps:
+            base_report["improvements"] = merged_imps
+    return base_report

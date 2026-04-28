@@ -6,6 +6,7 @@ import SessionGraph from './SessionGraph'
 import TranscriptView from './TranscriptView'
 import ProgressChart from './ProgressChart'
 import ScoreBreakdownPanel from './ScoreBreakdownPanel'
+import CoachingPanel from './CoachingPanel'
 import { API_BASE, apiFetch, mediaUrl } from '../config'
 
 export default function SessionReport({
@@ -62,7 +63,14 @@ export default function SessionReport({
     recording, kind, topic,
     signal_baseline_adjusted, user_baseline, baseline_note,
     insufficient_speech, unsupported_language, status_message,
+    coaching, coaching_status,
   } = report
+
+  // LLM-generated coaching takes priority over the rule-based
+  // insights/action_items card. When coaching_status is "skipped" /
+  // "failed" / undefined we fall back to the rule-based card so users
+  // still get something actionable.
+  const hasLLMCoaching = coaching_status === 'ready' && coaching
 
   if (insufficient_speech || unsupported_language || avg_score == null) {
     return (
@@ -116,39 +124,43 @@ export default function SessionReport({
         </div>
       </div>
 
-      {/* Coaching card — pulled UP from below filler/pace */}
-      {((insights && insights.length > 0) || (action_items && action_items.length > 0)) && (
-        <div className="glass-card p-6 border border-border-accent">
-          <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-4">
-            ✦ Coaching Insights
-          </p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-            {insights && insights.length > 0 && (
-              <div>
-                <p className="text-success text-sm font-semibold mb-2">✅ What went well</p>
-                <ul className="space-y-1.5">
-                  {insights.map((insight, i) => (
-                    <li key={i} className="text-sm text-text-secondary flex gap-2">
-                      <span className="text-text-muted">·</span><span>{insight}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {action_items && action_items.length > 0 && (
-              <div>
-                <p className="text-warning text-sm font-semibold mb-2">↗ Work on next</p>
-                <ul className="space-y-1.5">
-                  {action_items.map((item, i) => (
-                    <li key={i} className="text-sm text-text-secondary flex gap-2">
-                      <span className="text-text-muted">·</span><span>{item}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
+      {/* Coaching — Gemini-powered when available, rule-based fallback otherwise */}
+      {hasLLMCoaching ? (
+        <CoachingPanel coaching={coaching} status={coaching_status} />
+      ) : (
+        ((insights && insights.length > 0) || (action_items && action_items.length > 0)) && (
+          <div className="glass-card p-6 border border-border-accent">
+            <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-4">
+              ✦ Coaching Insights
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+              {insights && insights.length > 0 && (
+                <div>
+                  <p className="text-success text-sm font-semibold mb-2">✅ What went well</p>
+                  <ul className="space-y-1.5">
+                    {insights.map((insight, i) => (
+                      <li key={i} className="text-sm text-text-secondary flex gap-2">
+                        <span className="text-text-muted">·</span><span>{insight}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {action_items && action_items.length > 0 && (
+                <div>
+                  <p className="text-warning text-sm font-semibold mb-2">↗ Work on next</p>
+                  <ul className="space-y-1.5">
+                    {action_items.map((item, i) => (
+                      <li key={i} className="text-sm text-text-secondary flex gap-2">
+                        <span className="text-text-muted">·</span><span>{item}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
           </div>
-        </div>
+        )
       )}
 
       {/* Practice Again CTA */}

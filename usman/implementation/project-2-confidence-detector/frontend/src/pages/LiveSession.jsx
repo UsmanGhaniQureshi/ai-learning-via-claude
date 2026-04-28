@@ -36,6 +36,7 @@ export default function LiveSession() {
   const {
     sessionState, videoRef, scores, transcript, tips, report, error,
     connectionStatus, unsupportedLanguage, backpressure, calibrating,
+    noSpeechDetected,
     scoreHistory, duration, faceScores,
     startSession, stopSession,
   } = useLiveSession()
@@ -77,7 +78,10 @@ export default function LiveSession() {
 
   function handleCountdownComplete() {
     setShowCountdown(false)
-    startSession()
+    // Pass topic info to the hook so it can ship a session_meta WS
+    // message for the backend's llm_coach. Without this the coach
+    // path short-circuits to "skipped".
+    startSession(setup)
   }
 
   const barScores = scores
@@ -99,12 +103,17 @@ export default function LiveSession() {
     ? tips[0]
     : 'Stay relaxed. Your scores update every few seconds.'
 
-  // Pick a single banner to show — priority: connection > unsupported > backpressure > calibrating.
+  // Pick a single banner to show.
+  // Priority: connection > unsupported > no-speech > backpressure > calibrating.
+  // No-speech outranks calibrating because if the user genuinely isn't
+  // speaking, the calibration message is misleading.
   let banner = null
   if (connectionStatus === 'lost') {
     banner = { cls: 'toast-danger', text: 'Connection lost. Saving what was captured so far…' }
   } else if (unsupportedLanguage) {
     banner = { cls: 'toast-danger', text: `We detected ${languageDisplayName(unsupportedLanguage)}. The app currently supports English only — stop and try again in English.` }
+  } else if (noSpeechDetected) {
+    banner = { cls: 'toast-warning', text: "We don't hear you yet — check your mic and start speaking. Scores will resume once we pick up audio." }
   } else if (backpressure) {
     banner = { cls: 'toast-info', text: 'Server catching up… (a chunk was dropped — keep speaking)' }
   } else if (calibrating) {

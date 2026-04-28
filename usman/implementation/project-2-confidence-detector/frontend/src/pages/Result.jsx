@@ -12,6 +12,7 @@ import MetadataEditor from '../components/MetadataEditor'
 import CommentsThread from '../components/CommentsThread'
 import ShareModal from '../components/ShareModal'
 import ScoreBreakdownPanel from '../components/ScoreBreakdownPanel'
+import CoachingPanel from '../components/CoachingPanel'
 
 export default function Result() {
   const { id } = useParams()
@@ -367,39 +368,45 @@ function UploadResult({
         </div>
       </div>
 
-      {/* Coaching card */}
-      {(wins.length > 0 || improvements.length > 0) && (
-        <div className="glass-card p-6 mb-6 border border-border-accent">
-          <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-4">
-            ✦ Coaching Insights
-          </p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-            {wins.length > 0 && (
-              <div>
-                <p className="text-success text-sm font-semibold mb-2">✅ What went well</p>
-                <ul className="space-y-1.5">
-                  {wins.map((w, i) => (
-                    <li key={i} className="text-sm text-text-secondary flex gap-2">
-                      <span className="text-text-muted">·</span><span>{w}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {improvements.length > 0 && (
-              <div>
-                <p className="text-warning text-sm font-semibold mb-2">↗ Work on next</p>
-                <ul className="space-y-1.5">
-                  {improvements.map((imp, i) => (
-                    <li key={i} className="text-sm text-text-secondary flex gap-2">
-                      <span className="text-text-muted">·</span><span>{imp}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
+      {/* Coaching — Gemini-powered when topic was set, rule-based fallback otherwise */}
+      {data.coaching_status === 'ready' && data.coaching ? (
+        <div className="mb-6">
+          <CoachingPanel coaching={data.coaching} status={data.coaching_status} />
         </div>
+      ) : (
+        (wins.length > 0 || improvements.length > 0) && (
+          <div className="glass-card p-6 mb-6 border border-border-accent">
+            <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-4">
+              ✦ Coaching Insights
+            </p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+              {wins.length > 0 && (
+                <div>
+                  <p className="text-success text-sm font-semibold mb-2">✅ What went well</p>
+                  <ul className="space-y-1.5">
+                    {wins.map((w, i) => (
+                      <li key={i} className="text-sm text-text-secondary flex gap-2">
+                        <span className="text-text-muted">·</span><span>{w}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {improvements.length > 0 && (
+                <div>
+                  <p className="text-warning text-sm font-semibold mb-2">↗ Work on next</p>
+                  <ul className="space-y-1.5">
+                    {improvements.map((imp, i) => (
+                      <li key={i} className="text-sm text-text-secondary flex gap-2">
+                        <span className="text-text-muted">·</span><span>{imp}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          </div>
+        )
       )}
 
       {/* Practice Again CTA */}

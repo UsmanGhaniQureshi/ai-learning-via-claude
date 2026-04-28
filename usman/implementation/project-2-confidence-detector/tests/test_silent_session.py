@@ -127,7 +127,7 @@ def test_30s_silent_session_marked_insufficient_speech():
 
 
 def test_session_with_one_second_of_speech_still_insufficient():
-    """1 s of speech across a 30-s session is still under the 3-s gate."""
+    """1 s of speech across a 30-s session is still under the gate."""
     chunks = [_silent_chunk() for _ in range(9)]
     chunks.append(_voiced_chunk(1.0))   # 1 s of speech in chunk 10
     report = _run_session(chunks)
@@ -135,14 +135,61 @@ def test_session_with_one_second_of_speech_still_insufficient():
     assert report.get("avg_score") is None
 
 
+def test_noise_clearing_vad_without_words_marked_insufficient():
+    """Batch-5 fix: ambient noise can clear VAD across enough chunks to
+    pass the 5-s voiced threshold, but produces 0-3 hallucinated words.
+    The new MIN_TOTAL_WORDS=8 gate catches this case — the report is
+    `insufficient_speech` rather than scoring on Whisper hallucinations.
+    """
+    # Stub a session that LOOKS voiced (high voiced_s) but has only 3
+    # transcribed words across 10 chunks — typical hallucination yield.
+    fake_words_chunk = [
+        {"word": "you", "start_ms": 1000, "end_ms": 1300,
+         "is_filler": False, "probability": 0.06},
+    ]
+    snapshots = []
+    for i in range(10):
+        snapshots.append({
+            "scores": {
+                "voice_steadiness": 70,
+                "eye_contact": 80,
+                "speech_pace": 75,
+                "filler_words": 90,
+                "vocal_variety": 65,
+                "expression": 60,
+                "total": 75,
+            },
+            "raw": {"voiced_s": 0.9},   # noise-driven; sums to 9.0 s
+            # Only 3 chunks emit a single hallucinated word — 3 total.
+            "transcript_words": list(fake_words_chunk) if i in (2, 5, 8) else [],
+        })
+    report = generate_post_session_report(snapshots, "noise-test")
+    assert report.get("insufficient_speech") is True, (
+        "Sessions with ambient noise but no real speech must not score; "
+        "got " + repr(report.get("avg_score"))
+    )
+    assert report.get("avg_score") is None
+
+
 def test_session_with_enough_voiced_seconds_is_scored():
-    """5 s of voiced speech (across 2 chunks) beats the 3-s gate.
+    """5 s of voiced speech + ≥8 words (across 2 chunks) beats the gate.
 
     Bypasses Silero VAD by injecting voiced_s directly into snapshot
     dicts — the gate's input is `r['voiced_s']` from the audio
     pipeline, and what we want to pin here is the report-generator
     threshold logic, not Silero's per-chunk voicing accuracy.
+
+    The gate also requires ≥8 total words across the session (Batch 5
+    fix for noise-driven phantom transcripts), so each voiced chunk
+    contributes 5 stub words.
     """
+    voiced_chunk_words = [
+        {"word": "this", "start_ms": 200, "end_ms": 400, "is_filler": False, "probability": 0.95},
+        {"word": "is",   "start_ms": 410, "end_ms": 500, "is_filler": False, "probability": 0.95},
+        {"word": "real", "start_ms": 510, "end_ms": 700, "is_filler": False, "probability": 0.95},
+        {"word": "spoken", "start_ms": 710, "end_ms": 1100, "is_filler": False, "probability": 0.95},
+        {"word": "audio", "start_ms": 1110, "end_ms": 1400, "is_filler": False, "probability": 0.95},
+    ]
     snapshots = []
     # 8 chunks (24 s) total: 6 silent, 2 voiced at 2.5 s each.
     for i in range(8):
@@ -158,7 +205,7 @@ def test_session_with_enough_voiced_seconds_is_scored():
                 "total": 75 if is_voiced else 50,
             },
             "raw": {"voiced_s": 2.5 if is_voiced else 0},
-            "transcript_words": [],
+            "transcript_words": list(voiced_chunk_words) if is_voiced else [],
         })
     report = generate_post_session_report(snapshots, "voiced-test")
     assert report.get("insufficient_speech") is not True
@@ -170,21 +217,33 @@ def test_session_with_enough_voiced_seconds_is_scored():
 
 def test_avg_returns_none_when_all_signals_are_none():
     """avg() previously returned 0 for empty inputs, displaying as
-    "0/100" instead of "N/A". Pin the fix."""
-    # Build a fake snapshots list where every score is None.
+    "0/100" instead of "N/A". Pin the fix.
+
+    Built to clear the Batch-5 insufficient_speech gate (≥5 s voiced
+    AND ≥8 transcript words) so we exercise the avg() path itself —
+    every score is None, but the snapshots ARE labelled as voiced and
+    have transcript words. Pre-Batch 5 this test stubbed an empty
+    transcript and only 3 s voiced; both would now short-circuit.
+    """
+    fake_words = [
+        {"word": w, "start_ms": i * 200, "end_ms": i * 200 + 150,
+         "is_filler": False, "probability": 0.9}
+        for i, w in enumerate(["the", "user", "said", "real", "words", "with", "good", "diction", "today"])
+    ]
     snapshots = [
         {
             "scores": {k: None for k in (
                 "voice_steadiness", "eye_contact", "speech_pace",
                 "filler_words", "vocal_variety", "expression", "total",
             )},
-            "raw": {"voiced_s": 1.5},   # avoids insufficient_speech short-circuit
-            "transcript_words": [],
+            "raw": {"voiced_s": 3.0},
+            "transcript_words": list(fake_words),
         }
         for _ in range(2)
     ]
-    # Sum voiced_s = 3.0 → just above the 3.0 threshold → not
-    # insufficient. avg() should return None for every signal.
+    # Sum voiced_s = 6.0 (above the 5 s gate). Total words = 18 (above
+    # the 8-word gate). avg() should return None for every signal
+    # because every score IS None per chunk.
     report = generate_post_session_report(snapshots, "avg-none-test")
     assert report.get("insufficient_speech") is not True
     for sig in ("voice_steadiness", "eye_contact", "speech_pace",

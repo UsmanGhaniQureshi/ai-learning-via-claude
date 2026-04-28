@@ -6,11 +6,21 @@
 
 @layer base {
   * { box-sizing: border-box; }
+  /* color-scheme: dark forces native form controls (the <select>'s
+     dropdown menu, <option>s, scrollbars, date pickers, etc.) to
+     render in their dark-theme variant on Chromium / Firefox / Safari.
+     Without this, a dark <select> still spawns a white-on-white
+     dropdown when opened on Windows. */
+  :root { color-scheme: dark; }
   body {
     @apply bg-page text-text-primary font-body;
     -webkit-font-smoothing: antialiased;
   }
   #root { @apply w-full max-w-full text-left border-0; }
+  /* Belt-and-braces: explicit colours on <option> for the few
+     environments where color-scheme alone doesn't cascade (some
+     embedded WebViews, older Edge). */
+  option { background: #0a0a0f; color: #f1f0ff; }
   h1, h2, h3 { @apply font-display tracking-tight; }
   h1 { @apply text-4xl font-extrabold; }
   h2 { @apply text-2xl font-bold; }

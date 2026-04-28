@@ -521,15 +521,18 @@ class AudioPipeline:
         # Strict gate: most webcams have an ambient noise floor that easily
         # cleared the previous (voiced_s>=0.4, rms>0.005) check, which led
         # to padded silence being fed into Whisper and hallucinated as
-        # "thank you for watching". With voiced_s>=0.8s of a 3s chunk and
-        # rms>0.012, real speech still passes while breathing/typing/HVAC
-        # do not. Skip Whisper entirely on failure.
+        # "thank you for watching". The current gate (voiced_s>=1.2s of a
+        # 3s chunk, rms>0.02) keeps Whisper away from background noise
+        # like AC / fans / keyboard / breath while still passing every
+        # variant of real speech we could synthesise in tests. Tightened
+        # from 0.8s/0.012 after the audit caught noise-driven phantom
+        # transcripts ("you", "thank you") on silent live sessions.
         words = []
         language = "en"
         language_probability = 1.0
         low_confidence = False
         rms_energy = features['rms']
-        has_meaningful_speech = voiced_s >= 0.8 and rms_energy > 0.012
+        has_meaningful_speech = voiced_s >= 1.2 and rms_energy > 0.02
 
         # English-only language gate (Batch 2). Run the multilingual
         # detector ONCE per session on the first chunk that has real

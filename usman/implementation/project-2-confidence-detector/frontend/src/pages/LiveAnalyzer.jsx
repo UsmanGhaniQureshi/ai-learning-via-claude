@@ -182,6 +182,19 @@ export default function LiveAnalyzer() {
 
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
 
+    // Ship the practice topic so the backend can call llm_coach at
+    // finalize time. Free-practice sessions skip this; coaching
+    // short-circuits to "skipped" downstream.
+    if (setup?.promptTitle) {
+      try {
+        wsRef.current.send(JSON.stringify({
+          type: 'session_meta',
+          prompt_title: setup.promptTitle,
+          prompt_body: setup.promptBody || '',
+        }))
+      } catch (e) { /* ignore — coaching just won't fire */ }
+    }
+
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
       : 'audio/webm'

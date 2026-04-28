@@ -962,6 +962,8 @@ async def upload_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     trim_segments: str | None = Form(default=None),
+    prompt_title: str | None = Form(default=None),
+    prompt_body: str | None = Form(default=None),
     user: User = Depends(get_current_user),
 ):
     """Phase-1 endpoint: take bytes, return media_id, kick off pipeline.
@@ -1017,10 +1019,21 @@ async def upload_video(
         content_sha256=content_sha256,
         title=Path(original_name).stem if original_name else None,
     )
+    # Practice topic — if the user picked one in Upload.jsx, the
+    # background task forwards it to llm_coach so the LLM coaching
+    # block of the report is filled in. Empty/missing → coaching is
+    # "skipped" downstream.
+    prompt_meta = None
+    if prompt_title and prompt_title.strip():
+        prompt_meta = {
+            "title": prompt_title.strip()[:200],
+            "body": (prompt_body or "").strip()[:1000],
+        }
+
     background_tasks.add_task(
         _run_upload_pipeline_sync,
         upload_id, filepath, original_name, safe_ext, user.id,
-        segments,
+        segments, prompt_meta,
     )
     return JSONResponse(
         {"media_id": upload_id, "status": "pending"},
@@ -1035,6 +1048,7 @@ def _run_upload_pipeline_sync(
     safe_ext: str,
     user_id: str,
     trim_segments: list[tuple[float, float]] | None = None,
+    prompt_meta: dict | None = None,
 ) -> None:
     """All the heavy lifting that used to run inline in upload_video.
 
@@ -1577,6 +1591,10 @@ def _run_upload_pipeline_sync(
                         f"/api/video/{video_serve}", user_id,
                     ),
                 },
+                'wins': [],
+                'improvements': [],
+                'coaching': None,
+                'coaching_status': 'skipped',
             }
             _complete_media_processing(
                 media_id=upload_id,
@@ -1620,6 +1638,10 @@ def _run_upload_pipeline_sync(
                         f"/api/video/{video_serve}", user_id,
                     ),
                 },
+                'wins': [],
+                'improvements': [],
+                'coaching': None,
+                'coaching_status': 'skipped',
             }
             _complete_media_processing(
                 media_id=upload_id,
@@ -1787,6 +1809,96 @@ def _run_upload_pipeline_sync(
             'face_timeline': face_results_by_time,
             'speech_timeline': speech_timeline,
         }
+
+        # Top-level wins/improvements derived from `tips`. The simple
+        # heuristic: positive-leaning sentences become wins, the rest
+        # are improvements. Same split Result.jsx used to do client-side
+        # — moved to the backend so every code path emits the same
+        # shape and the frontend never has to do this filtering itself.
+        # Overwritten below if Gemini coaching is ready.
+        _wins_pat = ('great', 'good', 'nice', 'keep', 'excellent', 'strong')
+        _tips = response_payload.get('tips') or []
+        _wins = [t for t in _tips if any(p in t.lower() for p in _wins_pat)]
+        _imps = [t for t in _tips if t not in _wins]
+        response_payload['wins'] = list(_wins)
+        response_payload['improvements'] = list(_imps)
+
+        # ── LLM coaching for video uploads ───────────────────────────
+        # The upload pipeline doesn't go through generate_post_session_report
+        # (it uses ScoringEngine directly), so we call llm_coach here with
+        # a shape adapter mapping camelCase sub_scores → snake_case
+        # signal_averages, plus pulling pace + filler stats from
+        # speech_summary. Off-topic / no API key / missing topic all
+        # short-circuit to coaching_status="skipped" and the rule-based
+        # tips above carry the load instead.
+        coaching = None
+        coaching_status = "skipped"
+        if prompt_meta and prompt_meta.get("title"):
+            try:
+                from llm_coach import generate_practice_coaching
+                # Flatten speech_timeline into the flat word list
+                # llm_coach expects (each chunk has its own .words array
+                # already with absolute start_ms after the live-path
+                # offset shift in audio_pipeline).
+                flat_words = []
+                for seg in speech_timeline or []:
+                    for w in (seg.get("words") or []):
+                        flat_words.append({
+                            "word": w.get("word"),
+                            "is_filler": bool(w.get("is_filler")),
+                        })
+                # Build the snake_case dict shape the coach reads from.
+                ss_obj = speech_summary or {}
+                filler_words_list = ss_obj.get("filler_words") or []
+                filler_breakdown = {}
+                for fw in filler_words_list:
+                    filler_breakdown[fw] = filler_breakdown.get(fw, 0) + 1
+                coach_input = {
+                    "avg_score": overall_score,
+                    "grade": _grade_for(int(overall_score or 0)),
+                    "signal_averages": {
+                        "voice_steadiness": final_scores.get("voiceSteadiness"),
+                        "eye_contact": final_scores.get("eyeContact"),
+                        "speech_pace": final_scores.get("speechPace"),
+                        "filler_words": final_scores.get("fillerWords"),
+                        "vocal_variety": final_scores.get("vocalVariety"),
+                        "expression": final_scores.get("expression"),
+                    },
+                    "filler_breakdown": filler_breakdown,
+                    "total_fillers": ss_obj.get("total_fillers", 0) or 0,
+                    "pace": {"avg_wpm": ss_obj.get("average_wpm", 0) or 0},
+                }
+                coaching = generate_practice_coaching(
+                    coach_input,
+                    transcript_words=flat_words,
+                    prompt_title=prompt_meta.get("title", ""),
+                    prompt_body=prompt_meta.get("body", ""),
+                )
+                coaching_status = "ready" if coaching else "skipped"
+            except Exception as e:
+                log.warning(f"[upload llm_coach] failed: {e}")
+                coaching_status = "failed"
+        response_payload["coaching"] = coaching
+        response_payload["coaching_status"] = coaching_status
+
+        # Same merge as report_generator: when Gemini produced
+        # structured coaching, prefer its wins/improvements for the
+        # top-level always-visible cards.
+        if coaching_status == "ready" and coaching:
+            en = coaching.get("english") or {}
+            cf = coaching.get("confidence") or {}
+            merged_wins = []
+            for w in (en.get("wins") or []) + (cf.get("wins") or []):
+                if isinstance(w, str) and w.strip():
+                    merged_wins.append(w.strip())
+            merged_imps = []
+            for imp in (en.get("improvements") or []) + (cf.get("improvements") or []):
+                if isinstance(imp, str) and imp.strip():
+                    merged_imps.append(imp.strip())
+            if merged_wins:
+                response_payload["wins"] = merged_wins
+            if merged_imps:
+                response_payload["improvements"] = merged_imps
 
         # Persist the FULL face_timeline (thumbs included) into report_json.
         # Earlier this slimmed thumbs out to save bandwidth on revisits,
@@ -2018,6 +2130,11 @@ async def session_ws(ws: WebSocket, session_id: str):
     _calibration_done_announced = False
     snapshots = []
     latest_browser_face = {}  # Face scores from browser MediaPipe
+    # Practice topic + brief, populated by the client's first
+    # `session_meta` WS message (see useLiveSession.js). Empty dict
+    # means free practice / no topic — coaching short-circuits to
+    # "skipped" downstream.
+    session_meta: dict = {}
     client_requested_stop = False
     _finalized = False  # Guard against double-finalize races.
     # English-only product gate. AudioPipeline probes the first
@@ -2068,8 +2185,21 @@ async def session_ws(ws: WebSocket, session_id: str):
         # avg_score=None + status_message and the persistence helper
         # marks the row as 'failed'.
         user_baseline = _fetch_user_baseline(ws_user_id, exclude_media_id=session_id)
+        # Pass the practice topic through so `report_generator` can
+        # invoke `llm_coach.generate_practice_coaching`. session_meta
+        # is empty for free-practice sessions; coaching short-circuits
+        # to "skipped" inside the report generator.
+        prompt_meta = (
+            {
+                "title": session_meta.get("prompt_title", ""),
+                "body": session_meta.get("prompt_body", ""),
+            }
+            if session_meta else None
+        )
         report = generate_post_session_report(
-            snapshots, session_id, user_baseline=user_baseline,
+            snapshots, session_id,
+            user_baseline=user_baseline,
+            prompt_meta=prompt_meta,
         )
         report["recording"] = recording_info
         # Phase 2: report JSON is now stored inside Media.report_json via
@@ -2331,6 +2461,18 @@ async def session_ws(ws: WebSocket, session_id: str):
                         else:
                             # Legacy 4-field path
                             latest_browser_face = data.get('scores', {})
+                    elif data.get('type') == 'session_meta':
+                        # Practice setup: topic title + body picked in
+                        # PracticeSetup. Stored once at session start so
+                        # finalize_and_send_report can hand it to
+                        # llm_coach. Subsequent session_meta messages
+                        # would just overwrite (no-op in normal flow).
+                        title = data.get('prompt_title')
+                        if isinstance(title, str) and title.strip():
+                            session_meta['prompt_title'] = title.strip()[:200]
+                        body = data.get('prompt_body')
+                        if isinstance(body, str):
+                            session_meta['prompt_body'] = body.strip()[:1000]
                     elif data.get('type') == 'stop_session':
                         # Drain the queue before finalize so every
                         # chunk the user spoke is in `snapshots`
@@ -2384,6 +2526,8 @@ async def analyze_audio_file(
     audio_file: UploadFile = File(...),
     session_label: str = Form(default="uploaded"),
     trim_segments: str | None = Form(default=None),
+    prompt_title: str | None = Form(default=None),
+    prompt_body: str | None = Form(default=None),
     user: User = Depends(get_current_user),
 ):
     """Accepts any audio file. Returns 202 + media_id immediately.
@@ -2429,10 +2573,18 @@ async def analyze_audio_file(
         content_sha256=content_sha256,
         title=default_title,
     )
+    # Practice topic forwarding (same pattern as /api/upload).
+    prompt_meta = None
+    if prompt_title and prompt_title.strip():
+        prompt_meta = {
+            "title": prompt_title.strip()[:200],
+            "body": (prompt_body or "").strip()[:1000],
+        }
+
     background_tasks.add_task(
         _run_analyzer_pipeline_sync,
         media_id, saved_path, saved_name, audio_file.filename, user.id,
-        segments,
+        segments, prompt_meta,
     )
     return JSONResponse(
         {"media_id": media_id, "status": "pending"},
@@ -2447,6 +2599,7 @@ def _run_analyzer_pipeline_sync(
     original_filename: str | None,
     user_id: str,
     trim_segments: list[tuple[float, float]] | None = None,
+    prompt_meta: dict | None = None,
 ) -> None:
     """Background-thread version of the analyzer pipeline.
 
@@ -2589,7 +2742,9 @@ def _run_analyzer_pipeline_sync(
         # Per-user baseline (last 5 finished sessions). See main.py:_fetch_user_baseline.
         user_baseline = _fetch_user_baseline(user_id, exclude_media_id=media_id)
         report = generate_post_session_report(
-            snapshots, media_id, user_baseline=user_baseline,
+            snapshots, media_id,
+            user_baseline=user_baseline,
+            prompt_meta=prompt_meta,
         )
         report["media_id"] = media_id
         report["source"] = "file_upload"

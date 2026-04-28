@@ -189,6 +189,18 @@ class SignalScorer:
             "filler_words": 0.20,
             "vocal_variety": 0.12,
         }
+        # Refuse to compute a "face-only" headline. When every audio
+        # signal is None (silent chunk, mic dead, language unsupported)
+        # the renormaliser would otherwise let eye_contact carry 100%
+        # of the weight — a silent user looking at the camera scored 100.
+        # Returning None forces callers to label the chunk as "no
+        # speech" rather than fabricate a confident headline from face
+        # alone. analyzer_audio (audio-only) is unaffected — its audio
+        # signals are populated and eye_contact is the missing one.
+        AUDIO_KEYS = ("voice_steadiness", "speech_pace", "filler_words", "vocal_variety")
+        if not any(signals.get(k) is not None for k in AUDIO_KEYS):
+            return None
+
         weighted_sum = 0.0
         weight_total = 0.0
         for k, w in weights.items():

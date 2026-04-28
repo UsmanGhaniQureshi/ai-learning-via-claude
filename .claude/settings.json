@@ -203,7 +203,8 @@
       "Bash(\"./detector_env/Scripts/pip.exe\" install *)",
       "Bash(\"./detector_env/Scripts/python.exe\" -m pytest tests/test_pipeline_regression.py -v)",
       "Bash(\"./detector_env/Scripts/python.exe\" -m pytest tests/ -v)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(./detector_env/Scripts/python -m pytest tests/ --tb=short)"
     ],
     "additionalDirectories": [
       "\\dev",

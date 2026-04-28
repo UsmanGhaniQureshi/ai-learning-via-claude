@@ -74,6 +74,16 @@ export default function useLiveSession() {
   // why the gauge isn't yet reflecting their expression.
   const [calibrating, setCalibrating] = useState(false)
 
+  // "We don't hear you yet" detector. After Batch-5 the backend's
+  // SignalScorer.aggregate() returns total=null when every audio
+  // signal is None — i.e. silent chunks no longer produce a fake
+  // face-only headline. We count consecutive null-total chunks here;
+  // 5 in a row (~15 s at 3-s chunk cadence) flips noSpeechDetected so
+  // LiveSession.jsx can surface a banner. Resets to 0 on any non-null
+  // total or when the session leaves 'active'.
+  const [noSpeechDetected, setNoSpeechDetected] = useState(false)
+  const silentChunkCountRef = useRef(0)
+
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const reportRef = useRef(null)
@@ -294,12 +304,19 @@ export default function useLiveSession() {
     }
   }
 
-  const startSession = useCallback(async () => {
+  // setupMeta: { promptTitle, promptBody, durationMin } from PracticeSetup.
+  // Forwarded to the backend over WS as a `session_meta` message right
+  // after the connection opens, so report_generator → llm_coach knows
+  // which topic to coach against. Optional — null/undefined means free
+  // practice and the LLM coaching path short-circuits to "skipped".
+  const startSession = useCallback(async (setupMeta = null) => {
     setError(null)
     setConnectionStatus('connected')
     setUnsupportedLanguage(null)
     setBackpressure(false)
     setCalibrating(false)
+    setNoSpeechDetected(false)
+    silentChunkCountRef.current = 0
     if (backpressureTimerRef.current) {
       clearTimeout(backpressureTimerRef.current)
       backpressureTimerRef.current = null
@@ -424,6 +441,10 @@ export default function useLiveSession() {
           if (data.scores) {
             setScores(data.scores)
             if (data.scores.total != null) {
+              // Real audio arrived → reset the silence counter and
+              // clear the "we don't hear you" banner if it was up.
+              silentChunkCountRef.current = 0
+              setNoSpeechDetected(false)
               setScoreHistory((prev) => [
                 ...prev,
                 {
@@ -433,6 +454,14 @@ export default function useLiveSession() {
                   score: data.scores.total,
                 },
               ])
+            } else {
+              // total=null means every audio signal was None for this
+              // chunk (Batch-5 fix). Count consecutive nulls; flip the
+              // banner once we hit 5 in a row (~15 s).
+              silentChunkCountRef.current += 1
+              if (silentChunkCountRef.current >= 5) {
+                setNoSpeechDetected(true)
+              }
             }
           }
           if (data.transcript_text && data.transcript_text.trim()) {
@@ -493,6 +522,21 @@ export default function useLiveSession() {
         ws.addEventListener('open', () => { clearTimeout(timeout); resolve() }, { once: true })
         ws.addEventListener('error', () => { clearTimeout(timeout); reject(new Error('WebSocket error')) }, { once: true })
       })
+
+      // Once the socket is open, ship the practice topic so the
+      // backend can hand it to llm_coach at finalize time. Sent ONCE;
+      // subsequent messages would just overwrite (no-op in normal
+      // flow). Free-practice sessions skip this and the coaching
+      // path short-circuits to "skipped".
+      if (setupMeta?.promptTitle) {
+        try {
+          ws.send(JSON.stringify({
+            type: 'session_meta',
+            prompt_title: setupMeta.promptTitle,
+            prompt_body: setupMeta.promptBody || '',
+          }))
+        } catch (e) { /* ignore — coaching just won't fire */ }
+      }
 
       // 4. Start video recorder
       const recorder = new SessionVideoRecorder()
@@ -662,6 +706,7 @@ export default function useLiveSession() {
     unsupportedLanguage,
     backpressure,
     calibrating,
+    noSpeechDetected,
     scoreHistory,
     duration,
     faceScores,

@@ -88,6 +88,51 @@ def test_aggregate_all_none_returns_none():
     }) is None
 
 
+def test_aggregate_face_only_returns_none_not_face_dominated():
+    """The Batch-5 fix: a silent user with their face on camera was
+    scoring 100 because every audio signal was None and eye_contact
+    was renormalized to 100% of the weight. After the fix the live
+    chunk aggregate must be None when no audio signal is present —
+    the live UI then keeps the gauge at its baseline rather than
+    fabricating a "100" headline from face alone.
+    """
+    out = SignalScorer.aggregate({
+        "voice_steadiness": None,
+        "eye_contact": 100,        # user looking at the camera
+        "speech_pace": None,
+        "filler_words": None,
+        "vocal_variety": None,
+    })
+    assert out is None
+    # Same shape with expression also present: still None — we look
+    # only at the four AUDIO signals to decide.
+    out2 = SignalScorer.aggregate({
+        "voice_steadiness": None,
+        "eye_contact": 80,
+        "speech_pace": None,
+        "filler_words": None,
+        "vocal_variety": None,
+        "expression": 90,
+    })
+    assert out2 is None
+
+
+def test_aggregate_one_audio_signal_present_is_enough():
+    """Belt-and-braces: a single voiced audio signal lets the
+    headline compute. We never want the gate to be so strict that
+    real speech with one missing signal returns None."""
+    out = SignalScorer.aggregate({
+        "voice_steadiness": 80,
+        "eye_contact": 90,
+        "speech_pace": None,
+        "filler_words": None,
+        "vocal_variety": None,
+    })
+    assert out is not None
+    # 0.24*80 + 0.24*90 = 40.8, divided by (0.24+0.24) = 0.48 → 85
+    assert out == 85
+
+
 # ──────────────────── Fix 1 + 2: filler_words parity ────────────────────
 
 def test_filler_words_signal_scorer_canonical_step_table():

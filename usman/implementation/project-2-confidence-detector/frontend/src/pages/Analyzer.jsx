@@ -4,6 +4,7 @@ import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import { fmtSecs } from '../utils/timeStr'
 import TrimSegmentsEditor, { validateSegments } from '../components/TrimSegmentsEditor'
+import TopicSelector from '../components/TopicSelector'
 import LiveAnalyzer from './LiveAnalyzer'
 
 const TABS = ['Upload Audio', 'Live Mic']
@@ -18,6 +19,8 @@ export default function Analyzer() {
   const [segments, setSegments] = useState([{ start: '', end: '' }])
   const [statusText, setStatusText] = useState(null)
   const [uploading, setUploading] = useState(false)
+  // Topic for LLM coaching; null = no topic.
+  const [topicMeta, setTopicMeta] = useState(null)
   const audioRef = useRef(null)
   const navigate = useNavigate()
 
@@ -70,6 +73,10 @@ export default function Analyzer() {
     formData.append('session_label', pickedFile.name)
     if (segmentsPayload) {
       formData.append('trim_segments', JSON.stringify(segmentsPayload))
+    }
+    if (topicMeta?.promptTitle) {
+      formData.append('prompt_title', topicMeta.promptTitle)
+      formData.append('prompt_body', topicMeta.promptBody || '')
     }
 
     try {
@@ -218,6 +225,8 @@ export default function Analyzer() {
               getCurrentTime={() => audioRef.current?.currentTime ?? 0}
             />
           )}
+
+          <TopicSelector value={topicMeta} onChange={setTopicMeta} />
 
           <div className="flex gap-3">
             <button onClick={handleSubmit} className="btn btn-primary">Analyze</button>
