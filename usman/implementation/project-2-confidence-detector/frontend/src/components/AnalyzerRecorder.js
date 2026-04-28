@@ -15,12 +15,15 @@ export class AnalyzerRecorder {
 
   async start() {
     // Request audio only — no camera permission needed
+    // Audio constraints OFF for accuracy parity with the upload
+    // path — see useLiveSession.js for the full rationale.
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         sampleRate: 16000,
         channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
       },
       video: false,
     })

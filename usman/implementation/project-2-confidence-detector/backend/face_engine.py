@@ -12,23 +12,78 @@ FACE_MODEL = os.path.join(os.path.dirname(__file__), 'face_landmarker.task')
 POSE_MODEL = os.path.join(os.path.dirname(__file__), 'pose_landmarker.task')
 
 
+class _LandmarkShim:
+    """Minimal stand-in for MediaPipe Python's NormalizedLandmark.
+
+    Browser MediaPipe sends landmarks as `{x, y, z}` JSON dicts; the
+    Python-side scoring code accesses them as `.x`, `.y`, `.z`. This
+    shim lets the live-WS path reuse the exact same scoring body
+    that processes upload-side MediaPipe output.
+    """
+    __slots__ = ('x', 'y', 'z')
+    def __init__(self, d):
+        self.x = float(d.get('x', 0.0) or 0.0)
+        self.y = float(d.get('y', 0.0) or 0.0)
+        self.z = float(d.get('z', 0.0) or 0.0)
+
+
+class _BlendshapeShim:
+    """Stand-in for MediaPipe Python's blendshape category.
+
+    Browser sends `{categoryName, score}`; Python side reads
+    `.category_name` + `.score`. We accept both spellings to tolerate
+    a possible camelCase-vs-snake_case mismatch on the wire.
+    """
+    __slots__ = ('category_name', 'score')
+    def __init__(self, d):
+        self.category_name = (
+            d.get('categoryName')
+            or d.get('category_name')
+            or ''
+        )
+        self.score = float(d.get('score', 0.0) or 0.0)
+
+
 class FaceEngine:
     """Detects expressions (blendshapes), eye contact, blink rate, posture, fidgeting."""
 
-    def __init__(self):
-        # Face landmarker WITH blendshapes (52 direct facial action scores)
-        # num_faces=2 so we can detect when a second person walks into
-        # frame and surface it as a warning. We still only SCORE the
-        # first face; the second is purely a signal for "you may not be
-        # the one being analysed here".
-        self.face_lm = vision.FaceLandmarker.create_from_options(
-            vision.FaceLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-                num_faces=2,
-                output_face_blendshapes=True,
-                min_face_detection_confidence=0.4,
-                min_face_presence_confidence=0.4,
-                running_mode=vision.RunningMode.IMAGE))
+    def __init__(self, load_mp_models=True):
+        """Set up the engine.
+
+        `load_mp_models=True` (default) — load MediaPipe FaceLandmarker
+        + PoseLandmarker. Use this in the upload pipeline where the
+        engine ingests raw frames via `process_frame`.
+
+        `load_mp_models=False` — skip the model load. Use this in the
+        live WS path where MediaPipe runs in the browser and the
+        backend only ever calls `process_landmarks_from_browser`. Saves
+        ~1-2 s of cold-start latency + ~80 MB of resident memory per
+        live session.
+        """
+        if load_mp_models:
+            # Face landmarker WITH blendshapes (52 direct facial action scores)
+            # num_faces=2 so we can detect when a second person walks into
+            # frame and surface it as a warning. We still only SCORE the
+            # first face; the second is purely a signal for "you may not be
+            # the one being analysed here".
+            self.face_lm = vision.FaceLandmarker.create_from_options(
+                vision.FaceLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
+                    num_faces=2,
+                    output_face_blendshapes=True,
+                    min_face_detection_confidence=0.4,
+                    min_face_presence_confidence=0.4,
+                    running_mode=vision.RunningMode.IMAGE))
+            # Pose landmarker for body language
+            self.pose_lm = vision.PoseLandmarker.create_from_options(
+                vision.PoseLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
+                    num_poses=1,
+                    min_pose_detection_confidence=0.4,
+                    running_mode=vision.RunningMode.IMAGE))
+        else:
+            self.face_lm = None
+            self.pose_lm = None
 
         # Accumulated counters for the session-level report. `frames_processed`
         # denominates everything so ratios are meaningful. `frames_multi_face`
@@ -36,14 +91,6 @@ class FaceEngine:
         # warning when it exceeds a small fraction of total frames.
         self.frames_processed = 0
         self.frames_multi_face = 0
-
-        # Pose landmarker for body language
-        self.pose_lm = vision.PoseLandmarker.create_from_options(
-            vision.PoseLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
-                num_poses=1,
-                min_pose_detection_confidence=0.4,
-                running_mode=vision.RunningMode.IMAGE))
 
         # Blink tracking
         self.blink_times = deque()
@@ -490,6 +537,46 @@ class FaceEngine:
         except Exception:
             pose_landmarks = None
 
+        return self._compute_signals(fl, blendshapes, pose_landmarks, w, h, timestamp)
+
+    def process_landmarks_from_browser(
+        self, face_landmarks, face_blendshapes, timestamp,
+        w=640, h=480,
+    ):
+        """Live-WS entry point.
+
+        Browser MediaPipe (`@mediapipe/tasks-vision`) extracts the face
+        landmarks + blendshapes client-side; we receive them as plain
+        JSON arrays:
+          face_landmarks   — list of {x, y, z} dicts (478 points)
+          face_blendshapes — list of {categoryName, score} dicts (52 entries)
+
+        Wrapping them in tiny shim objects lets us reuse every
+        `_detect_*` method below unchanged — they all access
+        `.x`/`.y`/`.z` on landmarks and `.category_name`/`.score` on
+        blendshapes (the Python MediaPipe API). One source of truth
+        for face scoring across upload + live.
+
+        Pose isn't sent by the browser, so live `posture / fidget /
+        hand_position` come back as their None / 'unknown' defaults
+        (vs the full pose engine on uploads). Same baseline-aware
+        eye-contact + expression logic, blink detection, and tension
+        scoring as the upload path.
+        """
+        if not face_landmarks or not face_blendshapes:
+            self.frames_processed += 1
+            return None
+        self.frames_processed += 1
+        fl = [_LandmarkShim(d) for d in face_landmarks]
+        blendshapes = [_BlendshapeShim(d) for d in face_blendshapes]
+        return self._compute_signals(fl, blendshapes, None, w, h, timestamp)
+
+    def _compute_signals(self, fl, blendshapes, pose_landmarks, w, h, timestamp):
+        """Shared scoring body — given already-extracted face landmarks
+        + blendshapes (+ optional pose landmarks), produce the full
+        result dict. Used by both `process_frame` (server-side
+        MediaPipe) and `process_landmarks_from_browser` (client-side
+        MediaPipe over WS)."""
         # Expression from blendshapes
         expression, expr_intensity, expr_details = self._detect_expression(blendshapes)
         self.expr_history.append(expression)

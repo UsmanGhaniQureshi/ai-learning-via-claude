@@ -52,12 +52,27 @@ export default function useLiveSession() {
   // to 'lost' when the WS closes unexpectedly while the session is
   // still active; stays 'connected' during normal user-triggered stop.
   const [connectionStatus, setConnectionStatus] = useState('connected')
-  // null until the backend's first-2-chunks language gate fires (see
-  // session_ws in main.py). When set: { detected: 'es' } etc. Drives a
-  // non-blocking banner in LiveSession; scoring still continues so the
-  // user gets *some* report, just with the caveat that English-only
-  // heuristics may be off.
-  const [languageWarning, setLanguageWarning] = useState(null)
+  // null when the input is English (or not yet probed). Set to the
+  // detected language code (e.g. "hi", "es") once the backend's
+  // multilingual probe (in audio_pipeline.AudioPipeline) decides
+  // the input isn't English. The product is English-only — when
+  // this fires we render a clear banner and the live score gauge
+  // stops updating (the WS handler stops broadcasting too).
+  const [unsupportedLanguage, setUnsupportedLanguage] = useState(null)
+
+  // Transient flag set when the backend's bounded queue dropped a
+  // chunk because Whisper inference fell behind. Auto-clears after
+  // a few seconds. The UI shows a tiny "Server catching up..."
+  // indicator while it's true. Doesn't change session state.
+  const [backpressure, setBackpressure] = useState(false)
+  const backpressureTimerRef = useRef(null)
+
+  // Server-side FaceEngine calibration state. The backend collects
+  // 90 frames of blendshapes (~13 s at 6.7 Hz) to establish a
+  // per-user expression baseline, then signals "calibrated". The UI
+  // shows a "Calibrating…" badge until then so the user understands
+  // why the gauge isn't yet reflecting their expression.
+  const [calibrating, setCalibrating] = useState(false)
 
   const videoRef = useRef(null)
   const streamRef = useRef(null)
@@ -127,8 +142,10 @@ export default function useLiveSession() {
       audioCtxRef.current = null
     }
 
-    // Flush remaining audio buffer (final partial chunk)
-    flushAudioBuffer(true)
+    // Flush remaining audio buffer (final partial chunk dropped on
+    // force=true). flushAudioBuffer is async now (OfflineAudioContext);
+    // we await so the close-out is deterministic.
+    try { await flushAudioBuffer(true) } catch (e) { /* ignore */ }
 
     // Stop video recorder, expose the blob locally for inline preview,
     // then upload (non-blocking). Upload failure does NOT discard the blob —
@@ -215,33 +232,60 @@ export default function useLiveSession() {
     stopSessionRef.current = stopSession
   }, [stopSession])
 
-  // Linear interpolation resampler (browser rate -> 16kHz)
-  function resample(input, inputRate, outputRate = 16000) {
+  // High-quality resampler via OfflineAudioContext.
+  //
+  // Replaces the previous in-JS linear-interpolation pass, which
+  // aliased high frequencies and attenuated pitch variance — the
+  // direct cause of live `vocal_variety` scoring lower than upload
+  // for the same audio. OfflineAudioContext uses the browser's
+  // built-in (high-quality, windowed-sinc) sample-rate converter,
+  // matching what ffmpeg's `-ar 16000` produces on the upload side.
+  //
+  // Async, so we batch — call once per 3-second chunk, not once per
+  // worklet frame. ~3 ms per call on Chrome desktop; negligible.
+  async function resampleViaOfflineCtx(input, inputRate, outputRate = 16000) {
     if (inputRate === outputRate) return new Float32Array(input)
-    const ratio = inputRate / outputRate
-    const outputLength = Math.floor(input.length / ratio)
-    const output = new Float32Array(outputLength)
-    for (let i = 0; i < outputLength; i++) {
-      const srcIdx = i * ratio
-      const idx = Math.floor(srcIdx)
-      const frac = srcIdx - idx
-      output[i] = input[idx] * (1 - frac) + (input[idx + 1] || 0) * frac
-    }
-    return output
+    const outLength = Math.floor(input.length * outputRate / inputRate)
+    const offlineCtx = new OfflineAudioContext(1, outLength, outputRate)
+    const buffer = offlineCtx.createBuffer(1, input.length, inputRate)
+    buffer.getChannelData(0).set(input)
+    const src = offlineCtx.createBufferSource()
+    src.buffer = buffer
+    src.connect(offlineCtx.destination)
+    src.start(0)
+    const rendered = await offlineCtx.startRendering()
+    return rendered.getChannelData(0)
   }
 
-  function flushAudioBuffer(force = false) {
-    // audioBufferRef contains samples already resampled to 16kHz.
-    // Only send full 3s chunks. NEVER zero-pad a partial chunk —
-    // padding silence into Whisper is the direct cause of the
-    // "thank you for watching" hallucinations. On force=true (session
-    // stopping), drop the leftover partial rather than send silence.
-    const CHUNK_SIZE = 16000 * 3 // 3 seconds at 16kHz
-    while (audioBufferRef.current.length >= CHUNK_SIZE) {
-      const chunk = new Float32Array(audioBufferRef.current.splice(0, CHUNK_SIZE))
+  // Native-rate buffer flush. We accumulate audio at the AudioWorklet's
+  // native sample rate (typically 44.1 / 48 kHz) and only resample when
+  // we have a full 3-second chunk worth — keeps the OfflineAudioContext
+  // call rate at ~0.33 Hz instead of 100+ Hz.
+  //
+  // NEVER zero-pad a partial chunk — padding silence into Whisper is
+  // the direct cause of the "thank you for watching" hallucinations.
+  // On force=true (session stopping), drop the leftover partial rather
+  // than send silence.
+  async function flushAudioBuffer(force = false) {
+    const inputRate = audioCtxRef.current?.sampleRate || 16000
+    const NATIVE_CHUNK = inputRate * 3   // 3 seconds at native rate
+    while (audioBufferRef.current.length >= NATIVE_CHUNK) {
+      const nativeChunk = new Float32Array(
+        audioBufferRef.current.splice(0, NATIVE_CHUNK)
+      )
+      let chunk16k
+      try {
+        chunk16k = inputRate === 16000
+          ? nativeChunk
+          : await resampleViaOfflineCtx(nativeChunk, inputRate, 16000)
+      } catch (e) {
+        // OfflineAudioContext can throw on Safari quirks. Skip the
+        // chunk rather than send garbage; the next one usually works.
+        continue
+      }
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         try {
-          wsRef.current.send(chunk.buffer)
+          wsRef.current.send(chunk16k.buffer)
         } catch (e) { /* ignore */ }
       }
     }
@@ -253,7 +297,13 @@ export default function useLiveSession() {
   const startSession = useCallback(async () => {
     setError(null)
     setConnectionStatus('connected')
-    setLanguageWarning(null)
+    setUnsupportedLanguage(null)
+    setBackpressure(false)
+    setCalibrating(false)
+    if (backpressureTimerRef.current) {
+      clearTimeout(backpressureTimerRef.current)
+      backpressureTimerRef.current = null
+    }
     userStopRef.current = false
     setSessionState('starting')
     setScores(null)
@@ -270,14 +320,29 @@ export default function useLiveSession() {
     lastTranscriptAppendRef.current = ''
 
     try {
-      // 1. Request camera + mic
+      // 1. Request camera + mic.
+      //
+      // Audio constraints: echoCancellation + noiseSuppression +
+      // autoGainControl are all explicitly OFF. The browser's WebRTC
+      // audio pipeline modifies the waveform when these are on:
+      //   - AGC flattens RMS variance → fake-stable voice_steadiness
+      //   - noiseSuppression strips breath sounds → undercounts the
+      //     acoustic-filler detector
+      //   - echoCancellation + AGC together mean the LIVE session
+      //     scores ~10 points higher than uploading the same audio
+      //
+      // The trade-off: users on speakerphone or in noisy rooms will
+      // get a worse transcript. The honest scoring is worth more
+      // than the convenience for those cases. A user with a headset
+      // mic in a quiet room gets the same numbers from live + upload.
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480 },
         audio: {
           sampleRate: 16000,
           channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
         },
       })
       streamRef.current = stream
@@ -300,12 +365,47 @@ export default function useLiveSession() {
             return
           }
 
-          // One-shot language warning — fired by main.py:session_ws
-          // when the first 2 chunks both detect a non-English language
-          // with confidence > 0.6. Doesn't block the session; UI shows
-          // a banner so the user knows scoring may be off.
-          if (data.type === 'language_warning' && data.detected) {
-            setLanguageWarning({ detected: data.detected })
+          // One-shot English-only enforcement — fired by
+          // main.py:session_ws when the multilingual probe in
+          // AudioPipeline decides the first voiced chunk isn't
+          // English. After this the WS handler stops broadcasting
+          // per-chunk score updates (the numbers would be
+          // misleading), so the gauge naturally freezes. The UI
+          // renders a banner asking the user to stop and switch to
+          // English.
+          if (data.type === 'language_unsupported' && data.language) {
+            setUnsupportedLanguage(data.language)
+            return
+          }
+
+          // Backpressure: server's bounded queue dropped a chunk
+          // because Whisper inference fell behind. Surface a brief
+          // indicator and auto-clear — there's nothing the user can
+          // do, but seeing "Server catching up..." beats silently
+          // losing 3 s of audio with no feedback.
+          if (data.type === 'backpressure') {
+            setBackpressure(true)
+            if (backpressureTimerRef.current) {
+              clearTimeout(backpressureTimerRef.current)
+            }
+            backpressureTimerRef.current = setTimeout(() => {
+              setBackpressure(false)
+              backpressureTimerRef.current = null
+            }, 2500)
+            return
+          }
+
+          // FaceEngine calibration state from the backend (Batch 4).
+          // Fired one-shot at the start of calibration and once
+          // again when it completes; UI renders a "Calibrating…"
+          // badge in between so the user knows why the gauge looks
+          // muted for the first ~13 s.
+          if (data.type === 'calibrating') {
+            setCalibrating(true)
+            return
+          }
+          if (data.type === 'calibrated') {
+            setCalibrating(false)
             return
           }
 
@@ -425,11 +525,15 @@ export default function useLiveSession() {
       processor.port.onmessage = (event) => {
         if (!event.data || event.data.type !== 'frame') return
         const frame = event.data.data // Float32Array at inputRate
-        const resampled = resample(frame, inputRate, 16000)
-        for (let i = 0; i < resampled.length; i++) {
-          audioBufferRef.current.push(resampled[i])
+        // Push raw native-rate samples; flushAudioBuffer batches
+        // the resample to whole 3-s chunks via OfflineAudioContext.
+        for (let i = 0; i < frame.length; i++) {
+          audioBufferRef.current.push(frame[i])
         }
-        flushAudioBuffer(false)
+        // Fire-and-forget: the async resample MUST NOT block the
+        // worklet message pump or we drop frames. If a flush errors
+        // it's logged inside the function and the next frame retries.
+        flushAudioBuffer(false).catch(() => {})
       }
 
       // AudioWorkletNode's process() fires even without a downstream
@@ -440,25 +544,43 @@ export default function useLiveSession() {
       // 6. Start browser face detection
       setFaceActive(true)
 
-      // 7. Send face scores every 500ms
+      // 7. Send face data to backend.
+      //
+      // Cadence: 150 ms (matches MediaPipe detection rate in
+      // useFaceDetection). The bump from 500 ms is necessary for
+      // calibration — the server-side FaceEngine needs 90 frames
+      // to establish a baseline; at 150 ms that's ~13.5 s, at the
+      // old 500 ms it would have been 45 s of "calibrating" before
+      // any real scoring kicked in.
+      //
+      // Payload shape: raw landmarks + blendshapes (Batch 4). The
+      // backend runs the canonical FaceEngine on these so live and
+      // upload paths produce comparable scores. We still also send
+      // the legacy 4-field `scores` block as a fallback in case the
+      // backend hasn't been redeployed — that path stays readable
+      // by older WS handlers.
       faceIntervalRef.current = setInterval(() => {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          const fs = faceScoresRef.current
-          try {
-            wsRef.current.send(
-              JSON.stringify({
-                type: 'face',
-                scores: {
-                  eye_contact: fs.eye_contact,
-                  expression: fs.expression,
-                  tension: fs.tension,
-                  face_detected: fs.face_detected,
-                },
-              })
-            )
-          } catch (e) { /* ignore */ }
+        if (!(wsRef.current && wsRef.current.readyState === WebSocket.OPEN)) return
+        const fs = faceScoresRef.current
+        const raw = fs?._rawFaceRef?.current
+        const payload = {
+          type: 'face',
+          scores: {
+            eye_contact: fs.eye_contact,
+            expression: fs.expression,
+            tension: fs.tension,
+            face_detected: fs.face_detected,
+          },
         }
-      }, 500)
+        if (raw && raw.landmarks && raw.blendshapes) {
+          payload.landmarks = raw.landmarks
+          payload.blendshapes = raw.blendshapes
+          payload.timestamp = raw.timestamp
+        }
+        try {
+          wsRef.current.send(JSON.stringify(payload))
+        } catch (e) { /* ignore */ }
+      }, 150)
 
       // 8. Duration timer
       sessionStartRef.current = Date.now()
@@ -537,7 +659,9 @@ export default function useLiveSession() {
     report,
     error,
     connectionStatus,
-    languageWarning,
+    unsupportedLanguage,
+    backpressure,
+    calibrating,
     scoreHistory,
     duration,
     faceScores,

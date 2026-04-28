@@ -36,7 +36,8 @@ function gestureBadge(label) {
 export default function LiveSession() {
   const {
     sessionState, videoRef, scores, transcript, tips, report, error,
-    connectionStatus, languageWarning, scoreHistory, duration, faceScores,
+    connectionStatus, unsupportedLanguage, backpressure, calibrating,
+    scoreHistory, duration, faceScores,
     startSession, stopSession,
   } = useLiveSession()
 
@@ -154,21 +155,54 @@ export default function LiveSession() {
               so far — we'll redirect you to the report in a moment.
             </div>
           )}
-          {languageWarning && (
+          {unsupportedLanguage && (
             <div
               style={{
-                background: '#3b2f00',
-                border: '1px solid #8a7100',
-                color: '#ffd95a',
-                padding: '10px 14px',
+                background: '#4a1f1f',
+                border: '1px solid #8a3333',
+                color: '#ff9b9b',
+                padding: '12px 14px',
                 borderRadius: 6,
                 marginBottom: 12,
-                fontSize: '0.92em',
+                fontSize: '0.95em',
               }}
             >
-              We detected <strong>{languageDisplayName(languageWarning.detected)}</strong>.
-              {' '}Confidence scoring currently supports English only.
-              Results may be inaccurate.
+              <strong>We detected {languageDisplayName(unsupportedLanguage)}.</strong>{' '}
+              The app currently supports English only. Stop and try
+              again in English — score updates have been paused for
+              this session.
+            </div>
+          )}
+
+          {backpressure && (
+            <div
+              style={{
+                background: '#2a2a35',
+                color: '#cfe1ff',
+                padding: '6px 12px',
+                borderRadius: 4,
+                marginBottom: 8,
+                fontSize: '0.82em',
+                opacity: 0.85,
+              }}
+            >
+              Server catching up… (a chunk was dropped — keep speaking)
+            </div>
+          )}
+
+          {calibrating && (
+            <div
+              style={{
+                background: '#1a2438',
+                color: '#cfe1ff',
+                padding: '6px 12px',
+                borderRadius: 4,
+                marginBottom: 8,
+                fontSize: '0.82em',
+              }}
+            >
+              Calibrating face baseline… expression scores will pick up in
+              about 10 s. Sit naturally and look at the camera.
             </div>
           )}
 

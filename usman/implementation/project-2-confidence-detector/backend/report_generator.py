@@ -45,6 +45,78 @@ def generate_post_session_report(
 
     all_scores = [s["scores"] for s in snapshots]
     all_raw = [s["raw"] for s in snapshots]
+
+    signal_keys = (
+        "voice_steadiness", "eye_contact", "speech_pace",
+        "filler_words", "vocal_variety", "expression",
+    )
+    duration_s = len(snapshots) * 3
+
+    # English-only product gate (Batch 2). The audio_pipeline probes
+    # the first voiced chunk with a multilingual detector and, on
+    # non-English input, sets `unsupported_language` on every chunk
+    # from that point forward. Surface that here as a hard
+    # short-circuit — the English-trained scorers can't be trusted on
+    # other languages, so we refuse to score rather than producing
+    # nonsense numbers. The `unsupported_language` field on each
+    # snapshot is identical (set once per session), so we just take
+    # the first non-None value.
+    unsupported_lang = next(
+        (s.get("unsupported_language") for s in snapshots
+         if s.get("unsupported_language")),
+        None,
+    )
+    if unsupported_lang:
+        return {
+            "session_id": session_id,
+            "unsupported_language": unsupported_lang,
+            "avg_score": None,
+            "grade": None,
+            "grade_label": None,
+            "signal_averages": {k: None for k in signal_keys},
+            "signal_stderrs": {},
+            "signal_reasons": {},
+            "coaching_status": "skipped",
+            "status_message": (
+                "This recording doesn't appear to be in English. The app "
+                "currently supports English only — please try again "
+                "speaking in English."
+            ),
+            "duration_s": duration_s,
+            "transcript": [],
+            "timeline": [],
+        }
+
+    # Session-level "did anything happen?" gate. Sum total voiced
+    # seconds across every chunk; if it's below 3 s (one chunk's worth)
+    # the user effectively didn't speak — return a clear
+    # `insufficient_speech` report instead of a fake number. Without
+    # this, a 30-s silent recording still produced a grade A in
+    # earlier passes (silent audio + visible face → ~82). The
+    # status_message text is exactly what the UI renders in place
+    # of the score gauge.
+    INSUFFICIENT_SPEECH_THRESHOLD_S = 3.0
+    total_voiced_s = sum(r.get("voiced_s", 0) for r in all_raw)
+    if total_voiced_s < INSUFFICIENT_SPEECH_THRESHOLD_S:
+        return {
+            "session_id": session_id,
+            "insufficient_speech": True,
+            "avg_score": None,
+            "grade": None,
+            "grade_label": None,
+            "signal_averages": {k: None for k in signal_keys},
+            "signal_stderrs": {},
+            "signal_reasons": {},
+            "coaching_status": "skipped",
+            "status_message": (
+                "Not enough speech to score. Try recording again and "
+                "speak for at least a few seconds."
+            ),
+            "duration_s": duration_s,
+            "total_voiced_s": round(total_voiced_s, 2),
+            "transcript": [],
+            "timeline": [],
+        }
     # Shift per-word timestamps into ABSOLUTE media time (each chunk is 3s,
     # so chunk i contributes offset i*3000ms). Without this, word 0 of every
     # chunk has start_ms=0, and AudioPlaybackReview can't sync past the
@@ -60,17 +132,16 @@ def generate_post_session_report(
                 "is_filler": w.get("is_filler", False),
                 "probability": w.get("probability"),
             })
-    duration_s = len(snapshots) * 3
 
     def avg(key):
         # Exclude None values — these mean "signal not available for
-        # this chunk" (e.g. speech_pace on a silent chunk). Previously
-        # Nones became 0 via .get(key, 0) and dragged the session
-        # average down; a speaker with a quiet pause shouldn't have
-        # their pace score halved because of it.
+        # this chunk" (e.g. speech_pace on a silent chunk). Returns
+        # None when no chunks contributed data — was previously 0,
+        # which displayed as "0/100" instead of "N/A" in the UI and
+        # made silent sessions look like the user scored a flat zero.
         vals = [s.get(key) for s in all_scores if s.get(key) is not None]
         if not vals:
-            return 0
+            return None
         return round(sum(vals) / len(vals))
 
     def stderr(key):
@@ -91,8 +162,12 @@ def generate_post_session_report(
         return round((var ** 0.5) / (n ** 0.5), 1)
 
     avg_total = avg("total")
-    peak_total = max((s.get("total", 0) for s in all_scores), default=0)
-    lowest_total = min((s.get("total", 0) for s in all_scores), default=0)
+    # Filter Nones — per-chunk total is now None when every signal in
+    # that chunk was None (e.g. silent chunk with no face data). Old
+    # default of 0 would compare wrong (max/min on Nones throws).
+    _totals = [s.get("total") for s in all_scores if s.get("total") is not None]
+    peak_total = max(_totals, default=0)
+    lowest_total = min(_totals, default=0)
 
     signal_avgs = {
         "voice_steadiness": avg("voice_steadiness"),
@@ -124,33 +199,15 @@ def generate_post_session_report(
     )
     total_fillers = sum(filler_counts.values()) + total_acoustic
 
-    # ── Language confidence (Whisper auto-detect) ───────────────────
-    # Majority vote across chunks: if most voiced chunks detected a
-    # non-English language (or low confidence), flag the whole session
-    # so the UI can warn the user that the analysis may be unreliable.
+    # NOTE: this used to majority-vote per-chunk `language` from
+    # Whisper to set a `language_warning`, but the production
+    # transcription model is `.en` — Whisper always reports "en"
+    # with confidence 1.0 — so the gate never fired. Replaced by
+    # the upstream `unsupported_language` short-circuit at the top
+    # of this function (Batch 2), which uses a real multilingual
+    # probe in audio_pipeline and refuses to score rather than
+    # warning + scoring anyway.
     voiced_chunks = [r for r in all_raw if r.get("voiced_s", 0) >= 0.8]
-    langs = [r.get("language", "en") for r in voiced_chunks]
-    low_conf_flags = [bool(r.get("language_low_confidence")) for r in voiced_chunks]
-    non_en_count = sum(1 for L in langs if L and L != "en")
-    low_conf_count = sum(1 for f in low_conf_flags if f)
-    language_warning = None
-    dominant_language = "en"
-    if voiced_chunks:
-        if non_en_count > len(voiced_chunks) // 2:
-            # Most chunks weren't English — pick the most common non-en language.
-            from collections import Counter
-            dominant_language = Counter(
-                L for L in langs if L and L != "en"
-            ).most_common(1)[0][0]
-            language_warning = (
-                f"Detected speech as '{dominant_language}', not English. "
-                "Scoring is optimised for English — results may be unreliable."
-            )
-        elif low_conf_count > len(voiced_chunks) // 2:
-            language_warning = (
-                "Language detection confidence was low across most of the "
-                "session. The transcript and scores may be unreliable."
-            )
 
     # ── Pace statistics ──────────────────────────────────────────────
     wpms = [s.get("wpm", 0) for s in all_raw if s.get("wpm", 0) > 0]
@@ -186,6 +243,7 @@ def generate_post_session_report(
     )
 
     def _explain_score(score):
+        if score is None: return "no data"
         if score >= 80: return "strong"
         if score >= 65: return "solid"
         if score >= 50: return "developing"
@@ -234,10 +292,17 @@ def generate_post_session_report(
         (0, "F", "Keep practicing"),
     ]
     grade, label = "F", "Keep practicing"
-    for threshold, g, l in grade_table:
-        if avg_total >= threshold:
-            grade, label = g, l
-            break
+    if avg_total is None:
+        # Every per-chunk total was None — happens when all signals
+        # were None (e.g. silent session that somehow slipped past the
+        # insufficient_speech short-circuit, or audio-only-no-face
+        # case). Surface "no grade" rather than defaulting to F.
+        grade, label = None, None
+    else:
+        for threshold, g, l in grade_table:
+            if avg_total >= threshold:
+                grade, label = g, l
+                break
 
     # ── Specific insights (not generic) ──────────────────────────────
     insights = []
@@ -268,24 +333,31 @@ def generate_post_session_report(
             f"(avg {pace['avg_wpm']} WPM, ideal is 130-160)."
         )
 
-    if signal_avgs["eye_contact"] < 55:
+    # Skip None signals — they mean "no measurement," not "low score."
+    if signal_avgs["eye_contact"] is not None and signal_avgs["eye_contact"] < 55:
         insights.append(
             "Eye contact was weak — you looked away from camera frequently."
         )
 
-    if signal_avgs["voice_steadiness"] < 55:
+    if signal_avgs["voice_steadiness"] is not None and signal_avgs["voice_steadiness"] < 55:
         insights.append(
             "Voice trembling detected — nervousness was audible."
         )
 
-    if signal_avgs["vocal_variety"] < 50:
+    if signal_avgs["vocal_variety"] is not None and signal_avgs["vocal_variety"] < 50:
         insights.append(
             "Delivery was monotone. Vary your pitch to stay engaging."
         )
 
-    # Find worst confidence dip with timestamp
+    # Find worst confidence dip with timestamp. Skip if any per-chunk
+    # total in the comparison window is None (chunks with no measurable
+    # signals) — comparing across None windows produces meaningless
+    # "drops".
     for i in range(5, len(all_scores)):
-        window_avg = sum(all_scores[j]["total"] for j in range(i - 5, i)) / 5
+        window_totals = [all_scores[j].get("total") for j in range(i - 5, i)]
+        if any(t is None for t in window_totals) or all_scores[i].get("total") is None:
+            continue
+        window_avg = sum(window_totals) / 5
         drop = window_avg - all_scores[i]["total"]
         if drop > 20:
             mins, secs = divmod(i * 3, 60)
@@ -304,7 +376,11 @@ def generate_post_session_report(
         "vocal_variety": "Emphasise 2-3 key words per sentence. Avoid one flat pitch.",
         "expression": "Relax your brow. Unclench your jaw. Neutral face reads as calm.",
     }
-    sorted_signals = sorted(signal_avgs.items(), key=lambda x: x[1])
+    # Skip Nones — only sort over signals that actually scored. The
+    # weakest two get an action item; if every signal is None (no
+    # data at all) action_items just stays empty, which is correct.
+    _scored = [(k, v) for k, v in signal_avgs.items() if v is not None]
+    sorted_signals = sorted(_scored, key=lambda x: x[1])
     action_items = [
         action_map[k] for k, _ in sorted_signals[:2] if k in action_map
     ]
@@ -405,6 +481,4 @@ def generate_post_session_report(
         "action_items": action_items,
         "timeline": timeline,
         "transcript": transcript,
-        "language": dominant_language,
-        "language_warning": language_warning,
     }

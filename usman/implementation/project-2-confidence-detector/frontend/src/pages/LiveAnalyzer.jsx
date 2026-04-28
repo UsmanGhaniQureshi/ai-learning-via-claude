@@ -51,10 +51,11 @@ export default function LiveAnalyzer() {
   const lastTranscriptRef = useRef('')
   const userStopRef = useRef(false)
   const [connectionLost, setConnectionLost] = useState(false)
-  // Same one-shot language warning the LiveSession hook surfaces. See
-  // backend/main.py:session_ws — fired when the first 2 chunks both
-  // detect a non-English language with confidence > 0.6.
-  const [languageWarning, setLanguageWarning] = useState(null)
+  // English-only enforcement signal sent by the backend's
+  // multilingual probe in audio_pipeline. When set to a language
+  // code the WS handler stops broadcasting per-chunk scores and we
+  // render a banner asking the user to switch to English.
+  const [unsupportedLanguage, setUnsupportedLanguage] = useState(null)
   // Pre-session setup (topic + duration) and countdown overlay state.
   // Same pattern as LiveSession.jsx — see that file for the rationale.
   const [setup, setSetup] = useState(null)
@@ -134,12 +135,16 @@ export default function LiveAnalyzer() {
 
     let stream
     try {
+      // Audio constraints OFF — see useLiveSession.js for the
+      // accuracy rationale. Live audio must reach the backend with
+      // the same prosody the upload path sees.
       stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           sampleRate: 16000,
           channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
         },
         video: false,
       })
@@ -162,8 +167,8 @@ export default function LiveAnalyzer() {
         setError(data.message || 'Backend error')
         return
       }
-      if (data.type === 'language_warning' && data.detected) {
-        setLanguageWarning({ detected: data.detected })
+      if (data.type === 'language_unsupported' && data.language) {
+        setUnsupportedLanguage(data.language)
         return
       }
       if (data.type === 'session_ended') {
@@ -392,21 +397,22 @@ export default function LiveAnalyzer() {
               so far — we'll redirect you to the report in a moment.
             </div>
           )}
-          {languageWarning && (
+          {unsupportedLanguage && (
             <div
               style={{
-                background: '#3b2f00',
-                border: '1px solid #8a7100',
-                color: '#ffd95a',
-                padding: '10px 14px',
+                background: '#4a1f1f',
+                border: '1px solid #8a3333',
+                color: '#ff9b9b',
+                padding: '12px 14px',
                 borderRadius: 6,
                 marginBottom: 12,
-                fontSize: '0.92em',
+                fontSize: '0.95em',
               }}
             >
-              We detected <strong>{languageDisplayName(languageWarning.detected)}</strong>.
-              {' '}Confidence scoring currently supports English only.
-              Results may be inaccurate.
+              <strong>We detected {languageDisplayName(unsupportedLanguage)}.</strong>{' '}
+              The app currently supports English only. Stop and try
+              again in English — score updates have been paused for
+              this session.
             </div>
           )}
 

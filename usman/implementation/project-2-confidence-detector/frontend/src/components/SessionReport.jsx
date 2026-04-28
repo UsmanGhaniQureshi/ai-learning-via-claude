@@ -69,9 +69,46 @@ export default function SessionReport({
     signal_averages, signal_stderrs, signal_reasons, filler_breakdown,
     total_fillers, acoustic_fillers, pace, insights, action_items,
     timeline, transcript, duration_s, weakest_signal, note, session_id,
-    recording, kind, topic, language_warning,
+    recording, kind, topic,
     signal_baseline_adjusted, user_baseline, baseline_note,
+    insufficient_speech, unsupported_language, status_message,
   } = report
+
+  // Unscoreable-session short-circuit: when the backend couldn't
+  // score this session (silent recording OR non-English speech)
+  // we render a clear explainer card instead of the gauge +
+  // signal bars. The status_message text is set by the backend
+  // and varies by cause ("Not enough speech…" vs "doesn't appear
+  // to be in English…"), so we just render it verbatim.
+  if (insufficient_speech || unsupported_language || avg_score == null) {
+    return (
+      <div className="session-report">
+        <div
+          className="report-section"
+          style={{
+            background: '#1a1a22',
+            border: '1px solid #2a2a35',
+            borderRadius: 8,
+            padding: 24,
+            textAlign: 'center',
+          }}
+        >
+          <h3 style={{ marginTop: 0 }}>We couldn't score this recording</h3>
+          <p style={{ opacity: 0.85, fontSize: '1em', lineHeight: 1.5 }}>
+            {status_message ||
+              "Not enough speech to score. Try recording again and speak for at least a few seconds."}
+          </p>
+          <a
+            href="/live"
+            className="report-btn"
+            style={{ display: 'inline-block', marginTop: 8, textDecoration: 'none' }}
+          >
+            Try again
+          </a>
+        </div>
+      </div>
+    )
+  }
 
   // Analyzer audio has no face signal by definition; live/upload sessions
   // with no face in frame land on a 50-default. For analyzer_audio we can
@@ -125,29 +162,12 @@ export default function SessionReport({
 
       {note && <div className="report-note">{note}</div>}
 
-      {/* Non-English warning banner — speech-derived signals were
-          skipped because the English-trained scorers can't be
-          trusted on this clip. Same yellow styling used on the live
-          session page. */}
-      {language_warning && (
-        <div
-          style={{
-            background: '#3b2f00',
-            border: '1px solid #8a7100',
-            color: '#ffd95a',
-            padding: '10px 14px',
-            borderRadius: 6,
-            marginTop: 12,
-            marginBottom: 12,
-            fontSize: '0.92em',
-          }}
-        >
-          We detected non-English speech (<strong>{language_warning}</strong>).
-          Speech Pace and Filler Words are tuned for English and have
-          been skipped — only Voice Steadiness, Vocal Variety, and
-          face signals (when available) contribute to your score.
-        </div>
-      )}
+      {/* The non-English banner that used to live here is gone —
+          unsupported_language now triggers the unscoreable-session
+          short-circuit at the top of this component (status_message
+          card with Try Again button). The old "warning + keep
+          scoring" UX was misleading; either the input is English
+          and we score, or it isn't and we don't. */}
 
       {showRecording && recordingVideoUrl && (
         <div className="report-section">
@@ -171,7 +191,6 @@ export default function SessionReport({
           stderrs={signal_stderrs}
           reasons={signal_reasons}
           faceUnavailable={faceUnavailable}
-          languageWarning={language_warning}
         />
       </div>
 
@@ -313,12 +332,8 @@ export default function SessionReport({
   )
 }
 
-function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable, languageWarning }) {
+function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
   if (!signals) return null
-  // Speech-derived signals — skipped (set to null by backend) when
-  // the language gate fired because the English-trained scorers can't
-  // be trusted on non-English speech.
-  const SPEECH_KEYS = new Set(['speech_pace', 'filler_words'])
   const items = [
     { key: 'voice_steadiness', label: 'Voice Steadiness', face: false },
     { key: 'eye_contact', label: 'Eye Contact', face: true },
@@ -336,18 +351,13 @@ function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable, language
         const rawValue = signals[key]
         const noData = rawValue === null || rawValue === undefined
         const faceMissing = face && faceUnavailable
-        const langSkipped = languageWarning && SPEECH_KEYS.has(key)
-        const hide = noData || faceMissing || langSkipped
+        const hide = noData || faceMissing
         const value = noData ? 0 : Number(rawValue)
         const raw = stderrs?.[key]
         const se = typeof raw === 'number' ? Math.round(raw) : null
         const reason = reasons?.[key]
-        // Pick the right "why is this N/A" caption in priority order
-        // — the user only needs the most specific reason.
         let unavailableNote = null
-        if (langSkipped) {
-          unavailableNote = 'Non-English speech — English-trained scorer skipped.'
-        } else if (faceMissing) {
+        if (faceMissing) {
           unavailableNote = 'No face data available for this recording.'
         } else if (noData) {
           unavailableNote = 'No data available for this signal.'

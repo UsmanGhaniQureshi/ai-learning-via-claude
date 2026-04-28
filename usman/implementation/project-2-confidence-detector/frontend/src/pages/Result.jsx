@@ -195,20 +195,6 @@ export default function Result() {
 
   return (
     <div className="section">
-      {data.language_warning && (
-        <div
-          className="session-error"
-          style={{
-            background: '#3b2f00',
-            border: '1px solid #8a7100',
-            color: '#ffd95a',
-            marginBottom: 16,
-          }}
-        >
-          <strong>Language warning:</strong> {data.language_warning}
-        </div>
-      )}
-
       {!isOwner && data.shared_by && (
         <div
           style={{
@@ -334,6 +320,43 @@ function UploadResult({
     return 'Low Confidence'
   }
 
+  // Insufficient-speech short-circuit: when the upload pipeline
+  // bailed (silent recording etc.) avg_score is null and the report
+  // carries either `insufficient_speech` or `unsupported_language`,
+  // along with a human-readable `status_message`. Render the
+  // explainer card instead of trying to draw the full result layout.
+  // Same pattern as SessionReport's short-circuit.
+  if (data.insufficient_speech || data.unsupported_language || data.overall_confidence == null) {
+    return (
+      <div className="section">
+        <div className="results">
+          <div
+            style={{
+              background: '#1a1a22',
+              border: '1px solid #2a2a35',
+              borderRadius: 8,
+              padding: 24,
+              textAlign: 'center',
+            }}
+          >
+            <h3 style={{ marginTop: 0 }}>We couldn't score this recording</h3>
+            <p style={{ opacity: 0.85, fontSize: '1em', lineHeight: 1.5 }}>
+              {data.status_message ||
+                "Not enough speech to score. Try recording again and speak for at least a few seconds."}
+            </p>
+            <Link
+              to="/upload"
+              className="report-btn"
+              style={{ display: 'inline-block', marginTop: 8 }}
+            >
+              Upload another recording
+            </Link>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="section">
       <div className="results">
@@ -367,25 +390,6 @@ function UploadResult({
             No face was detected in this video. Face-based scores
             (eye contact, expression) are marked unavailable and
             were excluded from the headline score.
-          </div>
-        )}
-        {data.language_warning && (
-          <div
-            style={{
-              background: '#3b2f00',
-              border: '1px solid #8a7100',
-              color: '#ffd95a',
-              padding: '10px 14px',
-              borderRadius: 6,
-              marginTop: 10,
-              marginBottom: 10,
-              fontSize: '0.92em',
-            }}
-          >
-            We detected non-English speech (<strong>{data.language_warning}</strong>).
-            Speech Pace and Filler Words are tuned for English and have
-            been skipped — only Voice Steadiness, Vocal Variety, and
-            face signals (when available) contribute to your score.
           </div>
         )}
         {data.multi_face_warning && (
@@ -427,7 +431,6 @@ function UploadResult({
           <SignalBars
             scores={data.sub_scores}
             faceUnavailable={!!data.no_face_detected}
-            languageWarning={data.language_warning}
           />
         )}
 

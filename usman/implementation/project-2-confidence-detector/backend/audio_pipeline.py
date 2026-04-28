@@ -11,8 +11,10 @@ from collections import deque
 # ── Lazy-loaded models (singleton pattern, thread-safe) ─────────────
 _vad_model = None
 _whisper_model = None
+_lang_detector_model = None
 _vad_lock = threading.Lock()
 _whisper_lock = threading.Lock()
+_lang_detector_lock = threading.Lock()
 
 
 def get_vad():
@@ -95,6 +97,50 @@ def get_whisper():
         )
         print(f"[Whisper] Model ready.")
     return _whisper_model
+
+
+def get_language_detector():
+    """Load the tiny MULTILINGUAL whisper model used only for
+    language detection.
+
+    The production transcription model is `distil-small.en` — fast,
+    English-only, no language detection head. To honestly enforce the
+    English-only product decision we need a separate, multilingual
+    model. `tiny` is ~75 MB on disk, runs ~100ms on CPU, and only
+    fires once per session (on the first voiced chunk). It is NEVER
+    used for transcription — that stays on the .en model.
+
+    Override the model size with `WHISPER_LANG_DETECTOR_MODEL` if you
+    want a smaller / different multilingual model. `tiny` is a good
+    default for accuracy/cost; smaller multilingual models don't
+    really exist in faster-whisper.
+    """
+    global _lang_detector_model
+    if _lang_detector_model is not None:
+        return _lang_detector_model
+    with _lang_detector_lock:
+        if _lang_detector_model is not None:
+            return _lang_detector_model
+        from faster_whisper import WhisperModel
+        import os
+
+        model_size = os.environ.get("WHISPER_LANG_DETECTOR_MODEL", "tiny")
+        device = os.environ.get("WHISPER_DEVICE", "auto")
+        if device == "auto":
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                device = "cpu"
+        # Always int8 for the detector — accuracy doesn't matter much
+        # for language ID, latency does.
+        compute_type = "int8" if device == "cpu" else "float16"
+        print(f"[LangDetect] Loading {model_size} on {device} ({compute_type})...")
+        _lang_detector_model = WhisperModel(
+            model_size, device=device, compute_type=compute_type, num_workers=1,
+        )
+        print(f"[LangDetect] Model ready.")
+    return _lang_detector_model
 
 
 # ── Lexical fillers (detected from transcript) ──────────────────────
@@ -434,6 +480,15 @@ class AudioPipeline:
         self.total_acoustic_fillers = []
         self.start_time = time.time()
 
+        # English-only product gate. We probe the FIRST voiced chunk of
+        # each session with the multilingual `tiny` whisper model. If
+        # the result is non-English with confidence > 0.6, every
+        # subsequent chunk emits `unsupported_language` so callers can
+        # short-circuit scoring. The probe runs at most once per
+        # session (instance-level cache) to keep CPU cost down.
+        self._language_probed = False
+        self._unsupported_language = None  # None = English (or not yet probed)
+
     def process_chunk(self, audio, sr=16000):
         """
         Process a single 3-second audio chunk.
@@ -475,6 +530,29 @@ class AudioPipeline:
         low_confidence = False
         rms_energy = features['rms']
         has_meaningful_speech = voiced_s >= 0.8 and rms_energy > 0.012
+
+        # English-only language gate (Batch 2). Run the multilingual
+        # detector ONCE per session on the first chunk that has real
+        # speech. The production transcription model is .en (no
+        # detection head), so we route through `tiny` multilingual
+        # just for this probe. If non-English with confidence > 0.6,
+        # mark the session unsupported and every downstream caller
+        # bails out (WS stops broadcasting scores, upload + analyzer
+        # short-circuit at finalize).
+        if not self._language_probed and has_meaningful_speech:
+            try:
+                detector = get_language_detector()
+                lang, prob, _all = detector.detect_language(audio)
+                if lang and lang != "en" and float(prob or 0.0) > 0.6:
+                    self._unsupported_language = lang
+            except Exception as e:
+                # Detector failure shouldn't kill the session — log and
+                # carry on as if English. The transcript will still be
+                # garbage if it's actually non-English, but that's no
+                # worse than the pre-Batch-2 status quo.
+                print(f"[LangDetect] probe failed: {e}")
+            self._language_probed = True
+
         if has_meaningful_speech:
             try:
                 result = transcribe_chunk(audio, sr)
@@ -527,14 +605,22 @@ class AudioPipeline:
             silence_pen = SignalScorer.silence_penalty(vad_segments, chunk_duration_ms=3000)
             pace_score = max(0, pace_score - silence_pen)
 
+        # Pass voiced_s through to every audio-derived scorer so a
+        # silent chunk yields None (no measurement), not a fake
+        # number. The aggregate() then renormalizes the remaining
+        # weights — and on a fully silent chunk every audio signal
+        # is None, so total is None too. This is the single biggest
+        # accuracy fix for the "silent user scores 70+" failure.
         scores = {
-            "voice_steadiness": SignalScorer.voice_steadiness(pitch, rms_std),
+            "voice_steadiness": SignalScorer.voice_steadiness(pitch, rms_std, voiced_s=voiced_s),
             "speech_pace": pace_score,
             "filler_words": SignalScorer.filler_words(
                 len(lexical_fillers), len(acoustic_fillers), voiced_s
             ),
-            "vocal_variety": SignalScorer.vocal_variety(pitch),
-            # eye_contact and expression filled by caller (face engine or default 50)
+            "vocal_variety": SignalScorer.vocal_variety(pitch, voiced_s=voiced_s),
+            # eye_contact and expression filled by caller (face engine
+            # or, when no face data, left as None — see SignalScorer.aggregate
+            # which now renormalizes around any None signals).
             "eye_contact": 50,
             "expression": 50,
         }
@@ -546,13 +632,20 @@ class AudioPipeline:
             "transcript_words": words,
             "transcript_text": " ".join(w['word'] for w in words),
             "chunk_index": self.chunk_count,
-            # Top-level language signals so callers (WebSocket handler,
-            # report generator) don't have to dig into `raw`. Same
-            # values that already lived under raw["language"] /
-            # raw["language_probability"] — just surfaced where the
-            # downstream consumer is looking.
+            # `detected_language` from Whisper is always "en" because
+            # the production transcription model is .en — it doesn't
+            # actually detect. The honest answer comes from
+            # `unsupported_language` below, which is set by the
+            # multilingual probe in process_chunk.
             "detected_language": language,
             "language_confidence": language_probability,
+            # English-only product gate. None means "looked English (or
+            # not yet probed)"; a string is the detected non-English
+            # language code (e.g. "hi", "es", "ar"). Once set on an
+            # AudioPipeline instance, it stays set for every
+            # subsequent chunk so callers can short-circuit at any
+            # point in the session.
+            "unsupported_language": self._unsupported_language,
         }
 
     def reset(self):
@@ -562,3 +655,5 @@ class AudioPipeline:
         self.total_words = []
         self.total_acoustic_fillers = []
         self.start_time = time.time()
+        self._language_probed = False
+        self._unsupported_language = None

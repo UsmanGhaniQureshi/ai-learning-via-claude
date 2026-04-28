@@ -72,6 +72,20 @@ def _grade_for(score: int) -> str:
     return "F"
 
 
+# Same mapping ScoringEngine uses for the headline expression score.
+# Live FaceEngine returns a label ("happy", "speaking", etc.); the
+# WS handler turns it into the 0-100 score the audio-side aggregator
+# expects. Kept centralised so changes to the mapping don't drift.
+_EXPRESSION_TO_SCORE = {
+    'happy': 90, 'speaking': 80, 'focused': 70, 'neutral': 60,
+    'calibrating': 50, 'surprised': 40, 'sad': 30, 'angry': 20,
+}
+
+
+def _expression_label_to_score(label: str | None) -> int:
+    return _EXPRESSION_TO_SCORE.get(label or 'neutral', 50)
+
+
 def _fetch_user_baseline(
     user_id: str,
     exclude_media_id: str | None = None,
@@ -177,7 +191,17 @@ def _persist_media_and_segments(
     the main response while Phase 2 is still dual-writing alongside the
     JSON files.
     """
-    grade = _grade_for(score_avg) if score_avg is not None else None
+    # Same unscoreable-session handling as
+    # `_complete_media_processing`. Covers both insufficient_speech
+    # (silent recording) and unsupported_language (non-English) —
+    # the row is persisted as 'failed' so the user sees WHY in their
+    # library, with the report's status_message as the error text.
+    rj = report_json or {}
+    unscoreable = bool(rj.get("insufficient_speech") or rj.get("unsupported_language"))
+    final_status = "failed" if unscoreable else "completed"
+    final_error = rj.get("status_message") if unscoreable else None
+    final_score = None if unscoreable else score_avg
+    final_grade = _grade_for(final_score) if final_score is not None else None
 
     with SessionLocal() as db:
         media = Media(
@@ -190,10 +214,12 @@ def _persist_media_and_segments(
             duration_s=duration_s,
             has_video=has_video,
             has_audio=has_audio,
-            score_avg=score_avg,
-            score_grade=grade,
+            score_avg=final_score,
+            score_grade=final_grade,
             report_json=report_json,
             content_sha256=content_sha256,
+            processing_status=final_status,
+            processing_error=final_error,
             # Default title — caller decides what makes sense (filename
             # stem for uploads, "Recording <ts> - Video/Audio" for
             # live captures). Trimmed + length-capped to match the
@@ -327,7 +353,20 @@ def _complete_media_processing(
     Any exception here propagates to the BackgroundTask wrapper which
     catches it and flips status='failed' with the error string.
     """
-    grade = _grade_for(score_avg) if score_avg is not None else None
+    # When the report tells us the session was unscoreable (silent
+    # speaker or non-English) we still persist the row — the user
+    # needs to see WHY their recording failed in their library — but
+    # we mark it 'failed' so the polling client surfaces the error
+    # instead of navigating to a fake report. report_json carries
+    # the human-readable status_message used as the error text.
+    # Score and grade are forced to None so the Library list doesn't
+    # show a gauge for a row that wasn't actually scored.
+    rj = report_json or {}
+    unscoreable = bool(rj.get("insufficient_speech") or rj.get("unsupported_language"))
+    final_status = "failed" if unscoreable else "completed"
+    final_error = rj.get("status_message") if unscoreable else None
+    final_score = None if unscoreable else score_avg
+    final_grade = _grade_for(final_score) if final_score is not None else None
     with SessionLocal() as db:
         m = db.get(Media, media_id)
         if m is None:
@@ -336,11 +375,11 @@ def _complete_media_processing(
         m.duration_s = duration_s
         m.has_video = has_video
         m.has_audio = has_audio
-        m.score_avg = score_avg
-        m.score_grade = grade
+        m.score_avg = final_score
+        m.score_grade = final_grade
         m.report_json = report_json
-        m.processing_status = "completed"
-        m.processing_error = None
+        m.processing_status = final_status
+        m.processing_error = final_error
 
         segments: list[MediaSegment] = []
         for entry in face_timeline or []:
@@ -1272,12 +1311,18 @@ def _run_upload_pipeline_sync(
                     if words_in_text[i] == words_in_text[i - 1]
                 )
 
+                # Filter out None (silent chunks where voice_steadiness
+                # legitimately wasn't measured). The previous default of
+                # 50 silently averaged silence as "neutral steadiness"
+                # and inflated the headline on silent uploads.
                 steadiness_vals = [
-                    s["scores"].get("voice_steadiness", 50) for s in snapshots
+                    s["scores"].get("voice_steadiness")
+                    for s in snapshots
+                    if s["scores"].get("voice_steadiness") is not None
                 ]
                 voice_steadiness = (
                     int(sum(steadiness_vals) / len(steadiness_vals))
-                    if steadiness_vals else 50
+                    if steadiness_vals else None
                 )
 
                 # Pitch std drives vocal_variety in scoring_engine — without it
@@ -1499,27 +1544,95 @@ def _run_upload_pipeline_sync(
                 'pitch_std': speech_summary.get('pitch_std', 0),
             }
 
-        # ── Language gate (Fix 5). Mirrors the live WS path: inspect
-        # the first 2 chunks' detected_language; if both come back as
-        # non-English with high confidence, mark the report and zero
-        # out the speech-derived signals so they show as N/A in the
-        # breakdown rather than producing nonsense English-trained
-        # numbers (filler_words=100 because no English fillers were
-        # found, etc).
-        language_warning = None
-        if snapshots:
-            lang_chunks_seen = 0
-            lang_non_en = 0
-            non_en_code = None
-            for s in snapshots[:2]:
-                lang = s.get("detected_language") or "en"
-                conf = float(s.get("language_confidence") or 0.0)
-                lang_chunks_seen += 1
-                if lang != "en" and conf > 0.6:
-                    lang_non_en += 1
-                    non_en_code = lang
-            if lang_chunks_seen >= 2 and lang_non_en >= 2:
-                language_warning = non_en_code or "unknown"
+        # English-only enforcement (Batch 2). AudioPipeline runs the
+        # multilingual probe on the first voiced chunk and sets
+        # `unsupported_language` on every result. Take the first
+        # non-None — they're all the same value (set once per
+        # session). Same shape as report_generator's gate so the
+        # short-circuit logic below stays consistent across paths.
+        unsupported_lang = next(
+            (s.get("unsupported_language") for s in snapshots
+             if s.get("unsupported_language")),
+            None,
+        )
+        if unsupported_lang:
+            unsupported_payload = {
+                'media_id': upload_id,
+                'filename': original_name,
+                'duration': round(duration, 1),
+                'has_audio': has_audio,
+                'no_face_detected': len(all_face_scores) == 0,
+                'unsupported_language': unsupported_lang,
+                'avg_score': None,
+                'overall_confidence': None,
+                'sub_scores': None,
+                'status_message': (
+                    "This recording doesn't appear to be in English. "
+                    "The app currently supports English only — please "
+                    "try again speaking in English."
+                ),
+                'recording': {
+                    'media_id': upload_id,
+                    'video_url': sign_media_url(
+                        f"/api/video/{video_serve}", user_id,
+                    ),
+                },
+            }
+            _complete_media_processing(
+                media_id=upload_id,
+                playback_path=video_serve,
+                duration_s=float(duration),
+                has_video=len(all_face_scores) > 0,
+                has_audio=has_audio,
+                score_avg=None,
+                face_timeline=face_results_by_time,
+                speech_timeline=[],
+                report_json=unsupported_payload,
+            )
+            return
+
+        # Session-level "did anything happen?" gate. Mirrors the same
+        # check in report_generator.py for the WS / analyzer paths.
+        # If the user uploaded a recording with effectively no speech
+        # (silent room, mic muted, music-only clip), short-circuit
+        # the rest of the pipeline and persist as 'failed' instead of
+        # producing a fake high score.
+        INSUFFICIENT_SPEECH_THRESHOLD_S = 3.0
+        upload_voiced_s = sum(s["raw"].get("voiced_s", 0) for s in snapshots)
+        if upload_voiced_s < INSUFFICIENT_SPEECH_THRESHOLD_S:
+            insufficient_payload = {
+                'media_id': upload_id,
+                'filename': original_name,
+                'duration': round(duration, 1),
+                'has_audio': has_audio,
+                'no_face_detected': len(all_face_scores) == 0,
+                'insufficient_speech': True,
+                'avg_score': None,
+                'overall_confidence': None,
+                'sub_scores': None,
+                'status_message': (
+                    "Not enough speech to score. Try recording again "
+                    "and speak for at least a few seconds."
+                ),
+                'recording': {
+                    'media_id': upload_id,
+                    'video_url': sign_media_url(
+                        f"/api/video/{video_serve}", user_id,
+                    ),
+                },
+            }
+            _complete_media_processing(
+                media_id=upload_id,
+                playback_path=video_serve,
+                duration_s=float(duration),
+                has_video=len(all_face_scores) > 0,
+                has_audio=has_audio,
+                score_avg=None,
+                face_timeline=face_results_by_time,
+                speech_timeline=[],
+                report_json=insufficient_payload,
+            )
+            return
 
         # Compute sub-scores via scoring engine. Missing inputs return
         # None now (not 50) — see scoring_engine.compute_sub_scores
@@ -1537,13 +1650,9 @@ def _run_upload_pipeline_sync(
             sub_scores['eye_contact'] = None
             sub_scores['expression'] = None
 
-        # Fix 5: when language gate fires, the speech-derived signals
-        # are unreliable (the English-trained scorers can't be trusted
-        # on Spanish/Hindi/etc) — N/A them so the headline reflects
-        # only voice_steadiness + vocal_variety + face signals.
-        if language_warning:
-            sub_scores['speech_pace'] = None
-            sub_scores['filler_words'] = None
+        # Note: the unsupported-language case is already handled by
+        # the short-circuit above this block — if we got here, the
+        # input was English and we proceed to score normally.
 
         final_scores = upload_scoring.update(sub_scores)
         overall_score = final_scores['total']
@@ -1646,11 +1755,6 @@ def _run_upload_pipeline_sync(
             'has_audio': has_audio,
             'no_face_detected': len(all_face_scores) == 0,
             'multi_face_warning': multi_face_warning,
-            # When set, the frontend renders a yellow banner explaining
-            # that English-trained scorers were skipped for this clip.
-            # `language_warning` mirrors the field already produced by
-            # the live WS path (handled by useLiveSession.js).
-            'language_warning': language_warning,
             'audio_extraction_error': audio_extraction_error,
             'video_encode_error': video_encode_error,
             'processed_video': video_serve,
@@ -1897,20 +2001,35 @@ async def session_ws(ws: WebSocket, session_id: str):
         kind = "session"
 
     pipeline = AudioPipeline()
+    # Per-session FaceEngine instance — used to score landmarks the
+    # browser sends over WS. `load_mp_models=False` because the
+    # browser already extracted the landmarks; we just want the
+    # baseline-aware scoring (calibration, blink rate, expression
+    # deviation, eye-contact threshold) without paying the ~80 MB +
+    # ~1.5 s cost of loading the Python MediaPipe models. Audio-only
+    # analyzer sessions still create one but it's never called —
+    # cheap enough to leave for symmetry.
+    from face_engine import FaceEngine as _FaceEngine
+    live_face_engine = _FaceEngine(load_mp_models=False)
+    # One-shot calibration-state announcements to the client so the
+    # UI can render a "Calibrating…" badge during the first ~13 s
+    # (90 frames at 6.7 Hz) and clear it when calibration finishes.
+    _calibration_announced = False
+    _calibration_done_announced = False
     snapshots = []
     latest_browser_face = {}  # Face scores from browser MediaPipe
     client_requested_stop = False
     _finalized = False  # Guard against double-finalize races.
-    # Language-warning gate: if the FIRST 2 chunks both detect a
-    # non-English language with confidence > 0.6, send a one-shot
-    # `language_warning` JSON message to the client. Doesn't block
-    # the session — scoring continues, the UI shows a banner.
-    # (When WHISPER_AUTODETECT is off or the model is `.en`, the
-    # detected language is always "en" so this gate never fires.)
-    _lang_chunks_seen = 0
-    _lang_non_en_count = 0
-    _lang_non_en_code: str | None = None
-    _lang_warning_sent = False
+    # English-only product gate. AudioPipeline probes the first
+    # voiced chunk with a multilingual detector and emits
+    # `unsupported_language` on every result thereafter. When that
+    # fires we send ONE `language_unsupported` message to the client
+    # (so the UI can show a banner + tell the user to stop) and
+    # STOP broadcasting per-chunk score updates — scoring continues
+    # only for the finalize-time persistence so the user sees WHY
+    # in their library, but we don't stream meaningless numbers.
+    _unsupported_language: str | None = None
+    _unsupported_message_sent = False
 
     async def finalize_and_send_report():
         """Generate report and send via WebSocket while still open.
@@ -1939,31 +2058,20 @@ async def session_ws(ws: WebSocket, session_id: str):
                     f"/api/recordings/{session_id}/video", ws_user_id,
                 ),
             }
-        # If the language gate fired during the session (warning was
-        # already pushed via WS in real time), zero out the speech
-        # signals on every snapshot before report generation so the
-        # session aggregator skips them rather than producing
-        # nonsense English-trained numbers. Same as the upload +
-        # analyzer paths.
-        if _lang_warning_sent:
-            for s in snapshots:
-                s["scores"]["speech_pace"] = None
-                s["scores"]["filler_words"] = None
-                s["scores"]["total"] = SignalScorer.aggregate(s["scores"])
-
         # Per-user baseline. exclude_media_id is THIS session — never
         # include a row in its own baseline (would bias toward "you're
         # exactly average" since the new row hasn't been written yet
         # anyway, but cheap belt-and-braces).
+        # NB: report_generator now short-circuits on
+        # `unsupported_language` (set by the audio_pipeline probe and
+        # carried on every snapshot) — the report comes back with
+        # avg_score=None + status_message and the persistence helper
+        # marks the row as 'failed'.
         user_baseline = _fetch_user_baseline(ws_user_id, exclude_media_id=session_id)
         report = generate_post_session_report(
             snapshots, session_id, user_baseline=user_baseline,
         )
         report["recording"] = recording_info
-        # Persist the language warning so re-opening the saved report
-        # still surfaces the banner — the WS-time push is one-shot.
-        if _lang_warning_sent and _lang_non_en_code:
-            report["language_warning"] = _lang_non_en_code
         # Phase 2: report JSON is now stored inside Media.report_json via
         # _persist_media_and_segments below. No on-disk {session_id}_report.json.
 
@@ -2064,6 +2172,70 @@ async def session_ws(ws: WebSocket, session_id: str):
         except Exception:
             pass
 
+    # Bounded producer/consumer: WS receives queue audio chunks; a
+    # separate worker pulls and processes them. When the queue is
+    # full (Whisper inference falling behind on a slow CPU) the
+    # producer drops the OLDEST chunk and notifies the client with
+    # a `{"type":"backpressure"}` message so the UI can flash
+    # "Server catching up...". Without this the WS receive loop
+    # blocked on every process_chunk and chunks piled up in the OS
+    # TCP buffer with no flow-control feedback.
+    audio_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+
+    async def _process_one_chunk(audio):
+        """Consumer body — runs the audio pipeline on one chunk and
+        broadcasts the result to the client (unless suppressed by
+        the language gate)."""
+        nonlocal _unsupported_language, _unsupported_message_sent
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, pipeline.process_chunk, audio
+        )
+        if latest_browser_face:
+            result["scores"]["eye_contact"] = latest_browser_face.get("eye_contact", 50)
+            result["scores"]["expression"] = latest_browser_face.get("expression", 50)
+            result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
+
+        # English-only enforcement (Batch 2). See top of session_ws
+        # for the rationale; here we just react to the field set by
+        # AudioPipeline's multilingual probe.
+        detected_unsupported = result.get("unsupported_language")
+        if detected_unsupported and not _unsupported_language:
+            _unsupported_language = detected_unsupported
+        if _unsupported_language and not _unsupported_message_sent:
+            _unsupported_message_sent = True
+            try:
+                await ws.send_json({
+                    "type": "language_unsupported",
+                    "language": _unsupported_language,
+                })
+            except Exception:
+                pass
+
+        snapshots.append(result)
+        # Suppress live score broadcasts once the language gate fires
+        # — per-chunk numbers from English-trained scorers running on
+        # non-English audio would be misleading. The persisted report
+        # still records every snapshot.
+        if not _unsupported_language:
+            try:
+                await ws.send_json(result)
+            except Exception:
+                pass
+
+    async def _audio_consumer():
+        while True:
+            audio = await audio_queue.get()
+            try:
+                if audio is None:
+                    return                       # sentinel — drain & exit
+                await _process_one_chunk(audio)
+            except Exception:
+                log.exception("ws.consumer_error")
+            finally:
+                audio_queue.task_done()
+
+    consumer_task = asyncio.create_task(_audio_consumer())
+
     try:
         while True:
             message = await ws.receive()
@@ -2071,53 +2243,100 @@ async def session_ws(ws: WebSocket, session_id: str):
                 break
 
             if message.get('bytes') is not None:
-                # Binary audio chunk (Float32 PCM, ~3s at 16kHz)
                 audio = np.frombuffer(message['bytes'], dtype=np.float32)
-
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, pipeline.process_chunk, audio
-                )
-
-                if latest_browser_face:
-                    result["scores"]["eye_contact"] = latest_browser_face.get("eye_contact", 50)
-                    result["scores"]["expression"] = latest_browser_face.get("expression", 50)
-                    result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
-
-                # Language-warning gate. Inspect the first 2 chunks
-                # only; if both come back as non-English with high
-                # confidence, send a single-shot warning. We track
-                # ALL chunks (not just voiced ones) — a 30-s session
-                # of mostly silence still has 2 chunks, and we'd
-                # rather warn early than wait.
-                if not _lang_warning_sent and _lang_chunks_seen < 2:
-                    lang = result.get("detected_language") or "en"
-                    conf = float(result.get("language_confidence") or 0.0)
-                    _lang_chunks_seen += 1
-                    if lang != "en" and conf > 0.6:
-                        _lang_non_en_count += 1
-                        _lang_non_en_code = lang
-                    if _lang_chunks_seen >= 2 and _lang_non_en_count >= 2:
-                        _lang_warning_sent = True
-                        try:
-                            await ws.send_json({
-                                "type": "language_warning",
-                                "detected": _lang_non_en_code or "unknown",
-                            })
-                        except Exception:
-                            # Don't let a transient WS error break the
-                            # main scoring path.
-                            pass
-
-                snapshots.append(result)
-                await ws.send_json(result)
+                if audio_queue.full():
+                    # Drop the oldest unprocessed chunk and warn the
+                    # client. Better to lose 3 s of audio than block
+                    # the receive loop and have the kernel silently
+                    # drop chunks at the TCP layer.
+                    try:
+                        audio_queue.get_nowait()
+                        audio_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                    try:
+                        await ws.send_json({"type": "backpressure"})
+                    except Exception:
+                        pass
+                await audio_queue.put(audio)
 
             elif message.get('text') is not None:
                 try:
                     data = json.loads(message['text'])
                     if data.get('type') == 'face':
-                        latest_browser_face = data.get('scores', {})
+                        # Two payload shapes accepted:
+                        #
+                        # 1. New (Batch 4) — browser sent raw MediaPipe
+                        #    output. We run the canonical FaceEngine on
+                        #    the landmarks so live + upload paths use
+                        #    the SAME baseline-aware scoring (same
+                        #    expression mapping, same per-user eye-
+                        #    contact threshold, same blink rate, same
+                        #    tension model). Pose isn't sent so
+                        #    posture / fidget / hand_position come back
+                        #    as engine defaults — known follow-up.
+                        #
+                        # 2. Legacy — browser already-derived 4 fields.
+                        #    Falls through to `latest_browser_face` as
+                        #    before. Kept for back-compat with any tab
+                        #    that hasn't refreshed since the deploy.
+                        landmarks = data.get('landmarks')
+                        blendshapes = data.get('blendshapes')
+                        if landmarks and blendshapes:
+                            try:
+                                fe_result = live_face_engine.process_landmarks_from_browser(
+                                    landmarks, blendshapes,
+                                    timestamp=data.get('timestamp', 0.0),
+                                )
+                            except Exception:
+                                fe_result = None
+                            if fe_result:
+                                latest_browser_face = {
+                                    'eye_contact': fe_result.get('eye_contact_pct', 50),
+                                    'expression': _expression_label_to_score(
+                                        fe_result.get('expression', 'neutral')
+                                    ),
+                                    'tension': fe_result.get('tension_score', 50),
+                                    'face_detected': True,
+                                    # New full-engine fields the audio
+                                    # pipeline doesn't currently use but
+                                    # downstream consumers can read.
+                                    'expression_label': fe_result.get('expression'),
+                                    'blink_rate': fe_result.get('blink_rate'),
+                                    'calibrating': fe_result.get('expression') == 'calibrating',
+                                }
+                                # Surface calibration state to the UI
+                                # one time per session so a "Calibrating…"
+                                # badge can show during the first ~13 s
+                                # of live recording (90 frames at 6.7 Hz).
+                                if (
+                                    latest_browser_face['calibrating']
+                                    and not _calibration_announced
+                                ):
+                                    _calibration_announced = True
+                                    try:
+                                        await ws.send_json({"type": "calibrating"})
+                                    except Exception:
+                                        pass
+                                if (
+                                    not latest_browser_face['calibrating']
+                                    and _calibration_announced
+                                    and not _calibration_done_announced
+                                ):
+                                    _calibration_done_announced = True
+                                    try:
+                                        await ws.send_json({"type": "calibrated"})
+                                    except Exception:
+                                        pass
+                        else:
+                            # Legacy 4-field path
+                            latest_browser_face = data.get('scores', {})
                     elif data.get('type') == 'stop_session':
-                        # Client explicitly requested stop — finalize NOW while WS is still open
+                        # Drain the queue before finalize so every
+                        # chunk the user spoke is in `snapshots`
+                        # before the report runs.
+                        await audio_queue.put(None)
+                        await consumer_task
                         await finalize_and_send_report()
                         client_requested_stop = True
                         break
@@ -2129,6 +2348,18 @@ async def session_ws(ws: WebSocket, session_id: str):
     except Exception:
         pass
     finally:
+        # Drain the consumer if it didn't already exit. Multiple
+        # signals + done-state checks because the disconnect path
+        # may have raced with the stop_session path.
+        if not consumer_task.done():
+            try:
+                await audio_queue.put(None)
+            except Exception:
+                consumer_task.cancel()
+            try:
+                await asyncio.wait_for(consumer_task, timeout=15)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                consumer_task.cancel()
         # Fallback: if client just closed WS without sending stop_session,
         # still generate + save the report (it will be retrievable via HTTP)
         if not client_requested_stop:
@@ -2346,31 +2577,14 @@ def _run_analyzer_pipeline_sync(
             _set_media_status(media_id, "failed", error=decode_error)
             return
 
-        # Language gate (Fix 5). Same logic as the upload + WS paths:
-        # if both of the first 2 chunks come back as non-English with
-        # high confidence, mark the report so the frontend can warn,
-        # and zero out the speech-derived signals on each snapshot so
-        # the session aggregator skips them rather than producing
-        # nonsense English-trained numbers.
-        language_warning = None
-        if snapshots:
-            lang_chunks_seen = 0
-            lang_non_en = 0
-            non_en_code = None
-            for s in snapshots[:2]:
-                lang = s.get("detected_language") or "en"
-                conf = float(s.get("language_confidence") or 0.0)
-                lang_chunks_seen += 1
-                if lang != "en" and conf > 0.6:
-                    lang_non_en += 1
-                    non_en_code = lang
-            if lang_chunks_seen >= 2 and lang_non_en >= 2:
-                language_warning = non_en_code or "unknown"
-        if language_warning:
-            for s in snapshots:
-                s["scores"]["speech_pace"] = None
-                s["scores"]["filler_words"] = None
-                s["scores"]["total"] = SignalScorer.aggregate(s["scores"])
+        # English-only enforcement is centralised in
+        # report_generator (Batch 2). It checks each snapshot's
+        # `unsupported_language` field — set by the audio_pipeline's
+        # multilingual probe on the first voiced chunk — and
+        # short-circuits the whole report if any chunk reports a
+        # non-English language. Same gate logic as the upload + WS
+        # paths use, just enforced inside the report generator now
+        # rather than duplicated per caller.
 
         # Per-user baseline (last 5 finished sessions). See main.py:_fetch_user_baseline.
         user_baseline = _fetch_user_baseline(user_id, exclude_media_id=media_id)
@@ -2381,8 +2595,6 @@ def _run_analyzer_pipeline_sync(
         report["source"] = "file_upload"
         report["filename"] = original_filename
         report["note"] = "Eye contact and expression scores not available for audio-only files."
-        if language_warning:
-            report["language_warning"] = language_warning
         report["recording"] = {
             "media_id": media_id,
             "audio_url": sign_media_url(

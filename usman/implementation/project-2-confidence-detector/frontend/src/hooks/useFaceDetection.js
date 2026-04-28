@@ -35,6 +35,14 @@ export default function useFaceDetection(videoRef, active) {
   const eyeContactHistoryRef = useRef([])
   const mountedRef = useRef(true)
 
+  // Raw MediaPipe output from the most recent tick — landmarks +
+  // blendshapes. Exposed via the returned object so useLiveSession
+  // can ship them to the backend in face WS messages, where the
+  // canonical FaceEngine reproduces the upload-side baseline-aware
+  // scoring (Batch 4). Held in a ref (not state) because it changes
+  // every 150 ms and we don't want a re-render per tick.
+  const rawFaceRef = useRef({ landmarks: null, blendshapes: null, timestamp: 0 })
+
   useEffect(() => {
     mountedRef.current = true
     return () => {
@@ -175,12 +183,25 @@ export default function useFaceDetection(videoRef, active) {
       if (!hasFace || !hasBlendshapes) {
         // Even with no face, still publish hand_position so the gesture
         // badge keeps working. face-dependent fields fall back to last.
+        rawFaceRef.current = { landmarks: null, blendshapes: null, timestamp: 0 }
         setFaceScores((prev) => ({
           ...prev,
           face_detected: false,
           hand_position: handPosition,
         }))
         return
+      }
+
+      // Stash the RAW MediaPipe output for the WS to ship to the
+      // backend. The map flattens MediaPipe's `categories` array into
+      // [{categoryName, score}, ...] so the wire shape matches the
+      // backend's _BlendshapeShim. Landmarks already have {x, y, z}.
+      rawFaceRef.current = {
+        landmarks: faceResult.faceLandmarks[0].map(p => ({ x: p.x, y: p.y, z: p.z })),
+        blendshapes: faceResult.faceBlendshapes[0].categories.map(
+          c => ({ categoryName: c.categoryName, score: c.score })
+        ),
+        timestamp: performance.now() / 1000,
       }
 
       // Build blendshape lookup
@@ -269,8 +290,15 @@ export default function useFaceDetection(videoRef, active) {
         poseLmRef.current = null
       }
       eyeContactHistoryRef.current = []
+      rawFaceRef.current = { landmarks: null, blendshapes: null, timestamp: 0 }
     }
   }, [active, videoRef])
 
+  // Returning the raw ref alongside the smoothed-state object lets
+  // the parent ship raw landmarks to the backend WHILE still using
+  // the in-browser derived `faceScores` for snappy local UI bits
+  // (gesture badge, calibration spinner). The two stay in sync —
+  // both update on the same MediaPipe tick.
+  faceScores._rawFaceRef = rawFaceRef
   return faceScores
 }

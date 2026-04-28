@@ -27,23 +27,17 @@ function barColor(val) {
   return '#ff1744'
 }
 
-// Speech-derived signals — skipped (rendered N/A) when the language
-// gate fired because the English-trained scorers can't be trusted.
-const SPEECH_KEYS = new Set(['speechPace', 'fillerWords'])
-
-export default function SignalBars({ scores = {}, faceUnavailable = false, languageWarning = null }) {
+export default function SignalBars({ scores = {}, faceUnavailable = false }) {
   return (
     <div className="signal-bars">
       {SIGNALS.map(({ key, signalDef, label, weight, face }) => {
         const raw = scores[key]
         const noData = raw === null || raw === undefined
         const faceMissing = face && faceUnavailable
-        const langSkipped = languageWarning && SPEECH_KEYS.has(key)
-        const hide = noData || faceMissing || langSkipped
+        const hide = noData || faceMissing
         const value = noData ? 0 : Number(raw)
         let title
-        if (langSkipped) title = 'Non-English speech — English-trained scorer skipped.'
-        else if (faceMissing) title = 'No face detected — this signal is unavailable.'
+        if (faceMissing) title = 'No face detected — this signal is unavailable.'
         else if (noData) title = 'No data available for this signal.'
         return (
           <div key={key} className="signal-row">

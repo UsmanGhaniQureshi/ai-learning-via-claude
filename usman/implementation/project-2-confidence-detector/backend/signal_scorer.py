@@ -21,10 +21,17 @@ class SignalScorer:
         return round(min(100, float(np.average(gaze_scores, weights=weights))))
 
     @staticmethod
-    def voice_steadiness(pitch, rms_std):
+    def voice_steadiness(pitch, rms_std, voiced_s=None):
         """Score voice steadiness from pitch tremor and volume consistency.
         pitch: dict with tremor_score (0-1).
-        rms_std: standard deviation of RMS energy over time."""
+        rms_std: standard deviation of RMS energy over time.
+        voiced_s: total voiced seconds in the source chunk. When < 0.5
+            we return None (no voice = nothing to score). The old
+            "treat tremor=0 + rms_std=0 as a perfect 100" was the
+            silent-speaker bug — silence was being rewarded.
+        """
+        if voiced_s is not None and voiced_s < 0.5:
+            return None
         tremor_penalty = pitch.get("tremor_score", 0) * 70
         volume_penalty = min(30, (rms_std / 0.06) * 30)
         return max(0, round(100 - tremor_penalty - volume_penalty))
@@ -75,9 +82,19 @@ class SignalScorer:
     @staticmethod
     def filler_words(lexical_count, acoustic_count, voiced_s):
         """Score filler word usage.
+
         lexical_count: fillers found in transcript.
         acoustic_count: filler sounds detected from audio.
-        voiced_s: total voiced seconds."""
+        voiced_s: total voiced seconds.
+
+        Returns None when voiced_s < 0.5 — zero fillers in zero
+        voiced seconds is "no data," not "perfect 100." The old
+        `rate == 0 → 100` shortcut was the silent-speaker bug:
+        a user who said nothing got a perfect filler-words score
+        and the headline came out a grade A.
+        """
+        if voiced_s < 0.5:
+            return None
         rate = ((lexical_count + acoustic_count) / max(voiced_s, 1)) * 60
         if rate == 0:
             return 100
@@ -123,9 +140,16 @@ class SignalScorer:
         return penalty
 
     @staticmethod
-    def vocal_variety(pitch):
+    def vocal_variety(pitch, voiced_s=None):
         """Score vocal variety from pitch standard deviation.
-        Monotone = low score, natural variation = high score, erratic = drops."""
+
+        Monotone = low score, natural variation = high score,
+        erratic = drops. Returns None on a silent chunk
+        (voiced_s < 0.5) so a silent speaker isn't labelled
+        "monotone" (the old behaviour: pitch_std=0 → score 20).
+        """
+        if voiced_s is not None and voiced_s < 0.5:
+            return None
         std = pitch.get("std_hz", 0)
         if std < 5:
             return 20
