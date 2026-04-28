@@ -1,28 +1,5 @@
 import { useEffect, useRef, useMemo, useState } from 'react'
 
-/**
- * TimelineModal — plays a single face-timeline window (e.g. 00:10 → 00:12)
- * and shows the transcript words whose absolute start_ms falls inside
- * that window on the right-hand side.
- *
- * Seek timing (the tricky part):
- *   The modal's <video> may already be fully cached by the browser because
- *   PlaybackReview just played the same URL. In that case React's onLoadedData
- *   can fire BEFORE we attach the listener and we'd miss it. So instead of
- *   relying on an event, this component:
- *     1. checks videoRef.current.readyState on mount — if >= 2, seeks NOW.
- *     2. also attaches `loadeddata` for the cold-cache case.
- *     3. re-attempts in `canplay` as a belt-and-braces fallback.
- *   hasSeekedRef guards against re-seeking when multiple events fire.
- *
- * Props:
- *   videoUrl   absolute URL of the processed video
- *   startTime  seconds where the window begins (entry.timestamp)
- *   duration   seconds — window length (default 2s = face-timeline cadence)
- *   words      flat array of { word, start_ms, end_ms, is_filler } (absolute ms)
- *   expression / score  shown in header
- *   onClose    close callback
- */
 export default function TimelineModal({
   videoUrl,
   startTime,
@@ -37,7 +14,6 @@ export default function TimelineModal({
   const [pausedAtEnd, setPausedAtEnd] = useState(false)
   const endTime = startTime + duration
 
-  // Words that land inside this window
   const wordsInWindow = useMemo(() => {
     const startMs = startTime * 1000
     const endMs = endTime * 1000
@@ -46,7 +22,6 @@ export default function TimelineModal({
     )
   }, [words, startTime, endTime])
 
-  // ESC to close + lock body scroll while open
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose?.() }
     window.addEventListener('keydown', onKey)
@@ -57,8 +32,6 @@ export default function TimelineModal({
     }
   }, [onClose])
 
-  // Seek + play — runs on mount, on prop change, and via multiple events
-  // so a cached video doesn't slip through the cracks.
   useEffect(() => {
     const v = videoRef.current
     if (!v) return
@@ -71,7 +44,7 @@ export default function TimelineModal({
       const safeStart = Math.max(0, Math.min(startTime, Math.max(0, dur - 0.05) || startTime))
       hasSeekedRef.current = true
       v.currentTime = safeStart
-      v.play().catch(() => { /* autoplay policy */ })
+      v.play().catch(() => {})
     }
 
     const onTimeUpdate = () => {
@@ -81,12 +54,10 @@ export default function TimelineModal({
       }
     }
 
-    // Cold path: wait for loadeddata/canplay.
     v.addEventListener('loadeddata', seekAndPlay)
     v.addEventListener('canplay', seekAndPlay)
     v.addEventListener('timeupdate', onTimeUpdate)
 
-    // Warm path: video was cached by PlaybackReview, readyState already high.
     if (v.readyState >= 2) {
       seekAndPlay()
     }
@@ -114,48 +85,64 @@ export default function TimelineModal({
 
   return (
     <div
-      className="tm-backdrop"
+      className="fixed inset-0 z-[100] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-up"
       onClick={onClose}
       role="dialog"
       aria-modal="true"
     >
-      <div className="tm-panel" onClick={(e) => e.stopPropagation()}>
-        <div className="tm-header">
-          <div className="tm-header-info">
+      <div
+        className="glass-card w-full max-w-5xl max-h-[90vh] flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-3 border-b border-border bg-page/60">
+          <div className="flex items-center gap-3 flex-wrap text-text-primary">
             <strong>{fmt(startTime)} – {fmt(endTime)}</strong>
-            {expression && <span className="tm-tag">{expression}</span>}
-            {score != null && <span className="tm-tag tm-tag-score">Score {score}</span>}
+            {expression && <span className="badge badge-muted">{expression}</span>}
+            {score != null && <span className="badge badge-accent">Score {score}</span>}
           </div>
-          <button className="tm-close" onClick={onClose} aria-label="Close">×</button>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="text-text-muted hover:text-text-primary text-2xl leading-none px-2"
+          >
+            ×
+          </button>
         </div>
 
-        <div className="tm-body">
-          <div className="tm-video-wrap">
+        <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 p-5 overflow-auto">
+          <div className="bg-black rounded-md overflow-hidden relative">
             <video
               ref={videoRef}
               src={videoUrl}
               controls
               playsInline
               preload="auto"
-              className="tm-video"
+              className="w-full block"
             />
             {pausedAtEnd && (
-              <button className="tm-replay" onClick={handleReplay}>
+              <button
+                onClick={handleReplay}
+                className="absolute right-3 bottom-14 btn btn-primary btn-sm"
+              >
                 ↻ Replay this window
               </button>
             )}
           </div>
 
-          <div className="tm-words-pane">
-            <div className="tm-words-label">
+          <div className="bg-page/60 border border-border rounded-md p-4 min-h-[180px]">
+            <p className="text-xs text-text-muted uppercase tracking-wider mb-2">
               Words in this {duration}s window
-            </div>
+            </p>
             {wordsInWindow.length > 0 ? (
-              <div className="tm-words">
+              <div className="flex flex-wrap gap-1.5 text-text-secondary text-sm leading-relaxed">
                 {wordsInWindow.map((w, i) => (
                   <span
                     key={i}
-                    className={'tm-word' + (w.is_filler ? ' tm-word-filler' : '')}
+                    className={`px-1.5 py-0.5 rounded ${
+                      w.is_filler
+                        ? 'bg-[rgba(245,158,11,0.15)] text-warning italic'
+                        : 'bg-elevated'
+                    }`}
                     title={`${(w.start_ms / 1000).toFixed(2)}s`}
                   >
                     {w.word}
@@ -163,7 +150,7 @@ export default function TimelineModal({
                 ))}
               </div>
             ) : (
-              <p className="tm-empty">No transcribed words in this window.</p>
+              <p className="text-text-muted text-sm italic">No transcribed words in this window.</p>
             )}
           </div>
         </div>

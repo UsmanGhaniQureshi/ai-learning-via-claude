@@ -1,21 +1,5 @@
 import { parseTimeStr, fmtSecs } from '../utils/timeStr'
 
-/**
- * Multi-segment trim composer.
- *
- * Renders a list of {start, end} rows the user can edit, plus an
- * "Add segment" button and a live combined-duration readout. The
- * parent owns the state and the media element (so the "Use" buttons
- * can pull `getCurrentTime()` from whatever is being previewed —
- * <video> on Upload, <audio> on Analyzer).
- *
- * Validation (combined duration min, end > start, max segments) is
- * deliberately split: this editor checks per-row sanity so the user
- * gets immediate feedback in the totals readout, but the *submit*
- * validation lives in the parent so it can show a single error
- * message in its existing error slot rather than scattering errors
- * inline.
- */
 export default function TrimSegmentsEditor({
   segments,
   onChange,
@@ -50,110 +34,82 @@ export default function TrimSegmentsEditor({
   }, 0)
 
   return (
-    <div
-      style={{
-        marginTop: 10, padding: 12,
-        background: '#1a1a22', borderRadius: 6,
-        border: '1px solid #2a2a35',
-      }}
-    >
-      <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 8 }}>
-        Trim segments (analysis only runs on these, played in order).
-        Format: <code>MM:SS</code> or seconds. Combined min 3 s.
+    <div className="bg-page/60 border border-border rounded-md p-3 mt-2">
+      <p className="text-xs text-text-muted mb-3">
+        Trim segments (analysis only runs on these, played in order). Format: <code className="bg-elevated px-1.5 py-0.5 rounded">MM:SS</code> or seconds. Combined min 3 s.
+      </p>
+
+      <div className="space-y-2">
+        {segments.map((seg, idx) => (
+          <div key={idx} className="flex items-center gap-2 flex-wrap">
+            <span className="w-6 text-text-muted text-xs">#{idx + 1}</span>
+            <input
+              type="text"
+              placeholder="0:00"
+              value={seg.start}
+              onChange={(e) => update(idx, 'start', e.target.value)}
+              className="input"
+              style={{ width: 90 }}
+            />
+            <button
+              type="button"
+              onClick={() => captureCurrent(idx, 'start')}
+              title="Use current playback time as start"
+              className="btn btn-secondary btn-sm"
+            >
+              Use
+            </button>
+            <span className="text-text-muted">→</span>
+            <input
+              type="text"
+              placeholder={previewDuration ? fmtSecs(previewDuration) : 'M:SS'}
+              value={seg.end}
+              onChange={(e) => update(idx, 'end', e.target.value)}
+              className="input"
+              style={{ width: 90 }}
+            />
+            <button
+              type="button"
+              onClick={() => captureCurrent(idx, 'end')}
+              title="Use current playback time as end"
+              className="btn btn-secondary btn-sm"
+            >
+              Use
+            </button>
+            <button
+              type="button"
+              onClick={() => remove(idx)}
+              title="Remove this segment"
+              className="ml-auto text-text-muted hover:text-danger transition-colors text-base"
+            >
+              ×
+            </button>
+          </div>
+        ))}
       </div>
 
-      {segments.map((seg, idx) => (
-        <div
-          key={idx}
-          style={{
-            display: 'flex', gap: 6, alignItems: 'center',
-            marginBottom: 6, flexWrap: 'wrap',
-          }}
-        >
-          <span style={{ width: 20, opacity: 0.6, fontSize: '0.85em' }}>
-            #{idx + 1}
-          </span>
-          <input
-            type="text"
-            placeholder="0:00"
-            value={seg.start}
-            onChange={(e) => update(idx, 'start', e.target.value)}
-            style={{ width: 80, padding: '4px 8px', borderRadius: 4 }}
-          />
-          <button
-            type="button"
-            onClick={() => captureCurrent(idx, 'start')}
-            title="Use current playback time as start"
-            style={{ fontSize: '0.72em', padding: '3px 6px' }}
-          >
-            Use
-          </button>
-          <span style={{ opacity: 0.5 }}>→</span>
-          <input
-            type="text"
-            placeholder={previewDuration ? fmtSecs(previewDuration) : 'M:SS'}
-            value={seg.end}
-            onChange={(e) => update(idx, 'end', e.target.value)}
-            style={{ width: 80, padding: '4px 8px', borderRadius: 4 }}
-          />
-          <button
-            type="button"
-            onClick={() => captureCurrent(idx, 'end')}
-            title="Use current playback time as end"
-            style={{ fontSize: '0.72em', padding: '3px 6px' }}
-          >
-            Use
-          </button>
-          <button
-            type="button"
-            onClick={() => remove(idx)}
-            title="Remove this segment"
-            style={{
-              fontSize: '0.85em', padding: '3px 8px',
-              marginLeft: 'auto', background: 'transparent',
-              border: '1px solid #444', borderRadius: 4,
-              color: '#aaa', cursor: 'pointer',
-            }}
-          >
-            ×
-          </button>
-        </div>
-      ))}
-
-      <div
-        style={{
-          display: 'flex', justifyContent: 'space-between',
-          alignItems: 'center', marginTop: 8,
-        }}
-      >
+      <div className="flex items-center justify-between mt-3">
         <button
           type="button"
           onClick={add}
           disabled={segments.length >= maxSegments}
-          style={{ fontSize: '0.82em', padding: '4px 10px' }}
+          className="btn btn-secondary btn-sm disabled:opacity-50"
         >
           + Add segment
         </button>
-        <span style={{ fontSize: '0.82em', opacity: 0.7 }}>
-          Combined: <strong>{fmtSecs(totalKept)}</strong>
+        <span className="text-xs text-text-muted">
+          Combined: <strong className="text-text-primary">{fmtSecs(totalKept)}</strong>
         </span>
       </div>
     </div>
   )
 }
 
-/**
- * Shared submit-time validator. Parses the segment list and returns
- * either `{ ok: true, segments: [[s,e], ...] }` or
- * `{ ok: false, error: 'message' }`. Mirrors the backend's
- * `_parse_trim_segments` so the user gets a 4xx-equivalent error
- * client-side without a round trip.
- */
 export function validateSegments(segments, previewDuration) {
   const parsed = []
   for (let i = 0; i < segments.length; i++) {
     const { start, end } = segments[i]
-    if (!start && !end) continue   // skip blank rows silently
+    if (!start && !end) continue
     const s = parseTimeStr(start)
     const e = parseTimeStr(end)
     if (s === null || e === null) {

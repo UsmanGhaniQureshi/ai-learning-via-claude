@@ -1,17 +1,18 @@
 /**
- * Displays 1-3 contextual feedback tips based on lowest-scoring signals.
- * Tips appear/disappear with CSS fade transitions.
+ * Displays 1-3 contextual feedback tips.
  */
 export default function FeedbackTips({ tips = [] }) {
   if (!tips || tips.length === 0) return null
 
   return (
-    <div className="feedback-tips">
-      <h4>Live Feedback</h4>
-      <ul>
+    <div className="glass-card p-4 border-l-2 border-accent">
+      <h4 className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-3">
+        Live Feedback
+      </h4>
+      <ul className="space-y-2">
         {tips.map((tip, i) => (
-          <li key={i} className="tip-item">
-            <span className="tip-icon">{getTipIcon(tip)}</span>
+          <li key={i} className="flex items-center gap-2 text-sm text-text-secondary">
+            <span className="text-base">{getTipIcon(tip)}</span>
             <span>{tip}</span>
           </li>
         ))}

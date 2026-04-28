@@ -1,29 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { API_BASE, apiFetch, mediaUrl } from '../config'
+import { API_BASE, apiFetch } from '../config'
 
-/**
- * Library page — lists every Media row for the current user with
- * search / sort / filter on top of the pagination from Phase 3.
- *
- * Filter state lives in the URL via `useSearchParams`, so:
- *   - The browser back button works through filter changes.
- *   - A filtered Library is bookmarkable / shareable (within the same
- *     user account — the auth gate still applies).
- *   - A reload preserves the user's choices.
- *
- * URL params honoured:
- *   q          search text
- *   sort       created_desc | created_asc | score_desc | score_asc |
- *              duration_desc | duration_asc
- *   date_from  ISO yyyy-mm-dd
- *   date_to    ISO yyyy-mm-dd
- *   min_score, max_score   integer 0-100
- *   tag        exact tag string
- *
- * Backend hands back a *filtered* total so the "N of M" label always
- * reflects what the user actually sees.
- */
 const KIND_LABEL = {
   session: 'Live session',
   upload: 'Uploaded video',
@@ -41,8 +19,6 @@ const SORT_LABELS = {
   duration_asc:  'Shortest first',
 }
 
-// Build the API query string from the filter state. Skips empty
-// values so the URL stays minimal.
 function buildQuery(state, extra = {}) {
   const params = new URLSearchParams()
   if (state.q) params.set('q', state.q)
@@ -58,8 +34,6 @@ function buildQuery(state, extra = {}) {
   return params.toString()
 }
 
-// Active = anything other than the defaults (sort: newest-first, no
-// other filters). Drives the visibility of the Clear button.
 function isAnyFilterActive(state) {
   return Boolean(
     state.q ||
@@ -72,7 +46,6 @@ function isAnyFilterActive(state) {
   )
 }
 
-// Read URL params -> normalized state object.
 function stateFromParams(sp) {
   return {
     q: sp.get('q') || '',
@@ -95,14 +68,10 @@ export default function History() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState(null)
   const [showFilters, setShowFilters] = useState(false)
+  const [deletingId, setDeletingId] = useState(null)
+  const [toast, setToast] = useState(null)
 
-  // Debounce the text-search input — typing into `q` shouldn't fire
-  // an HTTP request on every keystroke. The other filter controls
-  // commit immediately on change.
   const [qDraft, setQDraft] = useState(filters.q)
-  // Whenever `qDraft` changes, schedule a 350 ms commit to URL state.
-  // Cancel pending timer on every keystroke so only the final pause
-  // triggers a fetch.
   const debounceRef = useRef(null)
   useEffect(() => {
     if (qDraft === filters.q) return
@@ -117,13 +86,10 @@ export default function History() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [qDraft])
 
-  // Sync the draft back when URL changes from elsewhere (back button,
-  // Clear filters), so the input value stays in sync with reality.
   useEffect(() => {
     setQDraft(filters.q)
   }, [filters.q])
 
-  // Load page 1 whenever filters change.
   useEffect(() => {
     let cancelled = false
     setLoading(true)
@@ -172,11 +138,17 @@ export default function History() {
     }
   }
 
+  function showToast(text, cls = 'toast-warning') {
+    setToast({ text, cls })
+    setTimeout(() => setToast(null), 4000)
+  }
+
   async function deleteSession(id) {
     const ok = window.confirm(
       'Delete this recording permanently? The report, video/audio, and all chunk scores will be removed. This cannot be undone.'
     )
     if (!ok) return
+    setDeletingId(id)
     try {
       const res = await apiFetch(`${API_BASE}/api/media/${id}`, { method: 'DELETE' })
       if (!res.ok) {
@@ -186,12 +158,12 @@ export default function History() {
       setSessions((prev) => prev.filter((s) => s.session_id !== id))
       setTotal((t) => Math.max(0, t - 1))
     } catch (e) {
-      alert(`Delete failed: ${e.message}`)
+      showToast(`Delete failed: ${e.message}`, 'toast-danger')
+    } finally {
+      setDeletingId(null)
     }
   }
 
-  // Update one filter and reset the URL. We replace= on q (debounced
-  // typing) but push= on explicit changes so back-button works.
   const updateFilter = useCallback((key, value, { replace = false } = {}) => {
     const next = new URLSearchParams(sp)
     if (value === '' || value == null) next.delete(key)
@@ -219,53 +191,43 @@ export default function History() {
   const hasMore = sessions.length < total
 
   return (
-    <div className="section history-page">
-      <h2>Library</h2>
-      <p className="subtitle">
-        Past recording sessions.
-        {total > 0 && (
-          <span style={{ opacity: 0.7, marginLeft: 8 }}>
-            ({sessions.length} of {total})
-          </span>
-        )}
+    <div>
+      <p className="text-sm text-text-muted mb-6">
+        <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
+        {' / '}
+        <span className="text-text-secondary">Library</span>
       </p>
 
-      {/* ── Search + Sort bar ─────────────────────────────────────── */}
-      <div
-        style={{
-          display: 'flex',
-          gap: 8,
-          flexWrap: 'wrap',
-          alignItems: 'center',
-          marginBottom: 12,
-        }}
-      >
+      {toast && <div className={`toast ${toast.cls}`}>{toast.text}</div>}
+
+      <div className="flex items-center justify-between gap-3 flex-wrap mb-4">
+        <div>
+          <h2 className="mb-1">Library</h2>
+          <p className="text-text-secondary text-sm">
+            Past recording sessions.
+            {total > 0 && (
+              <span className="text-text-muted ml-2">
+                ({sessions.length} of {total})
+              </span>
+            )}
+          </p>
+        </div>
+        <Link to="/live" className="btn btn-primary btn-sm">+ New Session</Link>
+      </div>
+
+      {/* Search + Sort bar */}
+      <div className="flex gap-2 flex-wrap items-center mb-4">
         <input
           type="search"
           value={qDraft}
           onChange={(e) => setQDraft(e.target.value)}
           placeholder="Search title, topic, tags…"
-          style={{
-            flex: '1 1 240px',
-            padding: '8px 12px',
-            borderRadius: 6,
-            border: '1px solid #444',
-            background: '#1c1c24',
-            color: '#eee',
-            fontSize: '0.95rem',
-          }}
+          className="input flex-1 min-w-[240px]"
         />
         <select
           value={filters.sort}
           onChange={(e) => updateFilter('sort', e.target.value)}
-          style={{
-            padding: '8px 12px',
-            borderRadius: 6,
-            border: '1px solid #444',
-            background: '#1c1c24',
-            color: '#eee',
-            fontSize: '0.9rem',
-          }}
+          className="input w-auto"
         >
           {Object.entries(SORT_LABELS).map(([v, label]) => (
             <option key={v} value={v}>{label}</option>
@@ -274,248 +236,128 @@ export default function History() {
         <button
           type="button"
           onClick={() => setShowFilters((s) => !s)}
-          style={{
-            padding: '8px 12px',
-            borderRadius: 6,
-            border: '1px solid #444',
-            background: showFilters ? '#2a3850' : '#1c1c24',
-            color: '#eee',
-            cursor: 'pointer',
-            fontSize: '0.9rem',
-          }}
+          className={`btn btn-sm ${showFilters ? 'btn-primary' : 'btn-secondary'}`}
         >
           {showFilters ? 'Hide filters' : 'Filters'}
           {anyFilters && !showFilters && (
-            <span style={{ color: '#4a90e2', marginLeft: 4 }}>•</span>
+            <span className="text-text-accent ml-1">•</span>
           )}
         </button>
         {anyFilters && (
           <button
             type="button"
             onClick={clearAll}
-            style={{
-              padding: '8px 12px',
-              borderRadius: 6,
-              border: '1px solid #555',
-              background: 'transparent',
-              color: '#ccc',
-              cursor: 'pointer',
-              fontSize: '0.9rem',
-            }}
+            className="btn btn-secondary btn-sm"
           >
             Clear filters
           </button>
         )}
       </div>
 
-      {/* ── Filter panel ──────────────────────────────────────────── */}
+      {/* Filter panel */}
       {showFilters && (
-        <div
-          style={{
-            background: '#161620',
-            border: '1px solid #2a2a35',
-            borderRadius: 8,
-            padding: 14,
-            marginBottom: 14,
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-            gap: 12,
-          }}
-        >
-          <label>
-            <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 4 }}>From date</div>
+        <div className="glass-card p-4 mb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          <label className="block">
+            <div className="text-xs text-text-muted mb-1">From date</div>
             <input
               type="date"
               value={filters.date_from}
               onChange={(e) => updateFilter('date_from', e.target.value)}
-              style={panelInput}
+              className="input"
             />
           </label>
-          <label>
-            <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 4 }}>To date</div>
+          <label className="block">
+            <div className="text-xs text-text-muted mb-1">To date</div>
             <input
               type="date"
               value={filters.date_to}
               onChange={(e) => updateFilter('date_to', e.target.value)}
-              style={panelInput}
+              className="input"
             />
           </label>
-          <label>
-            <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 4 }}>Min score</div>
+          <label className="block">
+            <div className="text-xs text-text-muted mb-1">Min score</div>
             <input
-              type="number"
-              min={0}
-              max={100}
-              step={1}
+              type="number" min={0} max={100} step={1}
               value={filters.min_score}
               onChange={(e) => updateFilter('min_score', e.target.value)}
               placeholder="0"
-              style={panelInput}
+              className="input"
             />
           </label>
-          <label>
-            <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 4 }}>Max score</div>
+          <label className="block">
+            <div className="text-xs text-text-muted mb-1">Max score</div>
             <input
-              type="number"
-              min={0}
-              max={100}
-              step={1}
+              type="number" min={0} max={100} step={1}
               value={filters.max_score}
               onChange={(e) => updateFilter('max_score', e.target.value)}
               placeholder="100"
-              style={panelInput}
+              className="input"
             />
           </label>
-          <label>
-            <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 4 }}>Exact tag</div>
+          <label className="block">
+            <div className="text-xs text-text-muted mb-1">Exact tag</div>
             <input
               type="text"
               value={filters.tag}
               onChange={(e) => updateFilter('tag', e.target.value.trim().toLowerCase())}
               placeholder="e.g. interview"
-              style={panelInput}
+              className="input"
             />
           </label>
         </div>
       )}
 
-      {error && <div className="session-error">Failed to load: {error}</div>}
+      {error && (
+        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2 mb-4">
+          Failed to load: {error}
+        </div>
+      )}
 
       {loading ? (
-        <div className="processing">
-          <div className="spinner"></div>
-          <p>Loading sessions…</p>
+        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
+          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-primary">Loading sessions…</p>
         </div>
       ) : sessions.length === 0 ? (
-        <div className="section">
-          <p className="subtitle">
-            {anyFilters
-              ? 'No recordings match your filters.'
-              : 'No sessions yet.'}
-          </p>
-        </div>
+        anyFilters ? (
+          <div className="text-center py-16">
+            <p className="text-text-secondary">No recordings match your filters.</p>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center py-24 space-y-4 text-center">
+            <div className="w-16 h-16 rounded-xl bg-accent-soft border border-border-accent flex items-center justify-center text-3xl">
+              ◈
+            </div>
+            <h3 className="text-text-primary">No sessions yet</h3>
+            <p className="text-text-secondary text-sm max-w-xs">
+              Start your first practice session to see your results here.
+            </p>
+            <Link to="/live" className="btn btn-primary mt-2">Start Practicing →</Link>
+          </div>
+        )
       ) : (
         <>
-          <div className="history-grid">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {sessions.map((s) => (
-              <div key={s.session_id} className="history-card">
-                {/* Shared-by badge — recipient view only. Renders
-                    above the title so it's the first thing scanned. */}
-                {s.shared_by && (
-                  <div
-                    style={{
-                      display: 'inline-block',
-                      background: '#2a3850',
-                      color: '#cfe1ff',
-                      padding: '2px 8px',
-                      borderRadius: 10,
-                      fontSize: '0.7rem',
-                      marginBottom: 6,
-                    }}
-                  >
-                    Shared by {s.shared_by.name || s.shared_by.email}
-                  </div>
-                )}
-                {/* Title (or fall back to original filename / "Untitled") */}
-                <div style={{ fontSize: '1.05rem', fontWeight: 600, marginBottom: 4 }}>
-                  {s.title || s.original_name || 'Untitled recording'}
-                </div>
-                {s.topic && (
-                  <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 6 }}>
-                    Topic: {s.topic}
-                  </div>
-                )}
-                <div className="history-card-header">
-                  <strong>{formatDate(s.started_at)}</strong>
-                  <span className="history-kind">{KIND_LABEL[s.kind] || s.kind}</span>
-                  <span>Duration: {formatDuration(s.duration_s)}</span>
-                  <span>Score: {s.score ?? '—'}</span>
-                </div>
-                {s.tags && s.tags.length > 0 && (
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
-                    {s.tags.map((t) => (
-                      <span
-                        key={t}
-                        onClick={() => updateFilter('tag', t)}
-                        style={{
-                          background: '#2a3850',
-                          color: '#cfe1ff',
-                          padding: '2px 8px',
-                          borderRadius: 10,
-                          fontSize: '0.72rem',
-                          cursor: 'pointer',
-                        }}
-                        title={`Filter by tag: ${t}`}
-                      >
-                        {t}
-                      </span>
-                    ))}
-                  </div>
-                )}
-
-                {s.video_url ? (
-                  <video
-                    src={mediaUrl(s.video_url)}
-                    controls
-                    preload="metadata"
-                    playsInline
-                    className="processed-video"
-                    style={{ width: '100%', borderRadius: 8, marginTop: 8 }}
-                  />
-                ) : s.audio_url ? (
-                  <audio
-                    src={mediaUrl(s.audio_url)}
-                    controls
-                    preload="metadata"
-                    style={{ width: '100%', marginTop: 8 }}
-                  />
-                ) : (
-                  <div className="history-no-video">
-                    {s.has_video === false && s.has_audio === false
-                      ? 'media missing'
-                      : 'no playable file'}
-                  </div>
-                )}
-
-                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                  <Link
-                    to={`/result/${s.session_id}`}
-                    className="report-btn"
-                    style={{ flex: 1, textAlign: 'center' }}
-                  >
-                    View Result →
-                  </Link>
-                  {/* Delete is owner-only — backend enforces this
-                      anyway, but hiding the button avoids the
-                      confused-error UX on shared rows. */}
-                  {!s.shared_by && (
-                    <button
-                      onClick={() => deleteSession(s.session_id)}
-                      type="button"
-                      title="Delete permanently"
-                      style={{
-                        background: 'transparent',
-                        border: '1px solid #6a1b1b',
-                        color: '#ff7a7a',
-                        padding: '8px 12px',
-                        borderRadius: 6,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      Delete
-                    </button>
-                  )}
-                </div>
-              </div>
+              <LibraryCard
+                key={s.session_id}
+                recording={s}
+                onDelete={() => deleteSession(s.session_id)}
+                deleting={deletingId === s.session_id}
+                formatDate={formatDate}
+                formatDuration={formatDuration}
+                onTagClick={(t) => updateFilter('tag', t)}
+              />
             ))}
           </div>
 
           {hasMore && (
-            <div style={{ display: 'flex', justifyContent: 'center', marginTop: 20 }}>
+            <div className="flex justify-center mt-6">
               <button
                 onClick={loadMore}
                 disabled={loadingMore}
-                className="report-btn"
+                className="btn btn-primary disabled:opacity-50"
               >
                 {loadingMore ? 'Loading…' : `Load more (${total - sessions.length} left)`}
               </button>
@@ -527,12 +369,85 @@ export default function History() {
   )
 }
 
-const panelInput = {
-  width: '100%',
-  padding: '7px 10px',
-  borderRadius: 6,
-  border: '1px solid #444',
-  background: '#1c1c24',
-  color: '#eee',
-  fontSize: '0.9rem',
+function LibraryCard({ recording, onDelete, deleting, formatDate, formatDuration, onTagClick }) {
+  const status = recording.processing_status || (recording.score != null ? 'completed' : null)
+  const failed = status === 'failed'
+  const processing = status === 'pending' || status === 'processing'
+  const completed = status === 'completed' || (status == null && recording.score != null)
+
+  return (
+    <div className="glass-card p-4 hover:-translate-y-0.5 hover:shadow-accent transition-all duration-200">
+      {recording.shared_by && (
+        <div className="badge badge-accent mb-2">
+          Shared by {recording.shared_by.name || recording.shared_by.email}
+        </div>
+      )}
+      <div className="flex gap-4 items-start">
+        {/* Thumbnail / icon */}
+        <div className="w-20 h-16 rounded-md bg-elevated flex-shrink-0 flex items-center justify-center text-2xl border border-border overflow-hidden">
+          <span>{recording.kind === 'session' ? '🎥' : recording.kind === 'analyzer_audio' ? '🎤' : '📁'}</span>
+        </div>
+
+        {/* Info */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-start justify-between gap-2">
+            <p className="font-medium text-sm text-text-primary truncate">
+              {recording.title || recording.original_name || 'Untitled recording'}
+            </p>
+            {failed ? (
+              <span className="badge badge-danger flex-shrink-0">Failed</span>
+            ) : processing ? (
+              <span className="badge badge-warning flex-shrink-0">Processing</span>
+            ) : completed && recording.score != null ? (
+              <span className="badge badge-accent flex-shrink-0">{recording.score}</span>
+            ) : (
+              <span className="badge badge-muted flex-shrink-0">—</span>
+            )}
+          </div>
+          {recording.topic && (
+            <p className="text-xs text-text-muted mt-0.5 truncate">Topic: {recording.topic}</p>
+          )}
+          <p className="text-xs text-text-muted mt-0.5">
+            {formatDate(recording.started_at)} · {KIND_LABEL[recording.kind] || recording.kind} · {formatDuration(recording.duration_s)}
+          </p>
+        </div>
+      </div>
+
+      {recording.tags && recording.tags.length > 0 && (
+        <div className="flex gap-1 flex-wrap mt-3">
+          {recording.tags.map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => onTagClick(t)}
+              className="badge badge-muted hover:badge-accent transition-colors"
+              title={`Filter by tag: ${t}`}
+            >
+              #{t}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between mt-3 pt-3 border-t border-border">
+        <Link
+          to={`/result/${recording.session_id}`}
+          className="btn btn-secondary btn-sm"
+        >
+          View →
+        </Link>
+        {!recording.shared_by && (
+          <button
+            type="button"
+            onClick={onDelete}
+            disabled={deleting}
+            className="btn btn-danger btn-sm disabled:opacity-50"
+            title="Delete permanently"
+          >
+            {deleting ? 'Deleting…' : 'Delete'}
+          </button>
+        )}
+      </div>
+    </div>
+  )
 }

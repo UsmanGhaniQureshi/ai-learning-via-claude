@@ -1,22 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { API_BASE, apiFetch } from '../config'
 
-/**
- * PracticeSetup — pre-session screen.
- *
- * Lets the user:
- *   - pick a topic (or "Free practice")
- *   - set a target duration 1-10 minutes
- *   - see the prompt body so they have something concrete to talk about
- *
- * Calls onStart({ promptId, promptTitle, durationMin }) when the user
- * clicks Start. Selection is persisted in localStorage so the next
- * session pre-fills with the same choices.
- *
- * Loading prompts can fail (network, backend down) — we fall back to
- * a single "Free practice" entry rather than blocking the user from
- * starting at all.
- */
 const STORAGE_KEY = 'cd_practice_setup'
 
 function loadSavedSetup() {
@@ -44,20 +28,21 @@ const FALLBACK_PROMPT = {
 export default function PracticeSetup({ onStart, ctaLabel = 'Start practice' }) {
   const [prompts, setPrompts] = useState([FALLBACK_PROMPT])
   const [selectedId, setSelectedId] = useState(FALLBACK_PROMPT.id)
+  const [activeCategory, setActiveCategory] = useState(FALLBACK_PROMPT.category)
   const [durationMin, setDurationMin] = useState(5)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
-  // Group prompts by category for the dropdown — keeps a Job Interview
-  // and Wedding Speech from being interleaved alphabetically.
-  const grouped = useMemo(() => {
-    const map = new Map()
-    for (const p of prompts) {
-      if (!map.has(p.category)) map.set(p.category, [])
-      map.get(p.category).push(p)
-    }
-    return Array.from(map.entries())
+  const categories = useMemo(() => {
+    const set = new Set()
+    for (const p of prompts) set.add(p.category)
+    return Array.from(set)
   }, [prompts])
+
+  const filteredTopics = useMemo(
+    () => prompts.filter((p) => p.category === activeCategory),
+    [prompts, activeCategory],
+  )
 
   const selected = useMemo(
     () => prompts.find((p) => p.id === selectedId) || prompts[0],
@@ -74,13 +59,14 @@ export default function PracticeSetup({ onStart, ctaLabel = 'Start practice' }) 
         if (cancelled) return
         if (Array.isArray(data) && data.length > 0) {
           setPrompts(data)
-          // Apply saved selection (or default) once prompts are loaded.
           const saved = loadSavedSetup()
           const initial = saved?.promptId
             && data.some((p) => p.id === saved.promptId)
               ? saved.promptId
               : data[0].id
           setSelectedId(initial)
+          const initialPrompt = data.find((p) => p.id === initial) || data[0]
+          if (initialPrompt) setActiveCategory(initialPrompt.category)
           if (saved?.durationMin) setDurationMin(saved.durationMin)
         }
       } catch (e) {
@@ -93,16 +79,11 @@ export default function PracticeSetup({ onStart, ctaLabel = 'Start practice' }) 
     return () => { cancelled = true }
   }, [])
 
-  // When the user picks a new prompt, default the duration to its
-  // suggested length — but only if the user hasn't already changed it
-  // for this session. We treat a value still equal to the previous
-  // prompt's suggested_min as "unchanged".
-  function handlePromptChange(newId) {
-    const newPrompt = prompts.find((p) => p.id === newId)
-    const oldSuggested = selected?.suggested_min
-    setSelectedId(newId)
-    if (newPrompt?.suggested_min && durationMin === oldSuggested) {
-      setDurationMin(newPrompt.suggested_min)
+  function handleSelectTopic(p) {
+    const prevSuggested = selected?.suggested_min
+    setSelectedId(p.id)
+    if (p.suggested_min && durationMin === prevSuggested) {
+      setDurationMin(p.suggested_min)
     }
   }
 
@@ -117,99 +98,90 @@ export default function PracticeSetup({ onStart, ctaLabel = 'Start practice' }) 
   }
 
   return (
-    <div className="section" style={{ maxWidth: 720, margin: '20px auto' }}>
-      <h2>Set up your practice</h2>
+    <div className="max-w-2xl mx-auto space-y-8">
+      <div>
+        <h2 className="mb-1">Choose your topic</h2>
+        <p className="text-text-secondary text-sm">
+          Pick a category and topic to practice
+        </p>
+      </div>
+
       {error && (
-        <div className="session-error" style={{ marginBottom: 12 }}>
-          Couldn't load topic library: {error}. You can still start with
-          Free practice below.
+        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2">
+          Couldn&apos;t load topic library: {error}. You can still start with Free practice below.
         </div>
       )}
 
-      <div style={{ marginTop: 16 }}>
-        <label style={{ display: 'block', marginBottom: 6 }}>
-          <strong>Topic</strong>
-        </label>
-        <select
-          value={selectedId}
-          onChange={(e) => handlePromptChange(e.target.value)}
-          disabled={loading}
-          style={{
-            width: '100%',
-            padding: '10px 12px',
-            borderRadius: 6,
-            border: '1px solid #444',
-            background: '#1c1c24',
-            color: '#eee',
-            fontSize: '1rem',
-          }}
-        >
-          {grouped.map(([category, group]) => (
-            <optgroup key={category} label={category}>
-              {group.map((p) => (
-                <option key={p.id} value={p.id}>{p.title}</option>
-              ))}
-            </optgroup>
-          ))}
-        </select>
-        {selected?.body && (
-          <div
-            style={{
-              marginTop: 10,
-              padding: 12,
-              background: '#1a1a22',
-              borderLeft: '3px solid #4a90e2',
-              borderRadius: 4,
-              fontSize: '0.92rem',
-              lineHeight: 1.5,
-              color: '#cfcfd6',
-            }}
+      {/* Category pills */}
+      <div className="flex flex-wrap gap-2">
+        {categories.map((cat) => (
+          <button
+            key={cat}
+            type="button"
+            onClick={() => setActiveCategory(cat)}
+            className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all duration-150 border ${
+              activeCategory === cat
+                ? 'bg-accent border-accent text-white shadow-glow'
+                : 'bg-card border-border text-text-secondary hover:border-border-accent'
+            }`}
           >
-            {selected.body}
-          </div>
-        )}
+            {cat}
+          </button>
+        ))}
       </div>
 
-      <div style={{ marginTop: 20 }}>
-        <label style={{ display: 'block', marginBottom: 6 }}>
-          <strong>Duration:</strong>{' '}
-          <span style={{ color: '#4a90e2' }}>
-            {durationMin} {durationMin === 1 ? 'minute' : 'minutes'}
+      {/* Topic cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {filteredTopics.map((topic) => (
+          <button
+            key={topic.id}
+            type="button"
+            onClick={() => handleSelectTopic(topic)}
+            disabled={loading}
+            className={`glass-card p-4 text-left transition-all duration-150 ${
+              selectedId === topic.id
+                ? 'border-border-accent shadow-accent bg-accent-soft'
+                : 'hover:border-border-accent'
+            }`}
+          >
+            <p className="font-medium text-sm text-text-primary mb-1">
+              {topic.title}
+            </p>
+            {topic.body && (
+              <p className="text-xs text-text-muted line-clamp-2">
+                {topic.body}
+              </p>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Duration slider */}
+      <div className="glass-card p-5 space-y-3">
+        <div className="flex justify-between items-center">
+          <span className="text-sm font-medium text-text-primary">Duration</span>
+          <span className="text-accent font-bold font-display">
+            {durationMin} min
           </span>
-        </label>
+        </div>
         <input
           type="range"
           min={1}
           max={10}
-          step={1}
           value={durationMin}
           onChange={(e) => setDurationMin(parseInt(e.target.value, 10))}
-          style={{ width: '100%' }}
+          className="w-full accent-accent cursor-pointer"
         />
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            opacity: 0.6,
-            fontSize: '0.78em',
-            marginTop: 2,
-          }}
-        >
-          <span>1 min</span>
-          <span>10 min</span>
+        <div className="flex justify-between text-xs text-text-muted">
+          <span>1 min</span><span>10 min</span>
         </div>
       </div>
 
       <button
         type="button"
         onClick={handleStart}
-        className="report-btn"
-        style={{
-          marginTop: 24,
-          width: '100%',
-          padding: '12px 16px',
-          fontSize: '1rem',
-        }}
+        disabled={!selected}
+        className="btn btn-primary btn-lg btn-full disabled:opacity-40 disabled:cursor-not-allowed disabled:transform-none"
       >
         {ctaLabel} →
       </button>

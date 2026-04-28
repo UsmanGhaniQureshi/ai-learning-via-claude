@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
 import { API_BASE, apiFetch, wsUrl } from '../config'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
@@ -14,22 +14,9 @@ import { languageDisplayName } from '../utils/language'
  * Same server pipeline as Live Practice, minus face. Opens a WebSocket
  * with ?kind=analyzer_audio so the backend persists as source_kind
  * 'analyzer_audio' and uses /api/analyzer/:id/audio for playback.
- *
- * Flow:
- *   1. User clicks Start Recording.
- *   2. getUserMedia({ audio }) — no video permission needed.
- *   3. Open WS /ws/session/:id?kind=analyzer_audio.
- *   4. Web Audio graph: MediaStreamSource -> ScriptProcessor -> 16kHz
- *      Float32 chunks pushed into a 3-sec buffer. Whole buffer is sent
- *      as binary over WS whenever it fills. Server returns per-chunk
- *      scores + transcript — driving the live gauge + transcript.
- *   5. In parallel, MediaRecorder captures a full audio blob we upload
- *      at stop time so /result/:id has something to play back.
- *   6. On stop: flush any partial buffer, send stop_session, upload the
- *      recorded blob, await session_ended, navigate to /result/:id.
  */
 export default function LiveAnalyzer() {
-  const [state, setState] = useState('idle') // idle | starting | active | stopping
+  const [state, setState] = useState('idle')
   const [scores, setScores] = useState(null)
   const [transcript, setTranscript] = useState('')
   const [duration, setDuration] = useState(0)
@@ -51,18 +38,12 @@ export default function LiveAnalyzer() {
   const lastTranscriptRef = useRef('')
   const userStopRef = useRef(false)
   const [connectionLost, setConnectionLost] = useState(false)
-  // English-only enforcement signal sent by the backend's
-  // multilingual probe in audio_pipeline. When set to a language
-  // code the WS handler stops broadcasting per-chunk scores and we
-  // render a banner asking the user to switch to English.
   const [unsupportedLanguage, setUnsupportedLanguage] = useState(null)
-  // Pre-session setup (topic + duration) and countdown overlay state.
-  // Same pattern as LiveSession.jsx — see that file for the rationale.
   const [setup, setSetup] = useState(null)
   const [showCountdown, setShowCountdown] = useState(false)
   const [recStartedAt, setRecStartedAt] = useState(null)
+  const [uploadWarning, setUploadWarning] = useState(null)
 
-  // ── Cleanup — always safe to call ──────────────────────────────────
   const cleanup = useCallback(() => {
     if (processorRef.current) {
       try { processorRef.current.disconnect() } catch {}
@@ -89,7 +70,6 @@ export default function LiveAnalyzer() {
 
   useEffect(() => cleanup, [cleanup])
 
-  // Linear resample browser-native → 16 kHz.
   const resample = (input, inRate, outRate = 16000) => {
     if (inRate === outRate) return new Float32Array(input)
     const ratio = inRate / outRate
@@ -104,8 +84,6 @@ export default function LiveAnalyzer() {
     return out
   }
 
-  // Send whole 3-sec chunks. DON'T zero-pad the tail — the live session
-  // pipeline treats silence-padded chunks as real input and hallucinates.
   const flushAudioBuffer = (force = false) => {
     const CHUNK = 16000 * 3
     while (audioBufferRef.current.length >= CHUNK) {
@@ -117,11 +95,14 @@ export default function LiveAnalyzer() {
     if (force) audioBufferRef.current = []
   }
 
-  // ── Start ──────────────────────────────────────────────────────────
   const start = async () => {
     setError(null)
     setConnectionLost(false)
-    setLanguageWarning(null)
+    // Bug fix: was `setLanguageWarning(null)` — that setter doesn't exist
+    // (state was renamed). The old call threw a ReferenceError on every
+    // Start click and the page never advanced past 'idle'.
+    setUnsupportedLanguage(null)
+    setUploadWarning(null)
     userStopRef.current = false
     setState('starting')
     setScores(null)
@@ -135,9 +116,6 @@ export default function LiveAnalyzer() {
 
     let stream
     try {
-      // Audio constraints OFF — see useLiveSession.js for the
-      // accuracy rationale. Live audio must reach the backend with
-      // the same prosody the upload path sees.
       stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           sampleRate: 16000,
@@ -155,7 +133,6 @@ export default function LiveAnalyzer() {
     }
     mediaStreamRef.current = stream
 
-    // Open WS with ?kind=analyzer_audio
     const ws = new WebSocket(wsUrl(`/ws/session/${mediaId}?kind=analyzer_audio`))
     ws.binaryType = 'arraybuffer'
     wsRef.current = ws
@@ -187,13 +164,9 @@ export default function LiveAnalyzer() {
     }
     ws.onerror = () => setError('WebSocket connection failed')
     ws.onclose = () => {
-      if (userStopRef.current) return // normal termination
+      if (userStopRef.current) return
       setConnectionLost(true)
-      setError(
-        'Connection lost during the session. Saving what was captured so far…'
-      )
-      // Route through the normal stop flow so the partial report lands
-      // in the DB and the UI transitions to /result.
+      setError('Connection lost during the session. Saving what was captured so far…')
       setTimeout(() => { stop().catch(() => {}) }, 50)
     }
 
@@ -209,7 +182,6 @@ export default function LiveAnalyzer() {
 
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
 
-    // MediaRecorder for the eventual playback blob.
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus'
       : 'audio/webm'
@@ -221,7 +193,6 @@ export default function LiveAnalyzer() {
     recorder.start(1000)
     mediaRecorderRef.current = recorder
 
-    // Web Audio graph — capture Float32 PCM, resample to 16 kHz.
     let ctx
     try {
       ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 })
@@ -232,10 +203,6 @@ export default function LiveAnalyzer() {
     const inputRate = ctx.sampleRate
     const source = ctx.createMediaStreamSource(stream)
 
-    // AudioWorkletNode runs on the audio rendering thread — UI
-    // re-renders (transitions, big state updates) can't drop audio
-    // frames here, unlike ScriptProcessorNode which shared the main
-    // thread and was officially deprecated.
     await ctx.audioWorklet.addModule('/audioProcessor.worklet.js')
     const processor = new AudioWorkletNode(ctx, 'audio-processor')
     processorRef.current = processor
@@ -259,9 +226,6 @@ export default function LiveAnalyzer() {
     setState('active')
   }
 
-  // Pre-session flow: setup → countdown → start. The setup form is the
-  // same component LiveSession uses; the analyser just doesn't render
-  // the gesture badge afterwards.
   function handleSetupComplete(s) {
     setSetup(s)
     setShowCountdown(true)
@@ -274,19 +238,14 @@ export default function LiveAnalyzer() {
     if (state === 'active') {
       stop().catch(() => {})
     }
-    // Note: stop is a function declared below this — JS hoisting makes
-    // the reference resolvable at call time even though it's not yet
-    // defined when this useCallback is created.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state])
 
-  // ── Stop ───────────────────────────────────────────────────────────
   const stop = async () => {
     if (state !== 'active') return
     userStopRef.current = true
     setState('stopping')
 
-    // Stop audio capture.
     if (processorRef.current) {
       try { processorRef.current.disconnect() } catch {}
     }
@@ -296,7 +255,6 @@ export default function LiveAnalyzer() {
     }
     flushAudioBuffer(true)
 
-    // Collect MediaRecorder blob.
     const recorder = mediaRecorderRef.current
     let audioBlob = null
     if (recorder && recorder.state !== 'inactive') {
@@ -308,7 +266,6 @@ export default function LiveAnalyzer() {
       })
     }
 
-    // Ask server to finalize, then wait for session_ended or 15s timeout.
     const ws = wsRef.current
     if (ws?.readyState === WebSocket.OPEN) {
       try { ws.send(JSON.stringify({ type: 'stop_session' })) } catch {}
@@ -324,7 +281,6 @@ export default function LiveAnalyzer() {
       })
     }
 
-    // Upload the audio blob for playback.
     if (audioBlob) {
       try {
         const form = new FormData()
@@ -335,7 +291,7 @@ export default function LiveAnalyzer() {
           body: form,
         })
       } catch (e) {
-        console.warn('audio upload failed', e)
+        setUploadWarning(`Audio upload failed: ${e.message || e}. Your session was scored, but playback may be unavailable.`)
       }
     }
 
@@ -347,7 +303,7 @@ export default function LiveAnalyzer() {
   const barScores = scores
     ? {
         voiceSteadiness: scores.voice_steadiness ?? 50,
-        eyeContact: 50, // N/A for audio-only, render neutral
+        eyeContact: 50,
         speechPace: scores.speech_pace ?? 50,
         fillerWords: scores.filler_words ?? 50,
         vocalVariety: scores.vocal_variety ?? 50,
@@ -356,125 +312,104 @@ export default function LiveAnalyzer() {
     : null
   const fmt = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 
+  let banner = null
+  if (connectionLost) {
+    banner = { cls: 'toast-danger', text: 'Connection lost. Saving what was captured so far…' }
+  } else if (unsupportedLanguage) {
+    banner = { cls: 'toast-danger', text: `We detected ${languageDisplayName(unsupportedLanguage)}. The app currently supports English only — stop and try again in English.` }
+  }
+
   return (
-    <div className="live-session-container">
-      <h2>Live Audio Analyzer</h2>
-      <p className="subtitle">
-        Speak into the mic — scores and transcript update in real time. No
-        camera needed.
+    <div>
+      <p className="text-sm text-text-muted mb-6">
+        <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
+        {' / '}
+        <Link to="/analyzer" className="hover:text-text-accent transition-colors">Speech Analyzer</Link>
+        {' / '}
+        <span className="text-text-secondary">Live Mic</span>
       </p>
 
-      {error && <div className="session-error">{error}</div>}
+      {error && (
+        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2 mb-4">
+          {error}
+        </div>
+      )}
+      {uploadWarning && (
+        <div className="bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.3)] text-warning text-sm rounded-md px-4 py-2 mb-4">
+          {uploadWarning}
+        </div>
+      )}
 
       {state === 'idle' && !showCountdown && (
         <PracticeSetup onStart={handleSetupComplete} ctaLabel="Start recording" />
       )}
 
       {showCountdown && (
-        <CountdownOverlay onComplete={handleCountdownComplete} />
+        <CountdownOverlay onComplete={handleCountdownComplete} topicTitle={setup?.promptTitle} />
       )}
 
       {state === 'starting' && (
-        <div className="session-starting">
-          <div className="spinner"></div>
-          <p>Requesting microphone access…</p>
+        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
+          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-primary">Requesting microphone access…</p>
         </div>
       )}
 
       {(state === 'active' || state === 'stopping') && (
-        <div className="session-active">
-          {connectionLost && (
-            <div
-              className="session-error"
-              style={{
-                background: '#4a1f1f',
-                border: '1px solid #8a3333',
-                color: '#ff9b9b',
-                marginBottom: 12,
-              }}
-            >
-              <strong>Connection lost.</strong> Saving what was captured
-              so far — we'll redirect you to the report in a moment.
-            </div>
-          )}
-          {unsupportedLanguage && (
-            <div
-              style={{
-                background: '#4a1f1f',
-                border: '1px solid #8a3333',
-                color: '#ff9b9b',
-                padding: '12px 14px',
-                borderRadius: 6,
-                marginBottom: 12,
-                fontSize: '0.95em',
-              }}
-            >
-              <strong>We detected {languageDisplayName(unsupportedLanguage)}.</strong>{' '}
-              The app currently supports English only. Stop and try
-              again in English — score updates have been paused for
-              this session.
-            </div>
-          )}
+        <div className="space-y-4">
+          {banner && <div className={`toast ${banner.cls}`}>{banner.text}</div>}
 
-          {setup?.promptTitle && (
-            <div
-              style={{
-                marginBottom: 12,
-                padding: '10px 14px',
-                background: '#1a1a22',
-                borderLeft: '3px solid #4a90e2',
-                borderRadius: 4,
-                fontSize: '0.92rem',
-              }}
-            >
-              <div style={{ opacity: 0.7, fontSize: '0.78rem', marginBottom: 2 }}>
-                Topic
-              </div>
-              <div><strong>{setup.promptTitle}</strong></div>
-            </div>
-          )}
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            {setup?.promptTitle ? (
+              <span className="badge badge-accent">📍 {setup.promptTitle}</span>
+            ) : <span />}
+            {!setup?.durationMin && (
+              <span className="text-text-muted text-sm tabular-nums">{fmt(duration)}</span>
+            )}
+          </div>
 
           {setup?.durationMin && (
-            <div style={{ marginBottom: 12 }}>
-              <PracticeTimer
-                targetMin={setup.durationMin}
-                startedAtMs={recStartedAt}
-                onTimeUp={handleTimeUp}
-              />
-            </div>
+            <PracticeTimer
+              targetMin={setup.durationMin}
+              startedAtMs={recStartedAt}
+              onTimeUp={handleTimeUp}
+            />
           )}
 
-          <div className="session-status-bar">
-            <div className="status-left">
-              <span className="rec-indicator">
-                <span className="rec-dot"></span> REC
-              </span>
-              {!setup && (
-                <span className="session-duration">{fmt(duration)}</span>
+          <div className="glass-card p-6 flex flex-col items-center gap-3">
+            <div className="flex items-center gap-1.5 bg-[rgba(0,0,0,0.4)] backdrop-blur-xs px-2.5 py-1 rounded-full">
+              <span className="w-2 h-2 rounded-full bg-danger animate-pulse" />
+              <span className="text-white text-xs font-medium">REC</span>
+            </div>
+            <ScoreGauge score={totalScore} size={180} label="Confidence" />
+          </div>
+
+          <details className="glass-card group">
+            <summary className="px-5 py-3 cursor-pointer text-sm font-medium text-text-secondary flex items-center gap-2 select-none">
+              <span className="transition-transform group-open:rotate-180">▾</span>
+              <span>Signal Details</span>
+            </summary>
+            <div className="px-5 pb-5 space-y-5 border-t border-border pt-4">
+              {barScores && <SignalBars scores={barScores} faceUnavailable />}
+              {transcript && (
+                <div>
+                  <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-2">
+                    Live Transcript
+                  </p>
+                  <div className="bg-page/60 border border-border rounded-md p-3 text-sm text-text-secondary leading-relaxed max-h-56 overflow-y-auto">
+                    {transcript}
+                  </div>
+                </div>
               )}
             </div>
-          </div>
-
-          <div className="session-score-panel" style={{ margin: '0 auto' }}>
-            <ScoreGauge score={totalScore} label="Confidence" size={180} />
-          </div>
-
-          {/* LiveAnalyzer is audio-only — face signals never apply. */}
-          {barScores && <SignalBars scores={barScores} faceUnavailable={true} />}
-
-          {transcript && (
-            <div className="live-transcript">
-              <h4>Live Transcript</h4>
-              <div className="transcript-box">{transcript}</div>
-            </div>
-          )}
+          </details>
 
           <button
-            className="stop-session-btn"
             onClick={stop}
             disabled={state === 'stopping'}
+            className="btn btn-danger btn-full btn-lg mt-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {state === 'stopping' ? 'Finalising…' : 'Stop Recording'}
+            {state === 'stopping' ? 'Finalising…' : '■ Stop Recording'}
           </button>
         </div>
       )}

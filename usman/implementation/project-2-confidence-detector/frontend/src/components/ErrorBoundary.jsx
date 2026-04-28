@@ -1,16 +1,6 @@
 import { Component } from 'react'
 import { Link } from 'react-router-dom'
 
-/**
- * ErrorBoundary — React class component that catches render errors in its
- * subtree and shows a friendly fallback instead of a white screen.
- *
- * Without this, a single buggy child (malformed report JSON, null
- * dereference in Playback Review, etc.) unmounts the entire app tree.
- *
- * Class component is required — error boundaries are one of the two
- * places React 19 still requires classes.
- */
 export default class ErrorBoundary extends Component {
   constructor(props) {
     super(props)
@@ -22,7 +12,6 @@ export default class ErrorBoundary extends Component {
   }
 
   componentDidCatch(error, info) {
-    // Surface to the console so DevTools still shows the stack.
     // eslint-disable-next-line no-console
     console.error('ErrorBoundary caught:', error, info)
   }
@@ -39,21 +28,21 @@ export default class ErrorBoundary extends Component {
       'Unknown error'
 
     return (
-      <div className="section" style={{ padding: 40, maxWidth: 720 }}>
+      <div className="max-w-2xl py-12 mx-auto">
         <h2>Something went wrong</h2>
-        <p className="subtitle">
+        <p className="text-text-secondary text-sm mb-4">
           The page hit an unexpected error and had to stop rendering.
         </p>
 
-        <div className="session-error" style={{ marginTop: 16, fontFamily: 'monospace', fontSize: '0.85rem' }}>
+        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-3 py-2 font-mono mb-5">
           {msg}
         </div>
 
-        <div style={{ marginTop: 20, display: 'flex', gap: 12 }}>
-          <Link to="/" onClick={this.handleReset} className="report-btn">
+        <div className="flex gap-3">
+          <Link to="/" onClick={this.handleReset} className="btn btn-primary">
             ← Home
           </Link>
-          <button onClick={() => window.location.reload()} className="report-btn">
+          <button onClick={() => window.location.reload()} className="btn btn-secondary">
             Reload page
           </button>
         </div>

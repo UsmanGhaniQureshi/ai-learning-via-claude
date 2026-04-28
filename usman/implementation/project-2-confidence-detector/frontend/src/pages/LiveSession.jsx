@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Link } from 'react-router-dom'
 import useLiveSession from '../hooks/useLiveSession'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
@@ -8,6 +8,7 @@ import SessionGraph from '../components/SessionGraph'
 import PracticeSetup from '../components/PracticeSetup'
 import CountdownOverlay from '../components/CountdownOverlay'
 import PracticeTimer from '../components/PracticeTimer'
+import PermissionScreen from '../components/PermissionScreen'
 import { languageDisplayName } from '../utils/language'
 
 function formatDuration(s) {
@@ -16,21 +17,19 @@ function formatDuration(s) {
   return `${m}:${String(sec).padStart(2, '0')}`
 }
 
-// Maps a hand_position label to a colour + short user-facing message.
-// Used by the live gesture badge during recording.
 function gestureBadge(label) {
   switch (label) {
-    case 'gesturing':
-      return { color: '#00c853', text: '✋ Hands gesturing' }
-    case 'mid-level':
-      return { color: '#4a90e2', text: '✋ Hands mid-level' }
-    case 'low/resting':
-      return { color: '#aaa', text: '✋ Hands resting' }
-    case 'not visible':
-      return { color: '#ffb84d', text: '✋ Hands not visible' }
-    default:
-      return null
+    case 'gesturing':   return { cls: 'badge-success', text: '✋ Hands gesturing' }
+    case 'mid-level':   return { cls: 'badge-accent',  text: '✋ Hands mid-level' }
+    case 'low/resting': return { cls: 'badge-muted',   text: '✋ Hands resting' }
+    case 'not visible': return { cls: 'badge-warning', text: '✋ Hands not visible' }
+    default:            return null
   }
+}
+
+function isPermissionError(msg) {
+  if (!msg) return false
+  return /camera|microphone|permission|denied|NotAllowed|NotFound|getUserMedia/i.test(msg)
 }
 
 export default function LiveSession() {
@@ -44,17 +43,11 @@ export default function LiveSession() {
   const navigate = useNavigate()
   const navigatedRef = useRef(false)
 
-  // Two new local UI states layered on top of useLiveSession's state:
-  //   showCountdown   — full-screen 3-2-1 overlay before WS opens
-  //   setup           — { promptTitle, promptBody, durationMin }
-  // We keep these LOCAL because they're pure pre-roll UX; the existing
-  // hook's state machine (idle / starting / active / stopping / report)
-  // already represents the actual session lifecycle once we hit Start.
   const [setup, setSetup] = useState(null)
   const [showCountdown, setShowCountdown] = useState(false)
   const [recStartedAt, setRecStartedAt] = useState(null)
+  const [permissionDismissed, setPermissionDismissed] = useState(false)
 
-  // Once the report arrives, redirect to /result/:id.
   useEffect(() => {
     if (sessionState === 'report' && report?.session_id && !navigatedRef.current) {
       navigatedRef.current = true
@@ -62,9 +55,6 @@ export default function LiveSession() {
     }
   }, [sessionState, report, navigate])
 
-  // Capture the wall-clock moment recording actually starts so the
-  // PracticeTimer can drive its own clock independent of the hook's
-  // duration counter (which can lag by 1 s on first render).
   useEffect(() => {
     if (sessionState === 'active' && !recStartedAt) {
       setRecStartedAt(Date.now())
@@ -74,17 +64,12 @@ export default function LiveSession() {
     }
   }, [sessionState, recStartedAt])
 
-  // Timer reached zero → auto-stop. We guard with a ref-equivalent to
-  // avoid double-calling stopSession (timer fires once, but defensive).
   const handleTimeUp = useCallback(() => {
     if (sessionState === 'active') {
       stopSession().catch(() => {})
     }
   }, [sessionState, stopSession])
 
-  // Setup → countdown → real start. Splitting these means the user sees
-  // the camera permission prompt during the countdown, which makes the
-  // 3-second wait useful instead of dead.
   function handleSetupComplete(s) {
     setSetup(s)
     setShowCountdown(true)
@@ -95,7 +80,6 @@ export default function LiveSession() {
     startSession()
   }
 
-  // Map backend session scores to SignalBars format
   const barScores = scores
     ? {
         voiceSteadiness: scores.voice_steadiness ?? 50,
@@ -110,224 +94,198 @@ export default function LiveSession() {
   const totalScore = scores?.total ?? 50
   const gesture = gestureBadge(faceScores.hand_position)
 
+  // Pick the single most relevant tip for the always-visible "Live Tip" card.
+  const currentTip = (tips && tips.length > 0)
+    ? tips[0]
+    : 'Stay relaxed. Your scores update every few seconds.'
+
+  // Pick a single banner to show — priority: connection > unsupported > backpressure > calibrating.
+  let banner = null
+  if (connectionStatus === 'lost') {
+    banner = { cls: 'toast-danger', text: 'Connection lost. Saving what was captured so far…' }
+  } else if (unsupportedLanguage) {
+    banner = { cls: 'toast-danger', text: `We detected ${languageDisplayName(unsupportedLanguage)}. The app currently supports English only — stop and try again in English.` }
+  } else if (backpressure) {
+    banner = { cls: 'toast-info', text: 'Server catching up… (a chunk was dropped — keep speaking)' }
+  } else if (calibrating) {
+    banner = { cls: 'toast-info', text: 'Calibrating face baseline… expression scores will pick up in about 10 s. Sit naturally and look at the camera.' }
+  }
+
+  // Permission denied → render PermissionScreen instead of the setup form.
+  const showPermission =
+    sessionState === 'idle' && error && isPermissionError(error) && !permissionDismissed
+
   return (
-    <div className="live-session-container">
-      <h2>Live Practice Session</h2>
-      <p className="subtitle">
-        AI-powered feedback on your eye contact, voice, and speech
+    <div>
+      {/* Breadcrumb */}
+      <p className="text-sm text-text-muted mb-6">
+        <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
+        {' / '}
+        <span className="text-text-secondary">Live Practice</span>
       </p>
 
-      {error && <div className="session-error">{error}</div>}
-
-      {/* IDLE STATE — show the practice-setup picker */}
-      {sessionState === 'idle' && !showCountdown && (
-        <PracticeSetup onStart={handleSetupComplete} />
+      {/* IDLE — permission-denied path */}
+      {showPermission && (
+        <PermissionScreen
+          error={error}
+          onRetry={() => setPermissionDismissed(true)}
+        />
       )}
 
-      {/* COUNTDOWN OVERLAY — shows before camera permission resolves */}
+      {/* IDLE — practice setup picker */}
+      {sessionState === 'idle' && !showCountdown && !showPermission && (
+        <>
+          {error && !isPermissionError(error) && (
+            <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2 mb-6">
+              {error}
+            </div>
+          )}
+          <PracticeSetup onStart={handleSetupComplete} />
+        </>
+      )}
+
+      {/* COUNTDOWN OVERLAY */}
       {showCountdown && (
-        <CountdownOverlay onComplete={handleCountdownComplete} />
+        <CountdownOverlay
+          onComplete={handleCountdownComplete}
+          topicTitle={setup?.promptTitle}
+        />
       )}
 
-      {/* STARTING STATE — Requesting permissions */}
+      {/* STARTING — Requesting permissions */}
       {sessionState === 'starting' && (
-        <div className="session-starting">
-          <div className="spinner"></div>
-          <p>Requesting camera and microphone access…</p>
-          <p className="small">Please allow access in the browser prompt</p>
+        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
+          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-primary">Requesting camera and microphone access…</p>
+          <p className="text-text-muted text-sm">Please allow access in the browser prompt</p>
         </div>
       )}
 
-      {/* ACTIVE STATE — Live session in progress */}
+      {/* ACTIVE / STOPPING */}
       {(sessionState === 'active' || sessionState === 'stopping') && (
-        <div className="session-active">
-          {connectionStatus === 'lost' && (
-            <div
-              className="session-error"
-              style={{
-                background: '#4a1f1f',
-                border: '1px solid #8a3333',
-                color: '#ff9b9b',
-                marginBottom: 12,
-              }}
-            >
-              <strong>Connection lost.</strong> Saving what was captured
-              so far — we'll redirect you to the report in a moment.
-            </div>
-          )}
-          {unsupportedLanguage && (
-            <div
-              style={{
-                background: '#4a1f1f',
-                border: '1px solid #8a3333',
-                color: '#ff9b9b',
-                padding: '12px 14px',
-                borderRadius: 6,
-                marginBottom: 12,
-                fontSize: '0.95em',
-              }}
-            >
-              <strong>We detected {languageDisplayName(unsupportedLanguage)}.</strong>{' '}
-              The app currently supports English only. Stop and try
-              again in English — score updates have been paused for
-              this session.
-            </div>
+        <div className="space-y-4">
+          {banner && (
+            <div className={`toast ${banner.cls}`}>{banner.text}</div>
           )}
 
-          {backpressure && (
-            <div
-              style={{
-                background: '#2a2a35',
-                color: '#cfe1ff',
-                padding: '6px 12px',
-                borderRadius: 4,
-                marginBottom: 8,
-                fontSize: '0.82em',
-                opacity: 0.85,
-              }}
-            >
-              Server catching up… (a chunk was dropped — keep speaking)
-            </div>
-          )}
-
-          {calibrating && (
-            <div
-              style={{
-                background: '#1a2438',
-                color: '#cfe1ff',
-                padding: '6px 12px',
-                borderRadius: 4,
-                marginBottom: 8,
-                fontSize: '0.82em',
-              }}
-            >
-              Calibrating face baseline… expression scores will pick up in
-              about 10 s. Sit naturally and look at the camera.
-            </div>
-          )}
-
-          {/* Topic banner — what the user is practising */}
-          {setup?.promptTitle && (
-            <div
-              style={{
-                marginBottom: 12,
-                padding: '10px 14px',
-                background: '#1a1a22',
-                borderLeft: '3px solid #4a90e2',
-                borderRadius: 4,
-                fontSize: '0.92rem',
-              }}
-            >
-              <div style={{ opacity: 0.7, fontSize: '0.78rem', marginBottom: 2 }}>
-                Topic
-              </div>
-              <div><strong>{setup.promptTitle}</strong></div>
-            </div>
-          )}
-
-          {/* Practice timer — elapsed/remaining + bar + auto-stop */}
-          {setup?.durationMin && (
-            <div style={{ marginBottom: 12 }}>
-              <PracticeTimer
-                targetMin={setup.durationMin}
-                startedAtMs={recStartedAt}
-                onTimeUp={handleTimeUp}
-              />
-            </div>
-          )}
-
-          {/* Status bar */}
-          <div className="session-status-bar">
-            <div className="status-left">
-              <span className="rec-indicator">
-                <span className="rec-dot"></span> REC
-              </span>
-              {!setup && (
-                <span className="session-duration">{formatDuration(duration)}</span>
-              )}
-            </div>
-            <div className="status-right" style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-              {gesture && (
-                <span
-                  style={{
-                    fontSize: '0.85rem',
-                    color: gesture.color,
-                    fontWeight: 500,
-                  }}
-                >
-                  {gesture.text}
-                </span>
-              )}
-              {faceScores.face_detected ? (
-                <span className="face-status ok">&#x2713; Face detected</span>
-              ) : (
-                <span className="face-status warn">&#x26A0; No face</span>
-              )}
-            </div>
+          {/* Topic + timer row */}
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            {setup?.promptTitle ? (
+              <span className="badge badge-accent">📍 {setup.promptTitle}</span>
+            ) : <span />}
+            {!setup?.durationMin && (
+              <span className="text-text-muted text-sm tabular-nums">{formatDuration(duration)}</span>
+            )}
           </div>
 
-          {/* Video + Score */}
-          <div className="session-main">
-            <div className="session-video-wrap">
+          {/* Practice timer (if duration set) */}
+          {setup?.durationMin && (
+            <PracticeTimer
+              targetMin={setup.durationMin}
+              startedAtMs={recStartedAt}
+              onTimeUp={handleTimeUp}
+            />
+          )}
+
+          {/* Main 2-column layout */}
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
+            {/* Camera feed */}
+            <div className="glass-card overflow-hidden relative aspect-[4/3]">
               <video
                 ref={videoRef}
                 autoPlay
                 muted
                 playsInline
-                className="session-video"
+                className="w-full h-full object-cover scale-x-[-1]"
               />
+              {/* REC indicator */}
+              <div className="absolute top-3 left-3 flex items-center gap-1.5 bg-[rgba(0,0,0,0.6)] backdrop-blur-xs px-2.5 py-1 rounded-full">
+                <span className="w-2 h-2 rounded-full bg-danger animate-pulse" />
+                <span className="text-white text-xs font-medium">REC</span>
+              </div>
+              {/* Face / gesture overlay */}
+              <div className="absolute top-3 right-3 flex flex-col items-end gap-1.5">
+                {faceScores.face_detected ? (
+                  <span className="badge badge-success">✓ Face detected</span>
+                ) : (
+                  <span className="badge badge-warning">⚠ No face</span>
+                )}
+                {gesture && (
+                  <span className={`badge ${gesture.cls}`}>{gesture.text}</span>
+                )}
+              </div>
             </div>
-            <div className="session-score-panel">
-              <ScoreGauge
-                score={totalScore}
-                label="Confidence"
-                size={180}
-              />
+
+            {/* Score panel */}
+            <div className="flex flex-col gap-4">
+              <div className="glass-card p-5 flex flex-col items-center gap-2">
+                <ScoreGauge score={totalScore} size={160} />
+                <p className="text-text-accent text-sm font-semibold uppercase tracking-wider">
+                  Confidence
+                </p>
+              </div>
+
+              {/* Live tip card */}
+              <div className="glass-card p-4 flex-1 border-l-2 border-accent">
+                <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-2">
+                  Live Tip
+                </p>
+                <p className="text-sm text-text-secondary leading-relaxed">
+                  {currentTip}
+                </p>
+              </div>
             </div>
           </div>
 
-          {/* Signal Bars */}
-          {barScores && <SignalBars scores={barScores} />}
-
-          {/* Feedback Tips */}
-          {tips && tips.length > 0 && <FeedbackTips tips={tips} />}
-
-          {/* Live Transcript */}
-          {transcript && (
-            <div className="live-transcript">
-              <h4>Live Transcript</h4>
-              <div className="transcript-box">{transcript}</div>
+          {/* Expandable details drawer */}
+          <details className="glass-card group">
+            <summary className="px-5 py-3 cursor-pointer text-sm font-medium text-text-secondary flex items-center gap-2 select-none">
+              <span className="transition-transform group-open:rotate-180">▾</span>
+              <span>Signal Details</span>
+            </summary>
+            <div className="px-5 pb-5 space-y-5 border-t border-border pt-4">
+              {barScores && <SignalBars scores={barScores} />}
+              {tips && tips.length > 1 && <FeedbackTips tips={tips.slice(1)} />}
+              {transcript && (
+                <div>
+                  <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-2">
+                    Live Transcript
+                  </p>
+                  <div className="bg-page/60 border border-border rounded-md p-3 text-sm text-text-secondary leading-relaxed max-h-56 overflow-y-auto">
+                    {transcript}
+                  </div>
+                </div>
+              )}
+              {scoreHistory.length > 2 && (
+                <SessionGraph history={scoreHistory} />
+              )}
             </div>
-          )}
-
-          {/* Score Graph */}
-          {scoreHistory.length > 2 && <SessionGraph history={scoreHistory} />}
+          </details>
 
           {/* Stop button */}
           <button
-            className="stop-session-btn"
             onClick={stopSession}
             disabled={sessionState === 'stopping'}
+            className="btn btn-danger btn-full btn-lg mt-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {sessionState === 'stopping' ? 'Stopping…' : 'Stop Session'}
+            {sessionState === 'stopping' ? 'Stopping…' : '■ Stop Session'}
           </button>
         </div>
       )}
 
-      {/* STOPPING STATE — shown briefly if stop triggered from elsewhere */}
+      {/* STOPPING fallback (when scores haven't arrived yet) */}
       {sessionState === 'stopping' && !scores && (
-        <div className="session-starting">
-          <div className="spinner"></div>
-          <p>Generating session report…</p>
+        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
+          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-primary">Generating session report…</p>
         </div>
       )}
 
-      {/* REPORT STATE — navigation handled by useEffect above; render a
-          brief loader while the redirect to /result/:id happens. */}
+      {/* REPORT loading */}
       {sessionState === 'report' && (
-        <div className="session-starting">
-          <div className="spinner"></div>
-          <p>Opening your session report…</p>
+        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
+          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-primary">Opening your session report…</p>
         </div>
       )}
     </div>

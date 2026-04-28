@@ -1,67 +1,56 @@
 import SignalInfoTooltip from './SignalInfoTooltip'
 
-/**
- * Horizontal bar display for each sub-score signal.
- * Each bar shows label, numeric value, and colored fill bar.
- *
- * `faceUnavailable`: when true, the face-dependent signals (eye contact,
- * expression) show N/A instead of a synthesised default — otherwise a
- * blank wall reads as "moderate 50" which is misleading.
- *
- * `info` (the camelCase key used here matches SignalBars' API; we map
- * it to the snake_case key SIGNAL_DEFS uses inside SignalInfoTooltip
- * via the `signalDef` field).
- */
 const SIGNALS = [
   { key: 'voiceSteadiness', signalDef: 'voice_steadiness', label: 'Voice Steadiness', weight: '24%', face: false },
-  { key: 'eyeContact',     signalDef: 'eye_contact',      label: 'Eye Contact',      weight: '24%', face: true },
+  { key: 'eyeContact',     signalDef: 'eye_contact',      label: 'Eye Contact',      weight: '24%', face: true  },
   { key: 'speechPace',     signalDef: 'speech_pace',      label: 'Speech Pace',      weight: '20%', face: false },
   { key: 'fillerWords',    signalDef: 'filler_words',     label: 'Filler Words',     weight: '20%', face: false },
   { key: 'vocalVariety',   signalDef: 'vocal_variety',    label: 'Vocal Variety',    weight: '12%', face: false },
-  { key: 'expression',     signalDef: 'expression',       label: 'Expression',       weight: 'display-only', face: true },
+  { key: 'expression',     signalDef: 'expression',       label: 'Expression',       weight: 'display', face: true },
 ]
 
-function barColor(val) {
-  if (val >= 71) return '#00c853'
-  if (val >= 41) return '#ffd600'
-  return '#ff1744'
+function fillClass(v) {
+  if (v >= 75) return 'bg-gradient-to-r from-success to-cyan'
+  if (v >= 50) return 'bg-gradient-to-r from-warning to-amber-400'
+  return 'bg-gradient-to-r from-danger to-orange-500'
 }
 
 export default function SignalBars({ scores = {}, faceUnavailable = false }) {
   return (
-    <div className="signal-bars">
+    <div className="space-y-4">
       {SIGNALS.map(({ key, signalDef, label, weight, face }) => {
         const raw = scores[key]
         const noData = raw === null || raw === undefined
         const faceMissing = face && faceUnavailable
         const hide = noData || faceMissing
         const value = noData ? 0 : Number(raw)
-        let title
-        if (faceMissing) title = 'No face detected — this signal is unavailable.'
-        else if (noData) title = 'No data available for this signal.'
         return (
-          <div key={key} className="signal-row">
-            <div className="signal-label">
-              <span>{label}<SignalInfoTooltip signal={signalDef} /></span>
-              <span className="signal-weight">({weight})</span>
+          <div key={key} className={`space-y-1.5 ${hide ? 'opacity-40' : ''}`}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <span className="text-sm font-medium text-text-primary">
+                  {label}
+                </span>
+                {!hide && <SignalInfoTooltip signal={signalDef} />}
+                <span className="text-xs text-text-muted">({weight})</span>
+              </div>
+              <span className="text-sm font-bold font-display tabular-nums text-text-primary">
+                {hide ? '—' : Math.round(value)}
+              </span>
             </div>
-            <div className="signal-bar-bg">
-              <div
-                className="signal-bar-fill"
-                style={{
-                  width: hide ? '0%' : `${value}%`,
-                  backgroundColor: hide ? '#444' : barColor(value),
-                  transition: 'width 0.5s ease, background-color 0.3s ease',
-                }}
-              />
+            <div className="h-1.5 bg-elevated rounded-full overflow-hidden">
+              {!hide && (
+                <div
+                  className={`h-full rounded-full transition-all duration-700 ease-out ${fillClass(value)}`}
+                  style={{ width: `${value}%` }}
+                />
+              )}
             </div>
-            <div
-              className="signal-value"
-              style={{ color: hide ? '#888' : barColor(value) }}
-              title={title}
-            >
-              {hide ? 'N/A' : Math.round(value)}
-            </div>
+            {hide && (
+              <p className="text-xs text-text-muted">
+                {faceMissing ? 'No face detected — unavailable' : 'Not measured'}
+              </p>
+            )}
           </div>
         )
       })}

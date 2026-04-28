@@ -1,18 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
 
-/**
- * PracticeTimer — displays elapsed/target time + a progress bar +
- * 10-second warning. Calls onTimeUp() exactly once when the target
- * is hit so the parent can auto-stop the session.
- *
- * Uses an internal interval rather than reading a parent-provided
- * `duration` prop because the parent's elapsed counter is also
- * driven by an interval and we don't want them to drift apart.
- *
- * `startedAtMs` should be the wall-clock millis when recording
- * actually began (after the countdown). When that's null the timer
- * shows 0:00 / target — useful while the countdown is still on screen.
- */
 export default function PracticeTimer({ targetMin, startedAtMs, onTimeUp }) {
   const [elapsedS, setElapsedS] = useState(0)
   const firedRef = useRef(false)
@@ -33,7 +20,7 @@ export default function PracticeTimer({ targetMin, startedAtMs, onTimeUp }) {
       }
     }
     tick()
-    const id = setInterval(tick, 250) // 250 ms = smooth bar, cheap
+    const id = setInterval(tick, 250)
     return () => clearInterval(id)
   }, [startedAtMs, targetMin, onTimeUp])
 
@@ -43,52 +30,32 @@ export default function PracticeTimer({ targetMin, startedAtMs, onTimeUp }) {
   const last10 = remainingS > 0 && remainingS <= 10
   const finished = remainingS === 0
 
-  // Bar colour: green → yellow at 80% → red in last 10 s.
-  const barColor = last10 || finished ? '#ff5252' : pct >= 80 ? '#ffb84d' : '#4a90e2'
+  let barClass = 'bg-gradient-to-r from-accent to-cyan'
+  if (last10 || finished) barClass = 'bg-danger'
+  else if (pct >= 80) barClass = 'bg-warning'
 
   return (
-    <div style={{ width: '100%' }}>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'baseline',
-          marginBottom: 6,
-        }}
-      >
-        <span style={{ fontSize: '1.05rem', fontWeight: 600 }}>
+    <div className="w-full">
+      <div className="flex justify-between items-baseline mb-1.5">
+        <span className="text-base font-semibold tabular-nums text-text-primary">
           {fmt(elapsedS)} / {fmt(targetS)}
         </span>
         <span
-          style={{
-            fontSize: '0.85rem',
-            color: last10 ? '#ff5252' : '#aaa',
-            fontWeight: last10 ? 600 : 400,
-          }}
+          className={`text-xs font-medium ${
+            last10 ? 'text-danger font-semibold' : 'text-text-muted'
+          }`}
         >
           {last10
             ? `${remainingS}s left — wrap up!`
             : finished
-              ? 'Time’s up'
+              ? "Time's up"
               : `${fmt(remainingS)} remaining`}
         </span>
       </div>
-      <div
-        style={{
-          width: '100%',
-          height: 8,
-          background: '#22222a',
-          borderRadius: 4,
-          overflow: 'hidden',
-        }}
-      >
+      <div className="h-2 bg-elevated rounded-full overflow-hidden">
         <div
-          style={{
-            width: `${pct}%`,
-            height: '100%',
-            background: barColor,
-            transition: 'width 0.25s linear, background 0.4s ease',
-          }}
+          className={`h-full transition-all duration-300 ${barClass}`}
+          style={{ width: `${pct}%` }}
         />
       </div>
     </div>

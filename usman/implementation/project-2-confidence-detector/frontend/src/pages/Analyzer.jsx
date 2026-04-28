@@ -1,30 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import { fmtSecs } from '../utils/timeStr'
 import TrimSegmentsEditor, { validateSegments } from '../components/TrimSegmentsEditor'
 import LiveAnalyzer from './LiveAnalyzer'
 
-/**
- * Standalone Speech Analyzer page.
- *
- * Two entry points:
- *   - Upload an audio file → preview + optional trim → batch process
- *     → navigate to /result/:id.
- *   - Record live → WebSocket real-time scores + transcript →
- *     navigate to /result/:id (rendered by the LiveAnalyzer
- *     sub-component; mounts in place when the user picks "Record
- *     Live").
- *
- * Trim semantics match Upload.jsx: optional list of [start,end]
- * segments concatenated server-side BEFORE analysis runs, so scores
- * + transcript only reflect the kept windows.
- *
- * Route: /analyzer
- */
+const TABS = ['Upload Audio', 'Live Mic']
+
 export default function Analyzer() {
-  const [mode, setMode] = useState('idle') // idle | preview | uploading | live
+  const [activeTab, setActiveTab] = useState(TABS[0])
   const [error, setError] = useState(null)
   const [pickedFile, setPickedFile] = useState(null)
   const [previewUrl, setPreviewUrl] = useState(null)
@@ -32,6 +17,7 @@ export default function Analyzer() {
   const [useFull, setUseFull] = useState(true)
   const [segments, setSegments] = useState([{ start: '', end: '' }])
   const [statusText, setStatusText] = useState(null)
+  const [uploading, setUploading] = useState(false)
   const audioRef = useRef(null)
   const navigate = useNavigate()
 
@@ -51,7 +37,6 @@ export default function Analyzer() {
     setPreviewDuration(0)
     setUseFull(true)
     setSegments([{ start: '', end: '' }])
-    setMode('preview')
   }
 
   function reset() {
@@ -62,7 +47,6 @@ export default function Analyzer() {
     setUseFull(true)
     setSegments([{ start: '', end: '' }])
     setError(null)
-    setMode('idle')
   }
 
   async function handleSubmit() {
@@ -79,7 +63,7 @@ export default function Analyzer() {
       segmentsPayload = v.segments
     }
 
-    setMode('uploading')
+    setUploading(true)
     setStatusText('Uploading file…')
     const formData = new FormData()
     formData.append('audio_file', pickedFile)
@@ -115,73 +99,113 @@ export default function Analyzer() {
       }
     } catch (err) {
       setError(err.message)
-      // Drop back to the preview screen so the user can adjust the
-      // trim window and retry without re-picking the file.
-      setMode('preview')
+      setUploading(false)
     }
   }
 
-  // Live mode mounts its own component with the full WS flow.
-  if (mode === 'live') return <LiveAnalyzer />
+  if (activeTab === 'Live Mic') {
+    return (
+      <div>
+        <p className="text-sm text-text-muted mb-6">
+          <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
+          {' / '}
+          <span className="text-text-secondary">Speech Analyzer</span>
+        </p>
+        <div className="flex gap-1 p-1 bg-elevated rounded-md w-fit mb-8">
+          {TABS.map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => setActiveTab(tab)}
+              className={`px-5 py-2 rounded-md text-sm font-medium transition-all duration-150 ${
+                activeTab === tab
+                  ? 'bg-accent text-white shadow-glow'
+                  : 'text-text-secondary hover:text-text-primary'
+              }`}
+            >
+              {tab}
+            </button>
+          ))}
+        </div>
+        <LiveAnalyzer />
+      </div>
+    )
+  }
 
   return (
-    <div className="analyzer-page">
-      <div className="analyzer-header">
-        <h2>Speech Analyzer</h2>
-        <p>Test your speech — no camera needed</p>
+    <div>
+      <p className="text-sm text-text-muted mb-6">
+        <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
+        {' / '}
+        <span className="text-text-secondary">Speech Analyzer</span>
+      </p>
+
+      <div className="mb-6">
+        <h2 className="mb-1">Speech Analyzer</h2>
+        <p className="text-text-secondary text-sm">Test your speech — no camera needed</p>
       </div>
 
-      {error && <div className="analyzer-error">{error}</div>}
-
-      {mode === 'idle' && (
-        <div className="analyzer-input">
-          <label className="upload-area">
-            <span className="upload-icon">&#x1F4C1;</span>
-            <span>Upload audio file</span>
-            <span className="small">WAV / MP3 / M4A / WebM / OGG</span>
-            <input
-              type="file"
-              accept="audio/*,.wav,.mp3,.m4a,.webm,.ogg"
-              onChange={handleFilePick}
-              hidden
-            />
-          </label>
-
-          <div className="analyzer-divider">or</div>
-
-          <button className="record-btn" onClick={() => setMode('live')}>
-            <span className="record-dot"></span>
-            Record Live (real-time scores)
+      <div className="flex gap-1 p-1 bg-elevated rounded-md w-fit mb-8">
+        {TABS.map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            onClick={() => setActiveTab(tab)}
+            className={`px-5 py-2 rounded-md text-sm font-medium transition-all duration-150 ${
+              activeTab === tab
+                ? 'bg-accent text-white shadow-glow'
+                : 'text-text-secondary hover:text-text-primary'
+            }`}
+          >
+            {tab}
           </button>
+        ))}
+      </div>
+
+      {error && (
+        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2 mb-4">
+          {error}
         </div>
       )}
 
-      {mode === 'preview' && pickedFile && (
-        <div className="analyzer-preview" style={{ marginTop: 16 }}>
+      {!pickedFile && !uploading && (
+        <label
+          className="block border-2 border-dashed border-border rounded-xl p-16 text-center cursor-pointer transition-all duration-200 hover:border-border-accent hover:bg-accent-soft group"
+        >
+          <div className="text-5xl mb-4 group-hover:scale-110 transition-transform duration-200">🎤</div>
+          <p className="font-semibold text-text-primary mb-1">Click to select audio</p>
+          <p className="text-sm text-text-muted">WAV / MP3 / M4A / WebM / OGG</p>
+          <input
+            type="file"
+            accept="audio/*,.wav,.mp3,.m4a,.webm,.ogg"
+            onChange={handleFilePick}
+            hidden
+          />
+        </label>
+      )}
+
+      {pickedFile && !uploading && (
+        <div className="space-y-4">
           <audio
             ref={audioRef}
             src={previewUrl}
             controls
             preload="metadata"
             onLoadedMetadata={(e) => setPreviewDuration(e.currentTarget.duration || 0)}
-            style={{ width: '100%' }}
+            className="w-full"
           />
 
-          <div style={{ marginTop: 10, fontSize: '0.85em', opacity: 0.8 }}>
-            <strong>{pickedFile.name}</strong>
-            {previewDuration > 0 && <> &middot; {fmtSecs(previewDuration)}</>}
-          </div>
+          <p className="text-sm text-text-secondary">
+            <strong className="text-text-primary">{pickedFile.name}</strong>
+            {previewDuration > 0 && <> · {fmtSecs(previewDuration)}</>}
+          </p>
 
-          <label
-            style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              marginTop: 12, fontSize: '0.92em',
-            }}
-          >
+          <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
             <input
               type="checkbox"
               checked={useFull}
               onChange={(e) => setUseFull(e.target.checked)}
+              className="accent-accent"
             />
             Use full clip (default — analyze the whole audio)
           </label>
@@ -195,18 +219,18 @@ export default function Analyzer() {
             />
           )}
 
-          <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
-            <button onClick={handleSubmit}>Analyze</button>
-            <button onClick={reset} className="secondary">Pick a different file</button>
+          <div className="flex gap-3">
+            <button onClick={handleSubmit} className="btn btn-primary">Analyze</button>
+            <button onClick={reset} className="btn btn-secondary">Pick a different file</button>
           </div>
         </div>
       )}
 
-      {mode === 'uploading' && (
-        <div className="processing">
-          <div className="spinner"></div>
-          <p>{statusText || 'Analyzing speech…'}</p>
-          <p className="small">Running VAD, pitch analysis, transcription, and scoring.</p>
+      {uploading && (
+        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
+          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-primary">{statusText || 'Analyzing speech…'}</p>
+          <p className="text-text-muted text-sm">Running VAD, pitch analysis, transcription, and scoring.</p>
         </div>
       )}
     </div>

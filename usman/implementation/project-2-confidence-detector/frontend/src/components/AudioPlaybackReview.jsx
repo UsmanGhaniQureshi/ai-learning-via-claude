@@ -1,32 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
-import { API_BASE, mediaUrl } from '../config'
+import { mediaUrl } from '../config'
 
-/**
- * AudioPlaybackReview — Poised-style synchronised playback for audio-only
- * analyses. Audio analog of PlaybackReview.
- *
- * Expects `report` to have:
- *   recording.audio_url      — served via /api/analyzer/{id}/audio
- *   timeline                 — [{ t_s, speech_pace, filler_words, total, ... }]
- *                              (from generate_post_session_report)
- *   transcript               — [{ word, start_ms, is_filler }]
- *
- * As the <audio> plays, this component:
- *   - Finds the nearest timeline entry at or before currentTime and drives
- *     a "live score" panel from it (speech pace / filler-words / total).
- *   - Finds the active word (start_ms ≤ currentTime*1000 ≤ next.start_ms)
- *     and highlights it. Clicking any word jumps the audio to that moment.
- *
- * forwardRef exposes:
- *   - getCurrentTime()        → seconds (float). Used by the comments
- *                               composer's "Set start/end at current"
- *                               buttons.
- *   - seekAndPlay(start, end?) → seek to `start` and play. If `end`
- *                               is provided AND > start, attach a
- *                               timeupdate listener that auto-pauses
- *                               at `end` and removes itself, so the
- *                               playback respects the comment's range.
- */
 const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, ref) {
   const audioRef = useRef(null)
   const transcriptContainerRef = useRef(null)
@@ -34,8 +8,6 @@ const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, 
   const [currentSegment, setCurrentSegment] = useState(null)
   const [currentWordIdx, setCurrentWordIdx] = useState(-1)
 
-  // Imperative handle so parent (Result.jsx) can plumb the audio
-  // element through to CommentsThread without lifting state.
   useImperativeHandle(ref, () => ({
     getCurrentTime() {
       return audioRef.current?.currentTime || 0
@@ -44,12 +16,8 @@ const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, 
       const audio = audioRef.current
       if (!audio) return
       audio.currentTime = Math.max(0, Number(startS) || 0)
-      audio.play().catch(() => { /* autoplay blocked, ignore */ })
+      audio.play().catch(() => {})
       if (endS != null && Number(endS) > Number(startS)) {
-        // Attach a one-shot listener that pauses at the range end
-        // and removes itself. We also clear it on the next call to
-        // seekAndPlay (via a ref) so range comments don't stack
-        // pause-handlers on top of each other.
         if (audio._cdRangePauseHandler) {
           audio.removeEventListener('timeupdate', audio._cdRangePauseHandler)
         }
@@ -67,16 +35,9 @@ const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, 
   }), [])
 
   const rawAudioUrl = report?.recording?.audio_url
-  // mediaUrl prefixes API_BASE for relative paths AND appends the
-  // current JWT as ?token=, since <audio src=...> can't send the
-  // Authorization header. Absolute URLs and data:/blob: pass through.
   const audioUrl = rawAudioUrl ? mediaUrl(rawAudioUrl) : null
   const timeline = useMemo(() => report?.timeline || [], [report])
 
-  // Prefer speech_timeline.words — each chunk there is built server-side
-  // with ABSOLUTE timestamps (start_ms includes the chunk offset). Fall
-  // back to report.transcript if speech_timeline isn't present. Avoids the
-  // old bug where report.transcript kept per-chunk (0-3000ms) offsets.
   const words = useMemo(() => {
     if (Array.isArray(report?.speech_timeline)) {
       const absolute = report.speech_timeline.flatMap((s) => s.words || [])
@@ -93,8 +54,6 @@ const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, 
       const t = audio.currentTime
       const tMs = t * 1000
 
-      // Nearest timeline entry at or before t (linear scan — timelines are
-      // bounded at ~chunk-count ≤ a few hundred for a long recording).
       let seg = null
       for (const e of timeline) {
         if (e.t_s <= t) seg = e
@@ -102,7 +61,6 @@ const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, 
       }
       setCurrentSegment(seg)
 
-      // Active word
       let idx = -1
       for (let i = 0; i < words.length; i++) {
         const w = words[i]
@@ -122,7 +80,6 @@ const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, 
     return () => audio.removeEventListener('timeupdate', onTimeUpdate)
   }, [timeline, words])
 
-  // Keep the highlighted word visible
   useEffect(() => {
     if (activeWordRef.current && transcriptContainerRef.current) {
       const container = transcriptContainerRef.current
@@ -135,9 +92,9 @@ const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, 
     }
   }, [currentWordIdx])
 
-  const scoreColor = (s) => {
-    if (s == null) return '#888'
-    return s >= 71 ? '#00c853' : s >= 41 ? '#ffd600' : '#ff1744'
+  const colorClass = (s) => {
+    if (s == null) return 'text-text-muted'
+    return s >= 71 ? 'text-success' : s >= 41 ? 'text-warning' : 'text-danger'
   }
 
   const handleWordClick = (w) => {
@@ -150,70 +107,63 @@ const AudioPlaybackReview = forwardRef(function AudioPlaybackReview({ report }, 
   if (!audioUrl) return null
 
   return (
-    <div className="playback-review">
-      <h3>Playback Review</h3>
-      <p className="pb-subtitle">
-        Play the audio — scores and transcript sync to the current moment.
-        Click any word to jump there.
+    <div className="glass-card p-5 my-6">
+      <h3 className="mb-1">Playback Review</h3>
+      <p className="text-text-secondary text-sm mb-4">
+        Play the audio — scores and transcript sync to the current moment. Click any word to jump there.
       </p>
 
-      <div className="pb-grid">
-        <div className="pb-video-wrap">
+      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 items-start">
+        <div>
           <audio
             ref={audioRef}
             src={audioUrl}
             controls
             preload="auto"
-            style={{ width: '100%' }}
+            className="w-full"
           />
         </div>
 
-        <div className="pb-live-panel">
-          <div className="pb-live-card">
-            <div className="pb-live-label">Total</div>
-            <div
-              className="pb-live-value"
-              style={{ color: scoreColor(currentSegment?.total) }}
-            >
+        <div className="flex flex-col gap-3">
+          <div className="bg-page/60 border border-border rounded-md p-3">
+            <p className="text-xs text-text-muted uppercase tracking-wider mb-1">Total</p>
+            <p className={`text-3xl font-display font-bold leading-none ${colorClass(currentSegment?.total)}`}>
               {currentSegment?.total ?? '—'}
-            </div>
-            <div className="pb-live-meta">
-              {currentSegment
-                ? `@ ${currentSegment.t_s}s`
-                : 'press play to see live scores'}
-            </div>
+            </p>
+            <p className="text-text-secondary text-xs mt-1">
+              {currentSegment ? `@ ${currentSegment.t_s}s` : 'press play to see live scores'}
+            </p>
           </div>
 
-          <div className="pb-live-card">
-            <div className="pb-live-label">Speech pace</div>
-            <div
-              className="pb-live-value"
-              style={{ color: scoreColor(currentSegment?.speech_pace) }}
-            >
+          <div className="bg-page/60 border border-border rounded-md p-3">
+            <p className="text-xs text-text-muted uppercase tracking-wider mb-1">Speech pace</p>
+            <p className={`text-3xl font-display font-bold leading-none ${colorClass(currentSegment?.speech_pace)}`}>
               {currentSegment?.speech_pace ?? '—'}
-            </div>
-            <div className="pb-live-meta">
+            </p>
+            <p className="text-text-secondary text-xs mt-1">
               Fillers score: {currentSegment?.filler_words ?? '—'}
-            </div>
+            </p>
           </div>
         </div>
       </div>
 
       {words.length > 0 && (
-        <div className="pb-transcript">
-          <div className="pb-transcript-label">Transcript</div>
-          <div className="pb-transcript-text" ref={transcriptContainerRef}>
+        <div className="bg-page/60 border border-border rounded-md p-4 mt-4">
+          <p className="text-xs text-text-muted uppercase tracking-wider mb-2">Transcript</p>
+          <div ref={transcriptContainerRef} className="max-h-44 overflow-y-auto leading-relaxed text-text-secondary text-sm">
             {words.map((w, i) => {
               const isActive = i === currentWordIdx
+              const cls = [
+                'cursor-pointer px-1 py-0.5 rounded transition-colors',
+                isActive ? 'bg-accent text-white' : 'hover:bg-elevated hover:text-text-primary',
+                w.is_filler ? 'text-warning italic' : '',
+                isActive && w.is_filler ? 'bg-warning text-white' : '',
+              ].join(' ')
               return (
                 <span
                   key={i}
                   ref={isActive ? activeWordRef : null}
-                  className={
-                    'pb-word' +
-                    (isActive ? ' pb-word-active' : '') +
-                    (w.is_filler ? ' pb-word-filler' : '')
-                  }
+                  className={cls}
                   onClick={() => handleWordClick(w)}
                 >
                   {w.word}{' '}

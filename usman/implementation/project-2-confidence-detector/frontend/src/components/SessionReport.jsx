@@ -1,39 +1,22 @@
 import { useRef } from 'react'
+import { Link } from 'react-router-dom'
 import ScoreGauge from './ScoreGauge'
-import SignalBars from './SignalBars'
+import SignalInfoTooltip from './SignalInfoTooltip'
 import SessionGraph from './SessionGraph'
 import TranscriptView from './TranscriptView'
-import SignalInfoTooltip from './SignalInfoTooltip'
 import ProgressChart from './ProgressChart'
 import ScoreBreakdownPanel from './ScoreBreakdownPanel'
 import { API_BASE, apiFetch, mediaUrl } from '../config'
 
-/**
- * Shared report UI — used by both live session post-report and standalone analyzer.
- * Expects a `report` prop matching the generate_post_session_report() output.
- *
- * showRecording: when true, render the saved video from report.recording.video_url
- * inside the report. Set true from contexts without their own preview (e.g.
- * the History page); leave false when the parent (LiveSession) already shows
- * the recording above the report so we don't double-render.
- */
 export default function SessionReport({
   report,
   onDownloadJSON,
   onCopyTranscript,
   showRecording = false,
-  // Optional. When provided, the inner <video> element registers a
-  // seekAndPlay/getCurrentTime API on this ref so CommentsThread can
-  // anchor + play ranged comments against this exact element. The
-  // shape mirrors what AudioPlaybackReview / PlaybackReview expose,
-  // so the comments thread is player-agnostic.
   playerHandleRef = null,
 }) {
   const videoElRef = useRef(null)
-  // Set up the imperative API on the parent's ref. We can't use
-  // forwardRef here because SessionReport already accepts a default
-  // export, and we want a NAMED prop to make the wiring explicit at
-  // call sites that DON'T need playback control (Library card, etc.).
+
   if (playerHandleRef) {
     playerHandleRef.current = {
       getCurrentTime() {
@@ -61,131 +44,136 @@ export default function SessionReport({
       },
     }
   }
+
   if (!report) return null
-  if (report.error) return <div className="report-error">{report.error}</div>
+  if (report.error) {
+    return (
+      <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2">
+        {report.error}
+      </div>
+    )
+  }
 
   const {
     avg_score, peak_score, lowest_score, grade, grade_label,
     signal_averages, signal_stderrs, signal_reasons, filler_breakdown,
     total_fillers, acoustic_fillers, pace, insights, action_items,
-    timeline, transcript, duration_s, weakest_signal, note, session_id,
+    timeline, transcript, duration_s, session_id,
     recording, kind, topic,
     signal_baseline_adjusted, user_baseline, baseline_note,
     insufficient_speech, unsupported_language, status_message,
   } = report
 
-  // Unscoreable-session short-circuit: when the backend couldn't
-  // score this session (silent recording OR non-English speech)
-  // we render a clear explainer card instead of the gauge +
-  // signal bars. The status_message text is set by the backend
-  // and varies by cause ("Not enough speech…" vs "doesn't appear
-  // to be in English…"), so we just render it verbatim.
   if (insufficient_speech || unsupported_language || avg_score == null) {
     return (
-      <div className="session-report">
-        <div
-          className="report-section"
-          style={{
-            background: '#1a1a22',
-            border: '1px solid #2a2a35',
-            borderRadius: 8,
-            padding: 24,
-            textAlign: 'center',
-          }}
-        >
-          <h3 style={{ marginTop: 0 }}>We couldn't score this recording</h3>
-          <p style={{ opacity: 0.85, fontSize: '1em', lineHeight: 1.5 }}>
-            {status_message ||
-              "Not enough speech to score. Try recording again and speak for at least a few seconds."}
-          </p>
-          <a
-            href="/live"
-            className="report-btn"
-            style={{ display: 'inline-block', marginTop: 8, textDecoration: 'none' }}
-          >
-            Try again
-          </a>
-        </div>
+      <div className="glass-card p-8 text-center max-w-xl mx-auto my-6">
+        <div className="text-4xl mb-3">⚠️</div>
+        <h3 className="text-text-primary mb-3">We couldn&apos;t score this recording</h3>
+        <p className="text-text-secondary mb-6">
+          {status_message || 'Not enough speech to score. Try recording again and speak for at least a few seconds.'}
+        </p>
+        <Link to="/live" className="btn btn-primary">Try again</Link>
       </div>
     )
   }
 
-  // Analyzer audio has no face signal by definition; live/upload sessions
-  // with no face in frame land on a 50-default. For analyzer_audio we can
-  // say so definitively and mark the face bars N/A rather than render a
-  // meaningless 50.
   const faceUnavailable = kind === 'analyzer_audio'
 
   const recordingVideoUrl = recording?.video_url
     ? mediaUrl(recording.video_url)
     : null
 
-  // Convert signal_averages to the format SignalBars expects
-  const barScores = {
-    eyeContact: signal_averages?.eye_contact ?? 50,
-    voiceSteadiness: signal_averages?.voice_steadiness ?? 50,
-    speechPace: signal_averages?.speech_pace ?? 50,
-    fillerWords: signal_averages?.filler_words ?? 50,
-    vocalVariety: signal_averages?.vocal_variety ?? 50,
-    expression: signal_averages?.expression ?? 50,
-  }
-
-  // Convert timeline for SessionGraph
-  const graphHistory = (timeline || []).map(t => ({
+  const graphHistory = (timeline || []).map((t) => ({
     time: t.t_s,
     score: t.total,
   }))
 
-  const gradeColor = avg_score >= 70 ? '#00c853' : avg_score >= 50 ? '#ffd600' : '#ff1744'
+  const scoreColorClass = (s) => {
+    if (s == null) return 'text-text-muted'
+    return s >= 71 ? 'text-success' : s >= 41 ? 'text-warning' : 'text-danger'
+  }
 
   return (
-    <div className="session-report">
-      {/* Header: Grade + Score */}
-      <div className="report-header">
-        <div className="report-grade" style={{ borderColor: gradeColor }}>
-          <span className="grade-letter" style={{ color: gradeColor }}>{grade}</span>
-          <span className="grade-label">{grade_label}</span>
-        </div>
-        <ScoreGauge score={avg_score} label="Average Score" size={160} />
-        <div className="report-stats">
-          <div className="stat-item">
-            <strong>{peak_score}</strong><span>Peak</span>
+    <div className="space-y-6">
+      {/* Score hero */}
+      <div className="glass-card p-8 flex flex-col sm:flex-row items-center gap-8">
+        <ScoreGauge score={avg_score} size={200} />
+        <div className="flex-1 space-y-2 text-center sm:text-left">
+          <div className="flex items-center gap-3 justify-center sm:justify-start flex-wrap">
+            <span className="text-6xl font-display font-extrabold text-text-primary leading-none">
+              {Math.round(avg_score)}
+            </span>
+            <span className={`text-3xl font-display font-bold ${scoreColorClass(avg_score)}`}>
+              {grade}
+            </span>
           </div>
-          <div className="stat-item">
-            <strong>{lowest_score}</strong><span>Lowest</span>
-          </div>
-          <div className="stat-item">
-            <strong>{formatDuration(duration_s)}</strong><span>Duration</span>
+          <p className="text-text-secondary">{grade_label}</p>
+          <div className="flex items-center gap-2 flex-wrap justify-center sm:justify-start pt-2">
+            <span className="badge badge-muted">Peak: {peak_score}</span>
+            <span className="badge badge-muted">Lowest: {lowest_score}</span>
+            <span className="badge badge-muted">{formatDuration(duration_s)}</span>
           </div>
         </div>
       </div>
 
-      {note && <div className="report-note">{note}</div>}
+      {/* Coaching card — pulled UP from below filler/pace */}
+      {((insights && insights.length > 0) || (action_items && action_items.length > 0)) && (
+        <div className="glass-card p-6 border border-border-accent">
+          <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-4">
+            ✦ Coaching Insights
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+            {insights && insights.length > 0 && (
+              <div>
+                <p className="text-success text-sm font-semibold mb-2">✅ What went well</p>
+                <ul className="space-y-1.5">
+                  {insights.map((insight, i) => (
+                    <li key={i} className="text-sm text-text-secondary flex gap-2">
+                      <span className="text-text-muted">·</span><span>{insight}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {action_items && action_items.length > 0 && (
+              <div>
+                <p className="text-warning text-sm font-semibold mb-2">↗ Work on next</p>
+                <ul className="space-y-1.5">
+                  {action_items.map((item, i) => (
+                    <li key={i} className="text-sm text-text-secondary flex gap-2">
+                      <span className="text-text-muted">·</span><span>{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
-      {/* The non-English banner that used to live here is gone —
-          unsupported_language now triggers the unscoreable-session
-          short-circuit at the top of this component (status_message
-          card with Try Again button). The old "warning + keep
-          scoring" UX was misleading; either the input is English
-          and we score, or it isn't and we don't. */}
+      {/* Practice Again CTA */}
+      <Link to="/live" className="btn btn-primary btn-full btn-lg">
+        Practice Again →
+      </Link>
+
+      <hr className="border-border" />
 
       {showRecording && recordingVideoUrl && (
-        <div className="report-section">
+        <div className="glass-card p-4">
           <video
             ref={videoElRef}
             src={recordingVideoUrl}
             controls
             playsInline
             preload="metadata"
-            className="processed-video"
-            style={{ width: '100%', borderRadius: 8 }}
+            className="w-full rounded-md bg-black"
           />
         </div>
       )}
 
-      {/* Signal Bars */}
-      <div className="report-section">
-        <h3>Signal Breakdown</h3>
+      {/* Signal bars */}
+      <div className="glass-card p-5">
+        <h3 className="mb-4">Signal Breakdown</h3>
         <ReportSignalBars
           signals={signal_averages}
           stderrs={signal_stderrs}
@@ -194,9 +182,6 @@ export default function SessionReport({
         />
       </div>
 
-      {/* "How was this computed?" — math worked out with the user's
-          actual numbers. Default-collapsed (most users skip), but
-          available for anyone who wants to verify the headline. */}
       <ScoreBreakdownPanel
         avgScore={avg_score}
         signalAverages={signal_averages}
@@ -206,20 +191,16 @@ export default function SessionReport({
         baselineNote={baseline_note}
       />
 
-      {/* Score Timeline */}
+      {/* Score timeline */}
       {graphHistory.length > 2 && (
-        <div className="report-section">
+        <div className="glass-card p-5">
           <SessionGraph history={graphHistory} />
           {session_id && (
-            <div style={{ marginTop: 8, textAlign: 'right' }}>
+            <div className="mt-2 text-right">
               <button
                 type="button"
                 onClick={() => downloadCsv(session_id)}
-                style={{
-                  background: 'none', border: 'none', padding: 0,
-                  color: '#8ab4f8', cursor: 'pointer',
-                  fontSize: '0.85em', opacity: 0.85,
-                }}
+                className="text-text-accent text-xs hover:underline"
               >
                 ⬇ Download raw scores (CSV)
               </button>
@@ -228,10 +209,9 @@ export default function SessionReport({
         </div>
       )}
 
-      {/* Progress across sessions — scoped to topic when this session has one,
-          so a "Q4 sales pitch" trend isn't muddied by an "elevator pitch" run. */}
+      {/* Progress across sessions */}
       {session_id && (
-        <div className="report-section">
+        <div className="glass-card p-5">
           <ProgressChart
             topic={topic || undefined}
             currentSessionId={session_id}
@@ -240,94 +220,69 @@ export default function SessionReport({
         </div>
       )}
 
-      {/* Filler Breakdown */}
+      {/* Filler breakdown */}
       {total_fillers > 0 && (
-        <div className="report-section">
-          <h3>Filler Words</h3>
-          <div className="filler-breakdown">
-            <div className="filler-total">
-              <strong>{total_fillers}</strong> total fillers
-              {acoustic_fillers > 0 && (
-                <span className="acoustic-note">
-                  ({acoustic_fillers} detected from audio sounds)
-                </span>
-              )}
-            </div>
-            <div className="filler-tags">
-              {Object.entries(filler_breakdown || {}).map(([word, count]) => (
-                <span key={word} className="filler-tag">{word} ({count})</span>
-              ))}
-            </div>
+        <div className="glass-card p-5">
+          <h3 className="mb-4">Filler Words</h3>
+          <p className="text-sm text-text-secondary mb-3">
+            <span className="text-warning font-display font-bold text-xl">{total_fillers}</span> total fillers
+            {acoustic_fillers > 0 && (
+              <span className="ml-2 text-text-muted">({acoustic_fillers} detected from audio sounds)</span>
+            )}
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {Object.entries(filler_breakdown || {}).map(([word, count]) => (
+              <span key={word} className="badge badge-warning">{word} ({count})</span>
+            ))}
           </div>
         </div>
       )}
 
-      {/* Pace Analysis */}
       {pace && (
-        <div className="report-section">
-          <h3>Pace Analysis</h3>
-          <div className="pace-stats">
-            <div className="pace-item">
-              <strong>{pace.avg_wpm}</strong><span>Avg WPM</span>
+        <div className="glass-card p-5">
+          <h3 className="mb-4">Pace Analysis</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="bg-elevated rounded-md p-3 text-center">
+              <p className="text-xl font-display font-bold text-text-primary">{pace.avg_wpm}</p>
+              <p className="text-xs text-text-muted">Avg WPM</p>
             </div>
-            <div className="pace-item good">
-              <strong>{pace.ideal_pct}%</strong><span>Ideal pace</span>
+            <div className="bg-elevated rounded-md p-3 text-center">
+              <p className="text-xl font-display font-bold text-success">{pace.ideal_pct}%</p>
+              <p className="text-xs text-text-muted">Ideal pace</p>
             </div>
-            <div className="pace-item warn">
-              <strong>{pace.too_fast_pct}%</strong><span>Too fast</span>
+            <div className="bg-elevated rounded-md p-3 text-center">
+              <p className="text-xl font-display font-bold text-warning">{pace.too_fast_pct}%</p>
+              <p className="text-xs text-text-muted">Too fast</p>
             </div>
-            <div className="pace-item warn">
-              <strong>{pace.too_slow_pct}%</strong><span>Too slow</span>
+            <div className="bg-elevated rounded-md p-3 text-center">
+              <p className="text-xl font-display font-bold text-warning">{pace.too_slow_pct}%</p>
+              <p className="text-xs text-text-muted">Too slow</p>
             </div>
           </div>
         </div>
       )}
 
-      {/* Insights */}
-      {insights && insights.length > 0 && (
-        <div className="report-section">
-          <h3>Insights</h3>
-          <ul className="insights-list">
-            {insights.map((insight, i) => (
-              <li key={i}>{insight}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {/* Action Items */}
-      {action_items && action_items.length > 0 && (
-        <div className="report-section action-section">
-          <h3>Action Items</h3>
-          <ul className="action-list">
-            {action_items.map((item, i) => (
-              <li key={i}>{item}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {/* Transcript */}
       {transcript && transcript.length > 0 && (
-        <div className="report-section">
-          <h3>Transcript</h3>
+        <div className="glass-card p-5">
+          <h3 className="mb-4">Transcript</h3>
           <TranscriptView words={transcript} />
         </div>
       )}
 
-      {/* Actions */}
-      <div className="report-actions">
-        {onDownloadJSON && (
-          <button className="report-btn" onClick={onDownloadJSON}>
-            Download Report JSON
-          </button>
-        )}
-        {onCopyTranscript && (
-          <button className="report-btn secondary" onClick={onCopyTranscript}>
-            Copy Transcript
-          </button>
-        )}
-      </div>
+      {(onDownloadJSON || onCopyTranscript) && (
+        <div className="flex gap-3 justify-center pt-2">
+          {onDownloadJSON && (
+            <button className="btn btn-primary" onClick={onDownloadJSON}>
+              Download Report JSON
+            </button>
+          )}
+          {onCopyTranscript && (
+            <button className="btn btn-secondary" onClick={onCopyTranscript}>
+              Copy Transcript
+            </button>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -336,17 +291,21 @@ function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
   if (!signals) return null
   const items = [
     { key: 'voice_steadiness', label: 'Voice Steadiness', face: false },
-    { key: 'eye_contact', label: 'Eye Contact', face: true },
-    { key: 'speech_pace', label: 'Speech Pace', face: false },
-    { key: 'filler_words', label: 'Filler Words', face: false },
-    { key: 'vocal_variety', label: 'Vocal Variety', face: false },
-    { key: 'expression', label: 'Expression', face: true },
+    { key: 'eye_contact',      label: 'Eye Contact',      face: true  },
+    { key: 'speech_pace',      label: 'Speech Pace',      face: false },
+    { key: 'filler_words',     label: 'Filler Words',     face: false },
+    { key: 'vocal_variety',    label: 'Vocal Variety',    face: false },
+    { key: 'expression',       label: 'Expression',       face: true  },
   ]
 
-  const barColor = (v) => v >= 71 ? '#00c853' : v >= 41 ? '#ffd600' : '#ff1744'
+  const fillClass = (v) => {
+    if (v >= 75) return 'bg-gradient-to-r from-success to-cyan'
+    if (v >= 50) return 'bg-gradient-to-r from-warning to-amber-400'
+    return 'bg-gradient-to-r from-danger to-orange-500'
+  }
 
   return (
-    <div className="signal-bars">
+    <div className="space-y-4">
       {items.map(({ key, label, face }) => {
         const rawValue = signals[key]
         const noData = rawValue === null || rawValue === undefined
@@ -357,53 +316,36 @@ function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
         const se = typeof raw === 'number' ? Math.round(raw) : null
         const reason = reasons?.[key]
         let unavailableNote = null
-        if (faceMissing) {
-          unavailableNote = 'No face data available for this recording.'
-        } else if (noData) {
-          unavailableNote = 'No data available for this signal.'
-        }
+        if (faceMissing) unavailableNote = 'No face data available for this recording.'
+        else if (noData) unavailableNote = 'No data available for this signal.'
         return (
-          <div key={key} className="signal-row">
-            <div className="signal-label">
-              <span>{label}<SignalInfoTooltip signal={key} /></span>
-              {reason && !hide && (
-                <div style={{
-                  fontSize: '0.72em',
-                  opacity: 0.65,
-                  marginTop: 2,
-                }}>
-                  {reason}
+          <div key={key} className={`space-y-1.5 ${hide ? 'opacity-40' : ''}`}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-sm font-medium text-text-primary">{label}</span>
+                  {!hide && <SignalInfoTooltip signal={key} />}
                 </div>
-              )}
-              {hide && unavailableNote && (
-                <div style={{
-                  fontSize: '0.72em',
-                  opacity: 0.55,
-                  marginTop: 2,
-                }}>
-                  {unavailableNote}
-                </div>
-              )}
+                {reason && !hide && (
+                  <p className="text-xs text-text-muted mt-0.5">{reason}</p>
+                )}
+                {hide && unavailableNote && (
+                  <p className="text-xs text-text-muted mt-0.5">{unavailableNote}</p>
+                )}
+              </div>
+              <span className="text-sm font-bold font-display tabular-nums text-text-primary flex-shrink-0">
+                {hide ? '—' : Math.round(value)}
+                {!hide && se !== null && se >= 1 && (
+                  <span className="text-text-muted text-xs ml-1">± {se}</span>
+                )}
+              </span>
             </div>
-            <div className="signal-bar-bg">
-              <div className="signal-bar-fill" style={{
-                width: hide ? '0%' : `${value}%`,
-                backgroundColor: hide ? '#444' : barColor(value),
-                transition: 'width 0.5s ease',
-              }} />
-            </div>
-            <div
-              className="signal-value"
-              style={{ color: hide ? '#888' : barColor(value) }}
-            >
-              {hide ? 'N/A' : Math.round(value)}
-              {!hide && se !== null && se >= 1 && (
-                <span
-                  title="Standard error across chunks — how steady the signal was"
-                  style={{ opacity: 0.55, marginLeft: 4, fontSize: '0.75em' }}
-                >
-                  ± {se}
-                </span>
+            <div className="h-1.5 bg-elevated rounded-full overflow-hidden">
+              {!hide && (
+                <div
+                  className={`h-full rounded-full transition-all duration-700 ease-out ${fillClass(value)}`}
+                  style={{ width: `${value}%` }}
+                />
               )}
             </div>
           </div>
@@ -414,9 +356,6 @@ function ReportSignalBars({ signals, stderrs, reasons, faceUnavailable }) {
 }
 
 async function downloadCsv(sessionId) {
-  // Use apiFetch so the X-API-Key header goes along when configured.
-  // A plain anchor tag can't inject custom headers, so we fetch the
-  // bytes, wrap them in a Blob, and trigger a programmatic download.
   try {
     const res = await apiFetch(`${API_BASE}/api/report/${sessionId}/csv`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -430,7 +369,9 @@ async function downloadCsv(sessionId) {
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
   } catch (e) {
-    alert(`CSV download failed: ${e.message}`)
+    // Surface inline by triggering a hosted alert is removed in this revamp;
+    // the download fail path is rare. Console-log instead.
+    console.error('CSV download failed', e)
   }
 }
 

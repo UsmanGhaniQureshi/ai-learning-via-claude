@@ -1,23 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import { fmtSecs } from '../utils/timeStr'
 import TrimSegmentsEditor, { validateSegments } from '../components/TrimSegmentsEditor'
 
-/**
- * Upload — three-step flow:
- *   1. Pick a video file → preview it locally via blob: URL.
- *   2. Optionally add one OR MORE trim segments. Each row is
- *      independent; the kept segments play back-to-back in the
- *      order added. Overlaps are NOT merged — duplicate seconds
- *      replay, which matches the explicit composer.
- *   3. Submit → POST /api/upload (returns 202 + media_id), then poll
- *      GET /api/media/{id}/status until completed/failed.
- *
- * "Use full clip" defaults to ON so a user who just wants to analyze
- * the whole thing keeps the one-click flow.
- */
 export default function Upload() {
   const [pickedFile, setPickedFile] = useState(null)
   const [previewUrl, setPreviewUrl] = useState(null)
@@ -28,6 +15,7 @@ export default function Upload() {
   const [statusText, setStatusText] = useState(null)
   const [uploadError, setUploadError] = useState(null)
   const videoRef = useRef(null)
+  const fileInputRef = useRef(null)
   const navigate = useNavigate()
 
   useEffect(() => {
@@ -36,8 +24,7 @@ export default function Upload() {
     }
   }, [previewUrl])
 
-  function handleFilePick(e) {
-    const file = e.target.files[0]
+  function pickFile(file) {
     if (!file) return
     setUploadError(null)
     if (previewUrl) URL.revokeObjectURL(previewUrl)
@@ -46,6 +33,21 @@ export default function Upload() {
     setPreviewDuration(0)
     setUseFull(true)
     setSegments([{ start: '', end: '' }])
+  }
+
+  function handleFilePick(e) {
+    pickFile(e.target.files[0])
+  }
+
+  function handleDrop(e) {
+    e.preventDefault()
+    const file = e.dataTransfer?.files?.[0]
+    if (!file) return
+    if (!file.type.startsWith('video/')) {
+      setUploadError('Please drop a video file (MP4, MOV, WebM).')
+      return
+    }
+    pickFile(file)
   }
 
   function reset() {
@@ -116,23 +118,47 @@ export default function Upload() {
   }
 
   return (
-    <div className="section">
-      <h2>Analyze a Presentation Recording</h2>
-      <p className="subtitle">Upload a video — get face + speech + confidence analysis</p>
+    <div>
+      <p className="text-sm text-text-muted mb-6">
+        <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
+        {' / '}
+        <span className="text-text-secondary">Analyze a Video</span>
+      </p>
 
-      {uploadError && <div className="session-error">{uploadError}</div>}
+      <div className="mb-6">
+        <h2 className="mb-1">Analyze a Presentation Recording</h2>
+        <p className="text-text-secondary text-sm">Upload a video — get face + speech + confidence analysis</p>
+      </div>
+
+      {uploadError && (
+        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2 mb-4">
+          {uploadError}
+        </div>
+      )}
 
       {!pickedFile && !uploading && (
-        <label className="upload-area">
-          <span className="upload-icon">&#x1F4C1;</span>
-          <span>Click to select video</span>
-          <span className="small">.mp4, .avi, .mov (max 500MB)</span>
-          <input type="file" accept="video/*" onChange={handleFilePick} hidden />
-        </label>
+        <div
+          onDrop={handleDrop}
+          onDragOver={(e) => e.preventDefault()}
+          onClick={() => fileInputRef.current?.click()}
+          className="border-2 border-dashed border-border rounded-xl p-16 text-center cursor-pointer transition-all duration-200 hover:border-border-accent hover:bg-accent-soft group"
+        >
+          <div className="text-5xl mb-4 group-hover:scale-110 transition-transform duration-200">📁</div>
+          <p className="font-semibold text-text-primary mb-1">Drop your video here</p>
+          <p className="text-sm text-text-muted">or click to browse</p>
+          <p className="text-xs text-text-muted mt-3">MP4, MOV, WebM · max 500MB</p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="video/*"
+            onChange={handleFilePick}
+            hidden
+          />
+        </div>
       )}
 
       {pickedFile && !uploading && (
-        <div className="upload-preview" style={{ marginTop: 16 }}>
+        <div className="space-y-4">
           <video
             ref={videoRef}
             src={previewUrl}
@@ -140,24 +166,20 @@ export default function Upload() {
             playsInline
             preload="metadata"
             onLoadedMetadata={(e) => setPreviewDuration(e.currentTarget.duration || 0)}
-            style={{ width: '100%', maxHeight: 360, borderRadius: 8, background: '#000' }}
+            className="w-full max-h-[360px] rounded-md bg-black"
           />
 
-          <div style={{ marginTop: 10, fontSize: '0.85em', opacity: 0.8 }}>
-            <strong>{pickedFile.name}</strong>
-            {previewDuration > 0 && <> &middot; {fmtSecs(previewDuration)}</>}
-          </div>
+          <p className="text-sm text-text-secondary">
+            <strong className="text-text-primary">{pickedFile.name}</strong>
+            {previewDuration > 0 && <> · {fmtSecs(previewDuration)}</>}
+          </p>
 
-          <label
-            style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              marginTop: 12, fontSize: '0.92em',
-            }}
-          >
+          <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
             <input
               type="checkbox"
               checked={useFull}
               onChange={(e) => setUseFull(e.target.checked)}
+              className="accent-accent"
             />
             Use full clip (default — analyze the whole video)
           </label>
@@ -171,18 +193,18 @@ export default function Upload() {
             />
           )}
 
-          <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
-            <button onClick={handleSubmit}>Analyze</button>
-            <button onClick={reset} className="secondary">Pick a different file</button>
+          <div className="flex gap-3">
+            <button onClick={handleSubmit} className="btn btn-primary">Analyze</button>
+            <button onClick={reset} className="btn btn-secondary">Pick a different file</button>
           </div>
         </div>
       )}
 
       {uploading && (
-        <div className="processing">
-          <div className="spinner"></div>
-          <p>{statusText || 'Processing video…'}</p>
-          <p className="small">This may take a moment for longer videos.</p>
+        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
+          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-primary">{statusText || 'Processing video…'}</p>
+          <p className="text-text-muted text-sm">This may take a moment for longer videos.</p>
         </div>
       )}
     </div>

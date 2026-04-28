@@ -1,9 +1,5 @@
 import { useRef, useEffect } from 'react'
 
-/**
- * Canvas-based line chart showing confidence score over time.
- * Auto-scrolls as session progresses.
- */
 export default function SessionGraph({ history = [] }) {
   const canvasRef = useRef(null)
 
@@ -19,18 +15,16 @@ export default function SessionGraph({ history = [] }) {
     const drawW = W - padding.left - padding.right
     const drawH = H - padding.top - padding.bottom
 
-    // Clear
-    ctx.fillStyle = '#0d0d1a'
-    ctx.fillRect(0, 0, W, H)
+    ctx.fillStyle = 'rgba(0,0,0,0)'
+    ctx.clearRect(0, 0, W, H)
 
-    // Show last 60 data points (~30 seconds of data)
     const visibleData = history.slice(-60)
     const maxTime = visibleData[visibleData.length - 1].time
     const minTime = visibleData[0].time
     const timeRange = Math.max(maxTime - minTime, 1)
 
-    // Grid lines
-    ctx.strokeStyle = '#1a1a2e'
+    // Grid + Y labels
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)'
     ctx.lineWidth = 1
     for (let y = 0; y <= 100; y += 25) {
       const py = padding.top + drawH * (1 - y / 100)
@@ -38,44 +32,36 @@ export default function SessionGraph({ history = [] }) {
       ctx.moveTo(padding.left, py)
       ctx.lineTo(W - padding.right, py)
       ctx.stroke()
-
-      // Y-axis labels
-      ctx.fillStyle = '#555'
+      ctx.fillStyle = '#475569'
       ctx.font = '10px monospace'
       ctx.textAlign = 'right'
       ctx.fillText(y.toString(), padding.left - 5, py + 3)
     }
 
-    // Color zones (background)
-    // Red zone (0-40)
-    ctx.fillStyle = 'rgba(255,23,68,0.05)'
+    // Color zones
+    ctx.fillStyle = 'rgba(239,68,68,0.05)'
     ctx.fillRect(padding.left, padding.top + drawH * 0.6, drawW, drawH * 0.4)
-    // Amber zone (41-70)
-    ctx.fillStyle = 'rgba(255,214,0,0.05)'
+    ctx.fillStyle = 'rgba(245,158,11,0.05)'
     ctx.fillRect(padding.left, padding.top + drawH * 0.3, drawW, drawH * 0.3)
-    // Green zone (71-100)
-    ctx.fillStyle = 'rgba(0,200,83,0.05)'
+    ctx.fillStyle = 'rgba(16,185,129,0.05)'
     ctx.fillRect(padding.left, padding.top, drawW, drawH * 0.3)
 
-    // Draw line
+    // Line
     ctx.lineWidth = 2
     ctx.lineJoin = 'round'
     ctx.beginPath()
-
     visibleData.forEach((point, i) => {
       const x = padding.left + (drawW * (point.time - minTime)) / timeRange
       const y = padding.top + drawH * (1 - point.score / 100)
-
       if (i === 0) ctx.moveTo(x, y)
       else ctx.lineTo(x, y)
     })
 
-    // Gradient stroke based on latest score
     const latestScore = visibleData[visibleData.length - 1].score
-    ctx.strokeStyle = latestScore >= 71 ? '#00c853' : latestScore >= 41 ? '#ffd600' : '#ff1744'
+    ctx.strokeStyle = latestScore >= 71 ? '#10b981' : latestScore >= 41 ? '#f59e0b' : '#ef4444'
     ctx.stroke()
 
-    // Current score dot
+    // Current dot
     const lastPoint = visibleData[visibleData.length - 1]
     const lx = padding.left + drawW
     const ly = padding.top + drawH * (1 - lastPoint.score / 100)
@@ -85,7 +71,7 @@ export default function SessionGraph({ history = [] }) {
     ctx.fill()
 
     // Time labels
-    ctx.fillStyle = '#555'
+    ctx.fillStyle = '#475569'
     ctx.font = '10px monospace'
     ctx.textAlign = 'center'
     const startSec = Math.floor(minTime)
@@ -96,9 +82,16 @@ export default function SessionGraph({ history = [] }) {
   }, [history])
 
   return (
-    <div className="session-graph">
-      <h4>Score Over Time</h4>
-      <canvas ref={canvasRef} width={600} height={200} className="graph-canvas" />
+    <div>
+      <h4 className="text-text-primary text-sm font-semibold mb-2 uppercase tracking-wider">
+        Score Over Time
+      </h4>
+      <canvas
+        ref={canvasRef}
+        width={600}
+        height={200}
+        className="w-full h-auto rounded border border-border bg-page/40"
+      />
     </div>
   )
 }

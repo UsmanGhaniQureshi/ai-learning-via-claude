@@ -1,22 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { API_BASE, apiFetch } from '../config'
 
-/**
- * MetadataEditor — inline editing for a Media row's title, topic,
- * and tag chips. Sits at the top of the Result page.
- *
- * Behaviour:
- *   - Title: click to edit, blur or Enter to save. Falls back to a
- *     placeholder ("Untitled recording — click to name").
- *   - Topic: free-text input next to title.
- *   - Tags: chip list with an "Add tag" input. Backend lower-cases
- *     and de-duplicates; UI just shows the canonical form back.
- *
- * All edits are PATCH'd individually — small payloads, optimistic
- * UI, server response is the source of truth (re-renders with the
- * canonicalised tags from the server). Network failures show an
- * inline error and revert.
- */
 export default function MetadataEditor({ mediaId, initial, onUpdated }) {
   const [title, setTitle] = useState(initial?.title || '')
   const [topic, setTopic] = useState(initial?.topic || '')
@@ -25,7 +9,6 @@ export default function MetadataEditor({ mediaId, initial, onUpdated }) {
   const [error, setError] = useState(null)
   const [busy, setBusy] = useState(false)
 
-  // Keep local state in sync if `initial` ever changes (parent re-fetch).
   const lastInitId = useRef(mediaId)
   useEffect(() => {
     if (lastInitId.current !== mediaId) {
@@ -50,8 +33,6 @@ export default function MetadataEditor({ mediaId, initial, onUpdated }) {
         throw new Error(err.error || `HTTP ${res.status}`)
       }
       const data = await res.json()
-      // Server returns canonical values — sync local state to whatever
-      // it stored (handles trim/lowercase/de-dup of tags transparently).
       setTitle(data.title || '')
       setTopic(data.topic || '')
       setTags(data.tags || [])
@@ -63,7 +44,6 @@ export default function MetadataEditor({ mediaId, initial, onUpdated }) {
     }
   }
 
-  // Save on blur, only if value actually changed (avoid PATCH spam).
   function saveTitleIfChanged() {
     if ((initial?.title || '') !== title) patch({ title })
   }
@@ -86,20 +66,10 @@ export default function MetadataEditor({ mediaId, initial, onUpdated }) {
   }
 
   return (
-    <div
-      style={{
-        background: '#161620',
-        border: '1px solid #2a2a35',
-        borderRadius: 8,
-        padding: 14,
-        marginBottom: 16,
-      }}
-    >
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'flex-end' }}>
-        <label style={{ flex: '2 1 280px', display: 'block' }}>
-          <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 4 }}>
-            Title
-          </div>
+    <div className="glass-card p-4 mb-4">
+      <div className="grid grid-cols-1 sm:grid-cols-[2fr_1fr] gap-3">
+        <label className="block">
+          <div className="text-xs text-text-muted mb-1">Title</div>
           <input
             type="text"
             value={title}
@@ -109,13 +79,11 @@ export default function MetadataEditor({ mediaId, initial, onUpdated }) {
             onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur() }}
             maxLength={200}
             disabled={busy}
-            style={inputStyle}
+            className="input"
           />
         </label>
-        <label style={{ flex: '1 1 200px', display: 'block' }}>
-          <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 4 }}>
-            Topic
-          </div>
+        <label className="block">
+          <div className="text-xs text-text-muted mb-1">Topic</div>
           <input
             type="text"
             value={topic}
@@ -125,25 +93,23 @@ export default function MetadataEditor({ mediaId, initial, onUpdated }) {
             onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur() }}
             maxLength={120}
             disabled={busy}
-            style={inputStyle}
+            className="input"
           />
         </label>
       </div>
 
-      <div style={{ marginTop: 12 }}>
-        <div style={{ fontSize: '0.78em', opacity: 0.7, marginBottom: 4 }}>
-          Tags
-        </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+      <div className="mt-3">
+        <div className="text-xs text-text-muted mb-1">Tags</div>
+        <div className="flex flex-wrap gap-2 items-center">
           {tags.map((t) => (
-            <span key={t} style={chipStyle}>
+            <span key={t} className="badge badge-accent gap-1.5">
               {t}
               <button
                 type="button"
                 onClick={() => removeTag(t)}
                 disabled={busy}
                 title="Remove tag"
-                style={chipRemoveStyle}
+                className="text-text-accent hover:text-text-primary leading-none"
               >
                 ×
               </button>
@@ -157,10 +123,16 @@ export default function MetadataEditor({ mediaId, initial, onUpdated }) {
             onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addTag() } }}
             maxLength={40}
             disabled={busy || tags.length >= 20}
-            style={{ ...inputStyle, flex: '0 1 200px' }}
+            className="input flex-1 min-w-[140px]"
+            style={{ maxWidth: 200 }}
           />
           {newTag.trim() && (
-            <button type="button" onClick={addTag} disabled={busy} className="report-btn" style={{ padding: '4px 10px' }}>
+            <button
+              type="button"
+              onClick={addTag}
+              disabled={busy}
+              className="btn btn-primary btn-sm"
+            >
               Add
             </button>
           )}
@@ -168,41 +140,10 @@ export default function MetadataEditor({ mediaId, initial, onUpdated }) {
       </div>
 
       {error && (
-        <div className="session-error" style={{ marginTop: 10 }}>
-          Couldn't save: {error}
+        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-3 py-2 mt-3">
+          Couldn&apos;t save: {error}
         </div>
       )}
     </div>
   )
-}
-
-const inputStyle = {
-  width: '100%',
-  padding: '8px 10px',
-  borderRadius: 6,
-  border: '1px solid #444',
-  background: '#1c1c24',
-  color: '#eee',
-  fontSize: '0.95rem',
-}
-
-const chipStyle = {
-  display: 'inline-flex',
-  alignItems: 'center',
-  gap: 4,
-  background: '#2a3850',
-  color: '#cfe1ff',
-  padding: '3px 8px',
-  borderRadius: 12,
-  fontSize: '0.8rem',
-}
-
-const chipRemoveStyle = {
-  background: 'none',
-  border: 'none',
-  color: '#cfe1ff',
-  cursor: 'pointer',
-  fontSize: '1rem',
-  lineHeight: 1,
-  padding: 0,
 }

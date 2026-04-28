@@ -1,24 +1,6 @@
 import { useEffect, useRef, useState, useMemo, forwardRef, useImperativeHandle } from 'react'
-import { API_BASE, mediaUrl } from '../config'
+import { mediaUrl } from '../config'
 
-/**
- * PlaybackReview — Poised-style synchronised playback.
- *
- * Plays the server's overlay video and, as it plays, surfaces:
- *   - The face confidence / expression / eye contact at the current moment
- *     (nearest face_timeline entry, which runs every ~2 s).
- *   - The speech score + any fillers at the current moment
- *     (nearest speech_timeline entry, one per 3 s chunk).
- *   - A word-by-word transcript with the active word highlighted.
- *     Clicking a word jumps the video to that word's start time.
- *
- * All data comes from the /api/upload response (face_timeline +
- * speech_timeline.words with absolute timestamps).
- *
- * Exposes an imperative `seekTo(seconds)` method via ref — the parent's
- * Face Timeline "Jump" buttons call it to seek this video and scroll it
- * into view without needing to own the DOM ref.
- */
 const PlaybackReview = forwardRef(function PlaybackReview(
   { processedVideo, processedVideoUrl, faceTimeline, speechTimeline },
   ref,
@@ -41,10 +23,6 @@ const PlaybackReview = forwardRef(function PlaybackReview(
     getCurrentTime() {
       return videoRef.current?.currentTime || 0
     },
-    // Same shape as AudioPlaybackReview's seekAndPlay so CommentsThread
-    // can call it without caring whether the player is audio or video.
-    // When `endS` is set, attaches a one-shot timeupdate listener that
-    // pauses at the range end. See AudioPlaybackReview for rationale.
     seekAndPlay(startS, endS) {
       const video = videoRef.current
       if (!video) return
@@ -73,7 +51,6 @@ const PlaybackReview = forwardRef(function PlaybackReview(
   const [currentSpeech, setCurrentSpeech] = useState(null)
   const [currentWordIdx, setCurrentWordIdx] = useState(-1)
 
-  // Flatten all words with absolute timestamps once, not per timeupdate.
   const allWords = useMemo(
     () => (speechTimeline || []).flatMap((s) => s.words || []),
     [speechTimeline]
@@ -87,7 +64,6 @@ const PlaybackReview = forwardRef(function PlaybackReview(
       const t = video.currentTime
       const tMs = t * 1000
 
-      // Nearest face_timeline entry at or before t
       let fEntry = null
       for (const e of faceTimeline || []) {
         if (e.timestamp <= t) fEntry = e
@@ -95,7 +71,6 @@ const PlaybackReview = forwardRef(function PlaybackReview(
       }
       setCurrentFace(fEntry)
 
-      // Nearest speech_timeline entry at or before t
       let sEntry = null
       for (const e of speechTimeline || []) {
         if (e.timestamp <= t) sEntry = e
@@ -103,7 +78,6 @@ const PlaybackReview = forwardRef(function PlaybackReview(
       }
       setCurrentSpeech(sEntry)
 
-      // Active word — linear scan is fine, typical sessions have <1k words
       let idx = -1
       for (let i = 0; i < allWords.length; i++) {
         const w = allWords[i]
@@ -120,7 +94,6 @@ const PlaybackReview = forwardRef(function PlaybackReview(
     return () => video.removeEventListener('timeupdate', onTimeUpdate)
   }, [faceTimeline, speechTimeline, allWords])
 
-  // Keep the active word in view without jumping the whole page
   useEffect(() => {
     if (activeWordRef.current && transcriptContainerRef.current) {
       const container = transcriptContainerRef.current
@@ -133,9 +106,9 @@ const PlaybackReview = forwardRef(function PlaybackReview(
     }
   }, [currentWordIdx])
 
-  const scoreColor = (s) => {
-    if (s == null) return '#888'
-    return s >= 71 ? '#00c853' : s >= 41 ? '#ffd600' : '#ff1744'
+  const colorClass = (s) => {
+    if (s == null) return 'text-text-muted'
+    return s >= 71 ? 'text-success' : s >= 41 ? 'text-warning' : 'text-danger'
   }
 
   const handleWordClick = (word) => {
@@ -147,15 +120,14 @@ const PlaybackReview = forwardRef(function PlaybackReview(
   if (!processedVideo) return null
 
   return (
-    <div className="playback-review" ref={rootRef}>
-      <h3>Playback Review</h3>
-      <p className="pb-subtitle">
-        Play the video — scores and transcript sync to the current moment.
-        Click any word to jump there.
+    <div ref={rootRef} className="glass-card p-5 my-6">
+      <h3 className="mb-1">Playback Review</h3>
+      <p className="text-text-secondary text-sm mb-4">
+        Play the video — scores and transcript sync to the current moment. Click any word to jump there.
       </p>
 
-      <div className="pb-grid">
-        <div className="pb-video-wrap">
+      <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-4 items-start">
+        <div>
           <video
             key={processedVideoUrl || processedVideo}
             ref={videoRef}
@@ -163,60 +135,55 @@ const PlaybackReview = forwardRef(function PlaybackReview(
             controls
             playsInline
             preload="auto"
-            className="processed-video"
-            style={{ width: '100%', borderRadius: 8 }}
+            className="w-full rounded-md bg-black"
           />
         </div>
 
-        <div className="pb-live-panel">
-          <div className="pb-live-card">
-            <div className="pb-live-label">Face</div>
-            <div
-              className="pb-live-value"
-              style={{ color: scoreColor(currentFace?.face_confidence) }}
-            >
+        <div className="flex flex-col gap-3">
+          <div className="bg-page/60 border border-border rounded-md p-3">
+            <p className="text-xs text-text-muted uppercase tracking-wider mb-1">Face</p>
+            <p className={`text-3xl font-display font-bold leading-none ${colorClass(currentFace?.face_confidence)}`}>
               {currentFace?.face_confidence ?? '—'}
-            </div>
-            <div className="pb-live-meta">
+            </p>
+            <p className="text-text-secondary text-xs mt-1">
               {currentFace?.expression || '—'}
               {currentFace?.eye_contact_pct != null && (
                 <> · Eye {currentFace.eye_contact_pct}%</>
               )}
-            </div>
+            </p>
           </div>
 
-          <div className="pb-live-card">
-            <div className="pb-live-label">Speech</div>
-            <div
-              className="pb-live-value"
-              style={{ color: scoreColor(currentSpeech?.speech_score) }}
-            >
+          <div className="bg-page/60 border border-border rounded-md p-3">
+            <p className="text-xs text-text-muted uppercase tracking-wider mb-1">Speech</p>
+            <p className={`text-3xl font-display font-bold leading-none ${colorClass(currentSpeech?.speech_score)}`}>
               {currentSpeech?.speech_score ?? '—'}
-            </div>
-            <div className="pb-live-meta">
+            </p>
+            <p className="text-text-secondary text-xs mt-1">
               {currentSpeech?.fillers?.length > 0
                 ? `Fillers: ${currentSpeech.fillers.join(', ')}`
                 : 'No fillers in this chunk'}
-            </div>
+            </p>
           </div>
         </div>
       </div>
 
       {allWords.length > 0 && (
-        <div className="pb-transcript">
-          <div className="pb-transcript-label">Transcript</div>
-          <div className="pb-transcript-text" ref={transcriptContainerRef}>
+        <div className="bg-page/60 border border-border rounded-md p-4 mt-4">
+          <p className="text-xs text-text-muted uppercase tracking-wider mb-2">Transcript</p>
+          <div ref={transcriptContainerRef} className="max-h-44 overflow-y-auto leading-relaxed text-text-secondary text-sm">
             {allWords.map((w, i) => {
               const isActive = i === currentWordIdx
+              const cls = [
+                'cursor-pointer px-1 py-0.5 rounded transition-colors',
+                isActive ? 'bg-accent text-white' : 'hover:bg-elevated hover:text-text-primary',
+                w.is_filler ? 'text-warning italic' : '',
+                isActive && w.is_filler ? 'bg-warning text-white' : '',
+              ].join(' ')
               return (
                 <span
                   key={i}
                   ref={isActive ? activeWordRef : null}
-                  className={
-                    'pb-word' +
-                    (isActive ? ' pb-word-active' : '') +
-                    (w.is_filler ? ' pb-word-filler' : '')
-                  }
+                  className={cls}
                   onClick={() => handleWordClick(w)}
                 >
                   {w.word}{' '}

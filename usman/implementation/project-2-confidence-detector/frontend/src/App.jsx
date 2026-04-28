@@ -1,5 +1,4 @@
-import { Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom'
-import './App.css'
+import { Routes, Route, Link, NavLink, useLocation } from 'react-router-dom'
 import Home from './pages/Home'
 import Upload from './pages/Upload'
 import Result from './pages/Result'
@@ -21,111 +20,79 @@ function App() {
   )
 }
 
+function navLinkClass({ isActive }) {
+  return `text-sm font-medium px-3 py-1.5 rounded-md transition-all ${
+    isActive
+      ? 'text-text-accent bg-accent-soft'
+      : 'text-text-secondary hover:text-text-primary hover:bg-elevated'
+  }`
+}
+
 function AppShell() {
   const location = useLocation()
-  const navigate = useNavigate()
   const { user, logout } = useAuth()
-  const isHome = location.pathname === '/'
-  // No back button on the auth pages (they're entry points; back from
-  // /login goes nowhere useful).
   const isAuthPage = location.pathname === '/login' || location.pathname === '/register'
 
   return (
-    <div className="app">
-      <header style={{ position: 'relative' }}>
-        <Link to={user ? '/' : '/login'} style={{ textDecoration: 'none', color: 'inherit' }}>
-          <h1>Confidence Detector</h1>
-          <p>AI Presentation Coaching — Real-time Feedback</p>
-        </Link>
-        {user && (
-          <div
-            style={{
-              position: 'absolute',
-              top: 16,
-              right: 16,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 12,
-              fontSize: '0.9rem',
-            }}
-          >
-            <span style={{ opacity: 0.8 }}>{user.name}</span>
+    <>
+      {/* Fixed top header — shown only when authenticated and not on auth pages */}
+      {user && !isAuthPage && (
+        <header className="fixed top-0 left-0 right-0 z-50 h-[60px]
+          bg-[rgba(10,10,15,0.8)] backdrop-blur-nav border-b
+          border-border flex items-center justify-between px-6 sm:px-8">
+          <Link to="/" className="font-display text-2xl font-extrabold tracking-[-0.04em] text-text-primary">
+            cd<span className="text-accent">.</span>
+          </Link>
+
+          <nav className="flex items-center gap-1">
+            <NavLink to="/" end className={navLinkClass}>Home</NavLink>
+            <NavLink to="/library" className={navLinkClass}>Library</NavLink>
+            <NavLink to="/how-it-works" className={navLinkClass}>How it Works</NavLink>
+          </nav>
+
+          <div className="flex items-center gap-3">
+            <span className="hidden sm:inline text-sm text-text-secondary">{user.name}</span>
             <button
               type="button"
               onClick={logout}
-              style={{
-                background: 'transparent',
-                border: '1px solid #555',
-                color: '#ccc',
-                padding: '4px 10px',
-                borderRadius: 4,
-                cursor: 'pointer',
-                fontSize: '0.85rem',
-              }}
+              className="btn btn-secondary btn-sm"
             >
               Sign out
             </button>
           </div>
-        )}
-      </header>
-
-      {!isHome && !isAuthPage && (
-        <button className="back-btn" onClick={() => navigate(-1)}>
-          &larr; Back
-        </button>
+        </header>
       )}
 
-      <ErrorBoundary>
-        <Routes>
-          {/* Public auth routes */}
-          <Route path="/login" element={<Login />} />
-          <Route path="/register" element={<Register />} />
-          {/* /how-it-works is gated behind RequireAuth like everything
-              else — content is non-sensitive but the rule is uniform.
-              Move this OUT of RequireAuth if you want it public. */}
-          <Route path="/how-it-works" element={<RequireAuth><HowItWorks /></RequireAuth>} />
+      <main className={user && !isAuthPage ? 'page-glow' : ''}>
+        <div className={isAuthPage ? 'min-h-screen flex items-center justify-center px-6' : 'page'}>
+          <ErrorBoundary>
+            <Routes>
+              <Route path="/login" element={<Login />} />
+              <Route path="/register" element={<Register />} />
+              <Route path="/how-it-works" element={<RequireAuth><HowItWorks /></RequireAuth>} />
 
-          {/* Protected app routes — every page below requires login */}
-          <Route path="/" element={<RequireAuth><Home /></RequireAuth>} />
-          <Route path="/live" element={<RequireAuth><LiveSession /></RequireAuth>} />
-          <Route path="/upload" element={<RequireAuth><Upload /></RequireAuth>} />
-          <Route path="/analyzer" element={<RequireAuth><Analyzer /></RequireAuth>} />
-          <Route path="/library" element={<RequireAuth><History /></RequireAuth>} />
-          <Route path="/result/:id" element={<RequireAuth><Result /></RequireAuth>} />
+              <Route path="/" element={<RequireAuth><Home /></RequireAuth>} />
+              <Route path="/live" element={<RequireAuth><LiveSession /></RequireAuth>} />
+              <Route path="/upload" element={<RequireAuth><Upload /></RequireAuth>} />
+              <Route path="/analyzer" element={<RequireAuth><Analyzer /></RequireAuth>} />
+              <Route path="/library" element={<RequireAuth><History /></RequireAuth>} />
+              <Route path="/result/:id" element={<RequireAuth><Result /></RequireAuth>} />
 
-          <Route
-            path="*"
-            element={
-              <div className="section">
-                <h2>Page not found</h2>
-                <p className="subtitle">No route matches this URL.</p>
-                <Link to="/" className="report-btn">← Home</Link>
-              </div>
-            }
-          />
-        </Routes>
-      </ErrorBoundary>
-
-      {/* Footer link — discoverable from every page once logged in.
-          Hidden on auth pages and the explainer itself to avoid
-          self-referencing clutter. */}
-      {user && !isAuthPage && location.pathname !== '/how-it-works' && (
-        <footer
-          style={{
-            marginTop: 40,
-            padding: '16px 0',
-            borderTop: '1px solid #2a2a35',
-            textAlign: 'center',
-            fontSize: '0.85em',
-            opacity: 0.7,
-          }}
-        >
-          <Link to="/how-it-works" style={{ color: '#8ab4f8' }}>
-            How is this calculated?
-          </Link>
-        </footer>
-      )}
-    </div>
+              <Route
+                path="*"
+                element={
+                  <div className="text-center py-24 space-y-4">
+                    <h2>Page not found</h2>
+                    <p className="text-text-secondary">No route matches this URL.</p>
+                    <Link to="/" className="btn btn-primary">← Home</Link>
+                  </div>
+                }
+              />
+            </Routes>
+          </ErrorBoundary>
+        </div>
+      </main>
+    </>
   )
 }
 

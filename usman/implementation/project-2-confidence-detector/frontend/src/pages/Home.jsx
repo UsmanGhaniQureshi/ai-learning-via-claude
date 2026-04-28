@@ -1,47 +1,94 @@
 import { Link } from 'react-router-dom'
 import ProgressChart from '../components/ProgressChart'
 
-/**
- * Home — four mode cards + a compact "last 5 sessions" progress strip.
- * The strip renders nothing distracting until ≥1 finished session exists,
- * at which point it fills in a sparkline + delta pill so users see whether
- * they're trending up before they bother opening a report.
- */
+const MODES = [
+  {
+    path: '/live',
+    icon: '🎥',
+    title: 'Live Practice',
+    description: 'Record yourself on a topic. Scored live on confidence, pace, and eye contact.',
+  },
+  {
+    path: '/upload',
+    icon: '📁',
+    title: 'Analyze a Video',
+    description: 'Upload a video recording and get a full confidence breakdown.',
+  },
+  {
+    path: '/analyzer',
+    icon: '🎤',
+    title: 'Audio-Only Practice',
+    description: 'Practice without a camera. Scored on voice, filler words, and pace.',
+  },
+  {
+    path: '/library',
+    icon: '📚',
+    title: 'Session Library',
+    description: 'Browse past sessions, compare scores, and track your progress.',
+  },
+]
+
 export default function Home() {
   return (
     <>
-      <div className="mode-select">
-        <Link to="/live" className="mode-btn">
-          <span className="icon">&#x1F3A5;</span>
-          <h3>Live Practice</h3>
-          <p>Real-time confidence detection via webcam + mic</p>
-        </Link>
+      {/* Hero */}
+      <section className="text-center py-20 space-y-6">
+        <div className="inline-flex items-center gap-2 px-3 py-1
+          rounded-full bg-accent-soft border border-border-accent
+          text-text-accent text-xs font-semibold mb-4">
+          ✦ AI-Powered Confidence Coaching
+        </div>
+        <h1 className="text-5xl font-extrabold font-display
+          tracking-tight max-w-2xl mx-auto">
+          Speak with{' '}
+          <span className="text-transparent bg-clip-text
+            bg-gradient-to-r from-accent-bright to-cyan">
+            Confidence
+          </span>
+        </h1>
+        <p className="text-text-secondary text-lg max-w-xl mx-auto">
+          Real-time AI coaching on your voice, face, and presence.
+          Know exactly what to improve.
+        </p>
+        <div className="flex items-center justify-center gap-3 pt-2 flex-wrap">
+          <Link to="/live" className="btn btn-primary btn-lg">
+            Start Practicing →
+          </Link>
+          <Link to="/how-it-works" className="btn btn-secondary btn-lg">
+            How it Works
+          </Link>
+        </div>
+      </section>
 
-        <Link to="/upload" className="mode-btn">
-          <span className="icon">&#x1F4C1;</span>
-          <h3>Analyze Recording</h3>
-          <p>Upload a presentation video for analysis</p>
-        </Link>
+      {/* Mode cards */}
+      <section className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
+        {MODES.map((mode) => (
+          <Link
+            to={mode.path}
+            key={mode.path}
+            className="glass-card p-6 group cursor-pointer
+              hover:-translate-y-1 hover:shadow-accent
+              transition-all duration-200"
+          >
+            <div className="text-2xl mb-4">{mode.icon}</div>
+            <h3 className="text-text-primary mb-2">{mode.title}</h3>
+            <p className="text-text-secondary text-sm leading-relaxed mb-4">
+              {mode.description}
+            </p>
+            <span className="text-accent text-sm font-semibold flex items-center gap-1 group-hover:gap-2 transition-all">
+              Open <span>→</span>
+            </span>
+          </Link>
+        ))}
+      </section>
 
-        <Link to="/analyzer" className="mode-btn">
-          <span className="icon">&#x1F3A4;</span>
-          <h3>Speech Analyzer</h3>
-          <p>Test your speech — no camera needed</p>
-        </Link>
-
-        <Link to="/library" className="mode-btn">
-          <span className="icon">&#x1F4DA;</span>
-          <h3>Library</h3>
-          <p>Browse and replay past sessions</p>
-        </Link>
-      </div>
-
-      <div style={{ marginTop: 24, padding: '0 4px' }}>
-        <div style={{ fontSize: '0.78em', opacity: 0.6, marginBottom: 6 }}>
+      {/* Progress strip */}
+      <section className="mt-12">
+        <div className="text-xs uppercase tracking-wider text-text-muted mb-3">
           Last 5 sessions
         </div>
         <ProgressChart limit={5} compact />
-      </div>
+      </section>
     </>
   )
 }
