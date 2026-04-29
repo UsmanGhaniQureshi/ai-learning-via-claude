@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { API_BASE, apiFetch, mediaUrl, wsUrl } from '../config'
 import { SessionVideoRecorder } from '../components/VideoRecorder'
 import useFaceDetection from './useFaceDetection'
+import useBackgroundReplacement from './useBackgroundReplacement'
 
 // Defence-in-depth: even if the backend slips a Whisper hallucination
 // through, never paint these into the live transcript.
@@ -84,6 +85,19 @@ export default function useLiveSession() {
   const [noSpeechDetected, setNoSpeechDetected] = useState(false)
   const silentChunkCountRef = useRef(0)
 
+  // Virtual-background state. The picker (BackgroundPicker.jsx)
+  // writes here via `setBgMode`, which mirrors the value into BOTH
+  // React state (for the picker's selection visuals) AND a ref the
+  // useBackgroundReplacement rAF loop reads every frame. Mid-session
+  // switches are therefore instant — no pipeline teardown.
+  const [bgMode, _setBgModeState] = useState({ kind: 'off', image: null })
+  const bgModeRef = useRef({ kind: 'off', image: null })
+  const setBgMode = useCallback((next) => {
+    const safe = next || { kind: 'off', image: null }
+    bgModeRef.current = safe
+    _setBgModeState(safe)
+  }, [])
+
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const reportRef = useRef(null)
@@ -99,12 +113,34 @@ export default function useLiveSession() {
   // is still 'idle'. Reading through a ref gets us the live version.
   const stopSessionRef = useRef(null)
 
-  // Attach stream to video element once it's mounted in the DOM
+  // The visible canvas the segmentation pipeline paints to. We use a
+  // useState callback ref so the page can hand us the DOM node as
+  // soon as it mounts. `previewCanvas === null` until the active-
+  // state JSX renders the <canvas>; the hook waits for both
+  // mediaStream AND previewCanvas before starting up.
+  const [previewCanvas, setPreviewCanvas] = useState(null)
+
+  // Background replacement pipeline. The hook paints the SAME
+  // <canvas> the user sees (no captureStream → video re-decode in
+  // the preview path → no perceptible buffer lag) AND produces a
+  // composited MediaStream from that canvas's captureStream for the
+  // recorder. `sourceVideoRef` is the hidden raw-camera <video>
+  // element — passed below to useFaceDetection so face landmarks
+  // run on raw frames instead of through the canvas pipeline.
+  const {
+    compositedStream,
+    segmenterReady,
+    segmenterError,
+    sourceVideoRef,
+    sourceVideoReady,
+  } = useBackgroundReplacement(mediaStream, bgModeRef, previewCanvas)
+
+  // Mirror compositedStream into a ref so startSession can poll for
+  // it without restructuring its linear flow into a useEffect.
+  const compositedStreamRef = useRef(null)
   useEffect(() => {
-    if (videoRef.current && mediaStream) {
-      videoRef.current.srcObject = mediaStream
-    }
-  }, [mediaStream, sessionState])
+    compositedStreamRef.current = compositedStream
+  }, [compositedStream])
   const wsRef = useRef(null)
   const audioCtxRef = useRef(null)
   const audioProcessorRef = useRef(null)
@@ -117,7 +153,26 @@ export default function useLiveSession() {
   const lastTranscriptAppendRef = useRef('')
   const [faceActive, setFaceActive] = useState(false)
 
-  const faceScores = useFaceDetection(videoRef, faceActive)
+  // Face landmarker reads from the hidden raw-camera <video> exposed
+  // by useBackgroundReplacement, NOT the visible canvas preview.
+  // Reasons:
+  //   1) Lower latency — raw camera is ~1 frame behind real time;
+  //      the canvas/captureStream chain adds 2-4 more frames.
+  //   2) Cleaner face data — landmarks read pixel-perfect skin, not
+  //      a soft-edged segmented composite.
+  //   3) Less GPU contention on the visible canvas.
+  //
+  // We gate `active` on `sourceVideoReady` because useFaceDetection's
+  // setup effect bails out if videoRef.current is null at the moment
+  // it runs — and refs aren't reactive deps, so it would never re-run
+  // and never start MediaPipe. sourceVideoReady transitioning false→
+  // true causes `active` to flip false→true at the right moment, the
+  // effect re-runs, videoRef.current is now non-null, and MediaPipe
+  // initializes.
+  const faceScores = useFaceDetection(
+    sourceVideoRef,
+    faceActive && sourceVideoReady,
+  )
   const faceScoresRef = useRef(faceScores)
   useEffect(() => {
     faceScoresRef.current = faceScores
@@ -529,9 +584,27 @@ export default function useLiveSession() {
         } catch (e) { /* ignore — coaching just won't fire */ }
       }
 
-      // 4. Start video recorder
+      // 4. Start video recorder.
+      //
+      // The recorder records the COMPOSITED stream (canvas-driven
+      // virtual background) so that mid-session background switches
+      // show up in the saved webm. The canvas captureStream is
+      // produced synchronously by useBackgroundReplacement once it
+      // sees `mediaStream` change, but the React state → effect →
+      // ref-mirror cycle takes a tick, so we poll the ref briefly.
+      // 3-second cap; if it never resolves we fall back to recording
+      // the raw stream (no virtual background) rather than failing
+      // the session.
+      let streamForRecorder = compositedStreamRef.current
+      if (!streamForRecorder) {
+        const giveUpAt = Date.now() + 3000
+        while (!compositedStreamRef.current && Date.now() < giveUpAt) {
+          await new Promise((r) => setTimeout(r, 30))
+        }
+        streamForRecorder = compositedStreamRef.current || stream
+      }
       const recorder = new SessionVideoRecorder()
-      await recorder.start(stream)
+      await recorder.start(streamForRecorder)
       recorderRef.current = recorder
 
       // 5. Start audio capture — resample to 16kHz Float32, send 3s chunks
@@ -704,6 +777,11 @@ export default function useLiveSession() {
     videoBlob,
     videoUrl,
     remoteVideoUrl,
+    bgMode,
+    setBgMode,
+    segmenterReady,
+    segmenterError,
+    setPreviewCanvas,
     startSession,
     stopSession,
     discardReview,

@@ -10,6 +10,7 @@ import CountdownOverlay from '../components/CountdownOverlay'
 import PracticeTimer from '../components/PracticeTimer'
 import PermissionScreen from '../components/PermissionScreen'
 import RecordingReview from '../components/RecordingReview'
+import BackgroundPicker from '../components/BackgroundPicker'
 import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import { languageDisplayName } from '../utils/language'
@@ -37,11 +38,13 @@ function isPermissionError(msg) {
 
 export default function LiveSession() {
   const {
-    sessionState, videoRef, scores, transcript, tips, error,
+    sessionState, scores, transcript, tips, error,
     connectionStatus, unsupportedLanguage, backpressure, calibrating,
     noSpeechDetected,
     scoreHistory, duration, faceScores,
     videoBlob, videoUrl,
+    bgMode, setBgMode, segmenterReady, segmenterError,
+    setPreviewCanvas,
     startSession, stopSession, discardReview,
   } = useLiveSession()
 
@@ -259,14 +262,23 @@ export default function LiveSession() {
 
           {/* Main 2-column layout */}
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
-            {/* Camera feed */}
+            {/* Camera feed — rendered as a <canvas> the segmentation
+                pipeline paints to directly, instead of a <video>
+                bound to the captureStream output. The previous video
+                approach added ~50-150 ms of perceived lag because
+                browsers buffer captureStream frames before feeding
+                them to a video element for smooth playback. The
+                canvas-direct path shows each frame the moment the
+                rAF tick paints it. CSS-mirror via scale-x-[-1] for
+                the selfie-view (the captureStream content stays
+                un-mirrored so the recorded webm shows the user as
+                others see them, same as before). */}
             <div className="glass-card overflow-hidden relative aspect-[4/3]">
-              <video
-                ref={videoRef}
-                autoPlay
-                muted
-                playsInline
-                className="w-full h-full object-cover scale-x-[-1]"
+              <canvas
+                ref={setPreviewCanvas}
+                width={640}
+                height={480}
+                className="w-full h-full object-cover scale-x-[-1] bg-black"
               />
               {/* REC indicator */}
               <div className="absolute top-3 left-3 flex items-center gap-1.5 bg-[rgba(0,0,0,0.6)] backdrop-blur-xs px-2.5 py-1 rounded-full">
@@ -283,6 +295,20 @@ export default function LiveSession() {
                 {gesture && (
                   <span className={`badge ${gesture.cls}`}>{gesture.text}</span>
                 )}
+              </div>
+              {/* Background picker — bottom of the camera card.
+                  Always interactive during the active state so the
+                  user can switch backgrounds (or back to original)
+                  at any time during recording. */}
+              <div className="absolute bottom-3 left-3 right-3 flex justify-center pointer-events-none">
+                <div className="pointer-events-auto max-w-full">
+                  <BackgroundPicker
+                    mode={bgMode}
+                    onChange={setBgMode}
+                    segmenterReady={segmenterReady}
+                    segmenterError={segmenterError}
+                  />
+                </div>
               </div>
             </div>
 

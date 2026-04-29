@@ -495,28 +495,59 @@ def _parse_trim_segments(raw: str | None):
     return out
 
 
-def _probe_video_fps(filepath: str) -> float | None:
-    """Return the average frame rate via ffprobe, or None on failure.
+def _normalize_to_cfr_mp4(filepath: str) -> str | None:
+    """Re-encode a (possibly VFR) source into a constant-frame-rate
+    mp4 at 30 fps. Returns the new path, or None on failure.
 
-    `cv2.VideoCapture.get(CAP_PROP_FPS)` is unreliable on variable-frame-rate
-    containers — most notably the VP9 webm produced by MediaRecorder, which
-    is what every Live Practice and Live-Audio recording becomes. cv2
-    routinely returns 60+ for such files even when the actual capture rate
-    was ~30 fps; piping that figure into VideoWriter then produces a
-    processed mp4 that plays at 2x speed. ffprobe's `avg_frame_rate` looks
-    at the actual packet timestamps and gives an honest number.
+    Why: Chrome's MediaRecorder + canvas.captureStream produces VFR
+    webm with frame timestamps that don't match the requested fps
+    target. cv2.VideoCapture reads N frames, the metadata says fps=X,
+    cv2.VideoWriter writes N frames at fps=X — but if the timestamps
+    were really spread over a different real-time duration, the
+    output mp4 plays at the wrong speed (most often: too fast,
+    because Chrome over-reports fps in the avg_frame_rate field).
 
-    Returns None if ffprobe isn't installed, the probe times out, or the
-    parsed value is outside a sane realtime range — callers should fall
-    back to the cv2 reading.
+    Forcing CFR via `-r 30 -vsync cfr` upfront means cv2 reads a
+    file where frames-per-second is consistent and trustworthy. The
+    ORIGINAL filepath is preserved for later audio extraction in the
+    final mux — we only normalise the video side here.
+
+    No-op (returns None) if ffmpeg isn't installed; caller should
+    fall back to reading the source directly.
     """
-    ffprobe = "ffprobe"
+    out_path = filepath + ".cfr.mp4"
+    cmd = [
+        FFMPEG, "-y", "-i", filepath,
+        "-r", "30",
+        "-vsync", "cfr",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-an",  # video only — audio is muxed in later from the original
+        "-movflags", "+faststart",
+        out_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=600,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        return None
+    return out_path
+
+
+def _probe_video_duration(filepath: str) -> float | None:
+    """Container duration in seconds via ffprobe. Reliable for every
+    format — reads the container header only, no decoding.
+    """
     try:
         proc = subprocess.run(
             [
-                ffprobe, "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=avg_frame_rate",
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
                 "-of", "default=nokey=1:noprint_wrappers=1",
                 filepath,
             ],
@@ -526,24 +557,98 @@ def _probe_video_fps(filepath: str) -> float | None:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
     out = (proc.stdout or b"").decode("utf-8", errors="ignore").strip()
-    if not out or out == "0/0":
+    if not out or out == "N/A":
         return None
     try:
-        if "/" in out:
-            num_str, den_str = out.split("/", 1)
-            num = float(num_str)
-            den = float(den_str)
-            if den <= 0 or num <= 0:
-                return None
-            real_fps = num / den
-        else:
-            real_fps = float(out)
+        d = float(out)
+        return d if d > 0 else None
     except ValueError:
         return None
-    # Sanity clamp: anything outside this range is almost certainly a
-    # mis-parse or a timebase value, not a real capture rate.
-    if 1.0 < real_fps < 240.0:
-        return real_fps
+
+
+def _probe_video_fps(filepath: str) -> float | None:
+    """Return the effective video frame rate.
+
+    Two-step strategy:
+      1) avg_frame_rate from container metadata. Fast (header read only),
+         correct for well-formed CFR / mp4 / known-encoder webm.
+      2) If avg_frame_rate is missing, suspicious (outside 1-240), or
+         Chrome's canvas.captureStream encoder reported a wall-clock-
+         based timebase value (the historical bug), fall back to
+         actually counting decoded frames and dividing by the
+         container duration. Slower (decodes the whole stream) but
+         the resulting fps is precisely what the writer needs to
+         produce a processed mp4 of the same duration as the source.
+
+    Returns None when both probes fail; callers fall back to the cv2
+    reading or a hardcoded 30.
+    """
+    # Step 1: cheap path — read avg_frame_rate from container metadata.
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                filepath,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        out = (proc.stdout or b"").decode("utf-8", errors="ignore").strip()
+        if out and out not in ("0/0", "N/A"):
+            try:
+                if "/" in out:
+                    num_str, den_str = out.split("/", 1)
+                    num = float(num_str)
+                    den = float(den_str)
+                    if den > 0 and num > 0:
+                        candidate = num / den
+                        if 1.0 < candidate < 240.0:
+                            return candidate
+                else:
+                    candidate = float(out)
+                    if 1.0 < candidate < 240.0:
+                        return candidate
+            except ValueError:
+                pass
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Step 2: count actual decoded frames + divide by duration. Always
+    # accurate even for VFR webm (canvas.captureStream output), which
+    # is where the cheap path falls down most often. Up to ~1-3 s
+    # extra latency for typical recordings, capped at 60 s for very
+    # long ones.
+    duration = _probe_video_duration(filepath)
+    if duration is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-count_frames",
+                "-show_entries", "stream=nb_read_frames",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                filepath,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    out = (proc.stdout or b"").decode("utf-8", errors="ignore").strip()
+    try:
+        frames = int(out)
+    except ValueError:
+        return None
+    if frames <= 0:
+        return None
+    fps = frames / duration
+    if 1.0 < fps < 240.0:
+        return fps
     return None
 
 
@@ -1132,15 +1237,31 @@ def _run_upload_pipeline_sync(
                 raise RuntimeError("ffmpeg binary not found on the server.")
             except subprocess.TimeoutExpired:
                 raise RuntimeError("ffmpeg trim timed out after 600 s.")
-        cap = cv2.VideoCapture(filepath)
-        # ffprobe-corrected fps. cv2.CAP_PROP_FPS lies for VFR webm
-        # (MediaRecorder output), reporting 60+ for what was really
-        # captured at ~30. Using that wrong number for the writer
-        # produces a 2x-fast-forwarded processed mp4. _probe_video_fps
-        # asks ffprobe for the real avg_frame_rate; we fall back to
-        # cv2's value (or 30) only when the probe fails.
-        probed_fps = _probe_video_fps(filepath)
-        fps = probed_fps or cap.get(cv2.CAP_PROP_FPS) or 30
+        # CFR normalisation. The recorder hands us a VFR webm (canvas
+        # captureStream + opus audio); cv2's frame count and fps
+        # reading are unreliable on those, AND ffprobe's
+        # avg_frame_rate metadata is sometimes wrong (Chrome over-
+        # reports the rate, so the output mp4 plays too fast). The
+        # cheapest reliable fix is to re-encode the source to a
+        # 30 fps CFR mp4 before cv2 ever opens it. The intermediate
+        # mp4 has consistent frame timing → cv2 reads N frames over
+        # exactly N/30 seconds → output duration matches input. The
+        # original filepath is preserved for audio extraction later.
+        cv2_input_path = filepath
+        normalised_path = _normalize_to_cfr_mp4(filepath)
+        if normalised_path:
+            cv2_input_path = normalised_path
+
+        cap = cv2.VideoCapture(cv2_input_path)
+        # After CFR normalisation we know the rate is 30; otherwise
+        # we fall back to ffprobe (which now also counts frames as a
+        # second-tier probe so VFR sources still produce correct
+        # numbers).
+        if normalised_path:
+            fps = 30.0
+        else:
+            probed_fps = _probe_video_fps(cv2_input_path)
+            fps = probed_fps or cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps if fps > 0 else 0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -2016,6 +2137,16 @@ def _run_upload_pipeline_sync(
             pass
         log.exception("upload.pipeline_failed", extra={"media_id": upload_id})
         _set_media_status(upload_id, "failed", error=str(e) or "Pipeline error")
+    finally:
+        # Always clean up the CFR-normalised intermediate; we don't
+        # need it after the cv2 pass writes the overlay mp4. Failure
+        # to delete is non-fatal (just disk hygiene).
+        normalised_path = locals().get('normalised_path')
+        if normalised_path and os.path.exists(normalised_path):
+            try:
+                os.unlink(normalised_path)
+            except OSError:
+                pass
 
 
 def _serve_with_range(request: Request, path: str, media_type: str):
