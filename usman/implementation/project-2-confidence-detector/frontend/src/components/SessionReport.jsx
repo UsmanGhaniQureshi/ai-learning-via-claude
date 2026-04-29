@@ -63,14 +63,41 @@ export default function SessionReport({
     recording, kind, topic,
     signal_baseline_adjusted, user_baseline, baseline_note,
     insufficient_speech, unsupported_language, status_message,
-    coaching, coaching_status,
+    coaching, coaching_status, coaching_skip_reason,
+    wins: reportWins, improvements: reportImprovements,
   } = report
+
+  // Title-vs-transcript mismatch banner. The llm_coach module flags
+  // this with skip_reason="topic_mismatch" (keyword pre-filter) or
+  // "model_topic_mismatch" (Gemini itself returned null for the
+  // off-topic transcript). Either way the user typed a topic and we
+  // detected the recording didn't actually cover it — surface that
+  // clearly instead of letting the rule-based fallback render
+  // silently as if everything was fine.
+  const topicMismatch = (
+    coaching_status === 'skipped' &&
+    (coaching_skip_reason === 'topic_mismatch' ||
+     coaching_skip_reason === 'model_topic_mismatch')
+  )
 
   // LLM-generated coaching takes priority over the rule-based
   // insights/action_items card. When coaching_status is "skipped" /
   // "failed" / undefined we fall back to the rule-based card so users
   // still get something actionable.
   const hasLLMCoaching = coaching_status === 'ready' && coaching
+
+  // Always-rendered fallback content. Prefer top-level `wins` /
+  // `improvements` (the merged Gemini output OR the rule-based
+  // defaults populated by report_generator), then fall back to
+  // insights / action_items for older reports without those keys.
+  const fallbackWins =
+    Array.isArray(reportWins) && reportWins.length > 0
+      ? reportWins
+      : Array.isArray(insights) ? insights : []
+  const fallbackImprovements =
+    Array.isArray(reportImprovements) && reportImprovements.length > 0
+      ? reportImprovements
+      : Array.isArray(action_items) ? action_items : []
 
   if (insufficient_speech || unsupported_language || avg_score == null) {
     return (
@@ -124,43 +151,78 @@ export default function SessionReport({
         </div>
       </div>
 
-      {/* Coaching — Gemini-powered when available, rule-based fallback otherwise */}
+      {/* Topic-mismatch banner — only when the user typed a title AND
+          the transcript didn't cover it (per Gemini or the keyword
+          pre-filter). Shown ABOVE the coaching card so the user
+          understands why detailed AI coaching wasn't generated. */}
+      {topicMismatch && (
+        <div className="glass-card p-5 border border-[rgba(245,158,11,0.4)] bg-[rgba(245,158,11,0.08)]">
+          <p className="text-sm font-semibold text-warning uppercase tracking-wider mb-2">
+            ⚠ Transcript didn’t match the topic
+          </p>
+          <p className="text-sm text-text-secondary leading-relaxed">
+            {topic ? (
+              <>The transcript of this recording didn’t cover <strong className="text-text-primary">“{topic}”</strong>.</>
+            ) : (
+              <>The transcript of this recording didn’t cover the topic you set.</>
+            )}{' '}
+            We’re showing rule-based feedback below instead of detailed AI coaching.
+            Re-record with a transcript that talks about the topic, or leave the title blank, to get the right kind of coaching.
+          </p>
+        </div>
+      )}
+
+      {/* Coaching — Gemini-powered when available, rule-based fallback otherwise.
+          The fallback card ALWAYS renders so the user sees a "What went well"
+          + "What to Improve" pair on every scoreable session, even when the
+          LLM was skipped or returned empty arrays. */}
       {hasLLMCoaching ? (
         <CoachingPanel coaching={coaching} status={coaching_status} />
       ) : (
-        ((insights && insights.length > 0) || (action_items && action_items.length > 0)) && (
-          <div className="glass-card p-6 border border-border-accent">
-            <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-4">
-              ✦ Coaching Insights
-            </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-              {insights && insights.length > 0 && (
-                <div>
-                  <p className="text-success text-sm font-semibold mb-2">✅ What went well</p>
-                  <ul className="space-y-1.5">
-                    {insights.map((insight, i) => (
-                      <li key={i} className="text-sm text-text-secondary flex gap-2">
-                        <span className="text-text-muted">·</span><span>{insight}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+        <div className="glass-card p-6 border border-border-accent">
+          <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-4">
+            ✦ Coaching Insights
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+            <div>
+              <p className="text-success text-sm font-semibold mb-2">✅ What went well</p>
+              {fallbackWins.length > 0 ? (
+                <ul className="space-y-1.5">
+                  {fallbackWins.map((insight, i) => (
+                    <li key={i} className="text-sm text-text-secondary flex gap-2">
+                      <span className="text-text-muted">·</span><span>{insight}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-text-muted italic">
+                  Nothing specific stood out as a win this session.
+                </p>
               )}
-              {action_items && action_items.length > 0 && (
-                <div>
-                  <p className="text-warning text-sm font-semibold mb-2">↗ Work on next</p>
-                  <ul className="space-y-1.5">
-                    {action_items.map((item, i) => (
-                      <li key={i} className="text-sm text-text-secondary flex gap-2">
-                        <span className="text-text-muted">·</span><span>{item}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+            </div>
+            <div>
+              <p className="text-warning text-sm font-semibold mb-2">↗ What to improve</p>
+              {fallbackImprovements.length > 0 ? (
+                <ul className="space-y-1.5">
+                  {fallbackImprovements.map((item, i) => (
+                    <li key={i} className="text-sm text-text-secondary flex gap-2">
+                      <span className="text-text-muted">·</span><span>{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-text-muted italic">
+                  No specific improvements flagged. Pick a practice topic next time for AI coaching.
+                </p>
               )}
             </div>
           </div>
-        )
+          {coaching_status !== 'ready' && (
+            <p className="text-xs text-text-muted italic mt-3 pt-3 border-t border-border">
+              💡 Pick a practice topic before recording for detailed AI-powered coaching.
+            </p>
+          )}
+        </div>
       )}
 
       {/* Practice Again CTA */}

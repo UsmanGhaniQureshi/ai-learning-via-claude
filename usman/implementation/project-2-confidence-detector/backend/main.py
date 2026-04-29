@@ -495,6 +495,58 @@ def _parse_trim_segments(raw: str | None):
     return out
 
 
+def _probe_video_fps(filepath: str) -> float | None:
+    """Return the average frame rate via ffprobe, or None on failure.
+
+    `cv2.VideoCapture.get(CAP_PROP_FPS)` is unreliable on variable-frame-rate
+    containers — most notably the VP9 webm produced by MediaRecorder, which
+    is what every Live Practice and Live-Audio recording becomes. cv2
+    routinely returns 60+ for such files even when the actual capture rate
+    was ~30 fps; piping that figure into VideoWriter then produces a
+    processed mp4 that plays at 2x speed. ffprobe's `avg_frame_rate` looks
+    at the actual packet timestamps and gives an honest number.
+
+    Returns None if ffprobe isn't installed, the probe times out, or the
+    parsed value is outside a sane realtime range — callers should fall
+    back to the cv2 reading.
+    """
+    ffprobe = "ffprobe"
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                filepath,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    out = (proc.stdout or b"").decode("utf-8", errors="ignore").strip()
+    if not out or out == "0/0":
+        return None
+    try:
+        if "/" in out:
+            num_str, den_str = out.split("/", 1)
+            num = float(num_str)
+            den = float(den_str)
+            if den <= 0 or num <= 0:
+                return None
+            real_fps = num / den
+        else:
+            real_fps = float(out)
+    except ValueError:
+        return None
+    # Sanity clamp: anything outside this range is almost certainly a
+    # mis-parse or a timebase value, not a real capture rate.
+    if 1.0 < real_fps < 240.0:
+        return real_fps
+    return None
+
+
 def _ffmpeg_input_has_audio(filepath: str) -> bool:
     """Best-effort probe — ffmpeg `-i` with no output prints stream info
     to stderr and exits non-zero. We just look for an Audio stream
@@ -1081,7 +1133,14 @@ def _run_upload_pipeline_sync(
             except subprocess.TimeoutExpired:
                 raise RuntimeError("ffmpeg trim timed out after 600 s.")
         cap = cv2.VideoCapture(filepath)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        # ffprobe-corrected fps. cv2.CAP_PROP_FPS lies for VFR webm
+        # (MediaRecorder output), reporting 60+ for what was really
+        # captured at ~30. Using that wrong number for the writer
+        # produces a 2x-fast-forwarded processed mp4. _probe_video_fps
+        # asks ffprobe for the real avg_frame_rate; we fall back to
+        # cv2's value (or 30) only when the probe fails.
+        probed_fps = _probe_video_fps(filepath)
+        fps = probed_fps or cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps if fps > 0 else 0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1595,6 +1654,9 @@ def _run_upload_pipeline_sync(
                 'improvements': [],
                 'coaching': None,
                 'coaching_status': 'skipped',
+                'coaching_source': 'rule_based',
+                'coaching_skip_reason': 'unsupported_language',
+                'coaching_error': None,
             }
             _complete_media_processing(
                 media_id=upload_id,
@@ -1642,6 +1704,9 @@ def _run_upload_pipeline_sync(
                 'improvements': [],
                 'coaching': None,
                 'coaching_status': 'skipped',
+                'coaching_source': 'rule_based',
+                'coaching_skip_reason': 'insufficient_speech',
+                'coaching_error': None,
             }
             _complete_media_processing(
                 media_id=upload_id,
@@ -1826,16 +1891,19 @@ def _run_upload_pipeline_sync(
         # ── LLM coaching for video uploads ───────────────────────────
         # The upload pipeline doesn't go through generate_post_session_report
         # (it uses ScoringEngine directly), so we call llm_coach here with
-        # a shape adapter mapping camelCase sub_scores → snake_case
+        # a shape adapter mapping camelCase sub_scores -> snake_case
         # signal_averages, plus pulling pace + filler stats from
-        # speech_summary. Off-topic / no API key / missing topic all
-        # short-circuit to coaching_status="skipped" and the rule-based
-        # tips above carry the load instead.
+        # speech_summary. The payload carries source/reason/error fields
+        # so the client can tell whether the visible coaching came from
+        # Gemini or the local rule-based fallback.
         coaching = None
         coaching_status = "skipped"
+        coaching_source = "rule_based"
+        coaching_skip_reason = "missing_topic"
+        coaching_error = None
         if prompt_meta and prompt_meta.get("title"):
             try:
-                from llm_coach import generate_practice_coaching
+                from llm_coach import generate_practice_coaching_result
                 # Flatten speech_timeline into the flat word list
                 # llm_coach expects (each chunk has its own .words array
                 # already with absolute start_ms after the live-path
@@ -1868,18 +1936,34 @@ def _run_upload_pipeline_sync(
                     "total_fillers": ss_obj.get("total_fillers", 0) or 0,
                     "pace": {"avg_wpm": ss_obj.get("average_wpm", 0) or 0},
                 }
-                coaching = generate_practice_coaching(
+                coaching_result = generate_practice_coaching_result(
                     coach_input,
                     transcript_words=flat_words,
                     prompt_title=prompt_meta.get("title", ""),
                     prompt_body=prompt_meta.get("body", ""),
                 )
-                coaching_status = "ready" if coaching else "skipped"
+                coaching = coaching_result.get("coaching")
+                coaching_status = coaching_result.get("status") or "skipped"
+                coaching_source = coaching_result.get("source") or "rule_based"
+                coaching_skip_reason = coaching_result.get("skip_reason")
+                coaching_error = coaching_result.get("error")
             except Exception as e:
                 log.warning(f"[upload llm_coach] failed: {e}")
                 coaching_status = "failed"
+                coaching_source = "rule_based"
+                coaching_skip_reason = None
+                coaching_error = "coaching_pipeline_failed"
         response_payload["coaching"] = coaching
         response_payload["coaching_status"] = coaching_status
+        response_payload["coaching_source"] = coaching_source
+        response_payload["coaching_skip_reason"] = coaching_skip_reason
+        response_payload["coaching_error"] = coaching_error
+        # Surface the topic so the UI's mismatch banner can name it
+        # ("The transcript didn't cover '<topic>'."). When prompt_meta
+        # is None or empty the report has no topic and the banner falls
+        # back to a generic phrasing.
+        if prompt_meta and prompt_meta.get("title"):
+            response_payload["topic"] = prompt_meta["title"]
 
         # Same merge as report_generator: when Gemini produced
         # structured coaching, prefer its wins/improvements for the
@@ -2051,6 +2135,9 @@ def get_media_status(
             "status": m.processing_status,
             "error": m.processing_error,
             "ready": m.processing_status == "completed",
+            "kind": m.source_kind,
+            "title": m.title,
+            "has_report": m.report_json is not None,
         }
 
 
@@ -2479,7 +2566,16 @@ async def session_ws(ws: WebSocket, session_id: str):
                         # before the report runs.
                         await audio_queue.put(None)
                         await consumer_task
-                        await finalize_and_send_report()
+                        # `discard=true` is sent by the new live-then-trim
+                        # flow (LiveSession.jsx → review screen). It tells
+                        # us to skip report generation + Media row creation
+                        # entirely — the client will re-submit the
+                        # recorded blob via /api/upload after the user
+                        # picks trim windows, and that path produces the
+                        # canonical Media row + report. Without this flag,
+                        # we'd end up with two rows per recording.
+                        if not data.get('discard'):
+                            await finalize_and_send_report()
                         client_requested_stop = True
                         break
                 except Exception:

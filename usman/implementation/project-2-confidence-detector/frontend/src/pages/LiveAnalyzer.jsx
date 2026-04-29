@@ -6,6 +6,8 @@ import SignalBars from '../components/SignalBars'
 import PracticeSetup from '../components/PracticeSetup'
 import CountdownOverlay from '../components/CountdownOverlay'
 import PracticeTimer from '../components/PracticeTimer'
+import RecordingReview from '../components/RecordingReview'
+import { pollMediaStatus } from '../utils/mediaStatus'
 import { languageDisplayName } from '../utils/language'
 
 /**
@@ -43,6 +45,24 @@ export default function LiveAnalyzer() {
   const [showCountdown, setShowCountdown] = useState(false)
   const [recStartedAt, setRecStartedAt] = useState(null)
   const [uploadWarning, setUploadWarning] = useState(null)
+
+  // Review-screen state. After stop the recorder hands us a Blob; the
+  // user picks trim windows + (optional) title/body in RecordingReview,
+  // then Analyze re-uploads via /api/analyze-audio.
+  const [reviewBlob, setReviewBlob] = useState(null)
+  const [reviewUrl, setReviewUrl] = useState(null)
+  const [analyzing, setAnalyzing] = useState(false)
+  const [analyzeStatus, setAnalyzeStatus] = useState(null)
+  const [analyzeError, setAnalyzeError] = useState(null)
+
+  // Revoke the local blob URL on unmount or when it changes.
+  useEffect(() => {
+    return () => {
+      if (reviewUrl) {
+        try { URL.revokeObjectURL(reviewUrl) } catch {}
+      }
+    }
+  }, [reviewUrl])
 
   const cleanup = useCallback(() => {
     if (processorRef.current) {
@@ -254,6 +274,15 @@ export default function LiveAnalyzer() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state])
 
+  // Fast-stop transition mirrors LiveSession.stopSession:
+  //   - audio capture closes, recorder hands us the local blob
+  //   - WS gets `discard:true` so the server skips report generation
+  //   - UI lands on the 'review' state with the blob; the user picks
+  //     trim windows + (optional) title + body, then hits Analyze.
+  // Analyze re-uploads the blob via /api/analyze-audio, which runs
+  // Whisper once on the full audio (more accurate transcript than
+  // per-3s-chunk live transcription) and threads prompt_meta through
+  // to llm_coach.
   const stop = async () => {
     if (state !== 'active') return
     userStopRef.current = true
@@ -268,48 +297,99 @@ export default function LiveAnalyzer() {
     }
     flushAudioBuffer(true)
 
+    // Hand the local recorder blob to the review screen.
     const recorder = mediaRecorderRef.current
-    let audioBlob = null
     if (recorder && recorder.state !== 'inactive') {
-      audioBlob = await new Promise((resolve) => {
+      const blob = await new Promise((resolve) => {
         recorder.onstop = () => {
           resolve(new Blob(recordedChunksRef.current, { type: recorder.mimeType || 'audio/webm' }))
         }
         recorder.stop()
       })
-    }
-
-    const ws = wsRef.current
-    if (ws?.readyState === WebSocket.OPEN) {
-      try { ws.send(JSON.stringify({ type: 'stop_session' })) } catch {}
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, 15000)
-        const check = setInterval(() => {
-          if (reportReceivedRef.current) {
-            clearInterval(check)
-            clearTimeout(timer)
-            resolve()
-          }
-        }, 100)
-      })
-    }
-
-    if (audioBlob) {
-      try {
-        const form = new FormData()
-        form.append('audio', audioBlob, `${mediaIdRef.current}.webm`)
-        form.append('session_id', mediaIdRef.current)
-        await apiFetch(`${API_BASE}/api/session/upload-audio`, {
-          method: 'POST',
-          body: form,
-        })
-      } catch (e) {
-        setUploadWarning(`Audio upload failed: ${e.message || e}. Your session was scored, but playback may be unavailable.`)
+      if (blob) {
+        setReviewBlob(blob)
+        setReviewUrl(URL.createObjectURL(blob))
       }
     }
 
+    // Tell the server to discard the live snapshots — no report, no
+    // Media row. The /api/analyze-audio call from the Analyze button
+    // creates the canonical row.
+    const ws = wsRef.current
+    if (ws?.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: 'stop_session', discard: true })) } catch {}
+      try { ws.close() } catch {}
+    }
+    wsRef.current = null
     cleanup()
-    navigate(`/result/${mediaIdRef.current}`, { replace: true })
+    setState('review')
+  }
+
+  // Analyze handler — submits the locally-recorded audio blob via the
+  // standard upload endpoint, with title/body/trim from RecordingReview.
+  const handleAnalyze = async ({ title, body, trimSegments }) => {
+    if (!reviewBlob) {
+      setAnalyzeError('Recording not ready yet. Hold on a moment.')
+      return
+    }
+    setAnalyzeError(null)
+    setAnalyzing(true)
+    setAnalyzeStatus('Uploading recording…')
+
+    const formData = new FormData()
+    const filename = `analyzer_${Date.now().toString(36)}.webm`
+    formData.append('audio_file', reviewBlob, filename)
+    formData.append('session_label', title || filename)
+    if (trimSegments) {
+      formData.append('trim_segments', JSON.stringify(trimSegments))
+    }
+    if (title) {
+      formData.append('prompt_title', title)
+      formData.append('prompt_body', body || '')
+    }
+
+    try {
+      const res = await apiFetch(`${API_BASE}/api/analyze-audio`, {
+        method: 'POST',
+        body: formData,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Analysis failed' }))
+        throw new Error(err.error || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      if (!data.media_id) throw new Error('Server did not return a media id')
+
+      setAnalyzeStatus('Analyzing speech…')
+      const final = await pollMediaStatus(data.media_id, {
+        onProgress: (s) => {
+          if (s === 'pending') setAnalyzeStatus('Queued — waiting for a worker…')
+          if (s === 'processing') setAnalyzeStatus('Analyzing speech…')
+        },
+      })
+      if (final.status === 'completed') {
+        navigate(`/result/${data.media_id}`)
+      } else {
+        throw new Error(final.error || 'Analysis failed.')
+      }
+    } catch (e) {
+      setAnalyzeError(e.message || 'Cannot connect to backend.')
+      setAnalyzing(false)
+      setAnalyzeStatus(null)
+    }
+  }
+
+  function discardAndRestart() {
+    if (reviewUrl) {
+      try { URL.revokeObjectURL(reviewUrl) } catch {}
+    }
+    setReviewBlob(null)
+    setReviewUrl(null)
+    setAnalyzing(false)
+    setAnalyzeStatus(null)
+    setAnalyzeError(null)
+    setSetup(null)
+    setState('idle')
   }
 
   const totalScore = scores?.total ?? 0
@@ -424,6 +504,32 @@ export default function LiveAnalyzer() {
           >
             {state === 'stopping' ? 'Finalising…' : '■ Stop Recording'}
           </button>
+        </div>
+      )}
+
+      {/* REVIEW — same shared component as LiveSession + Upload + Analyzer. */}
+      {state === 'review' && !analyzing && (
+        <RecordingReview
+          mediaSrc={reviewUrl}
+          mediaKind="audio"
+          mediaBytes={reviewBlob?.size}
+          initialTitle={setup?.promptTitle || ''}
+          initialBody={setup?.promptBody || ''}
+          submitting={false}
+          error={analyzeError}
+          onAnalyze={handleAnalyze}
+          onDiscard={discardAndRestart}
+        />
+      )}
+
+      {/* ANALYZING — uploading + waiting for the analyze pipeline */}
+      {state === 'review' && analyzing && (
+        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
+          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
+          <p className="text-text-primary">{analyzeStatus || 'Analyzing recording…'}</p>
+          <p className="text-text-muted text-sm">
+            Running speech analysis on the full clip — typically 20–60 seconds.
+          </p>
         </div>
       )}
     </div>

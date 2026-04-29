@@ -123,15 +123,25 @@ export default function useLiveSession() {
     faceScoresRef.current = faceScores
   }, [faceScores])
 
+  // Fast-stop transition: capture stops, the local recorder hands us
+  // the blob, the WS is told to discard (no server-side report
+  // generation), and we land on a 'review' state where the parent
+  // component shows trim + Analyze controls. The Analyze button then
+  // re-submits the blob through /api/upload — that's the path that
+  // produces the canonical Media row + report. This unifies the live
+  // flow with the upload flow:
+  //   - Stop is now ~instant (no 15-s WS wait, no double-upload)
+  //   - The transcript runs through Whisper on the FULL audio in one
+  //     pass (upload pipeline) instead of per-3s chunks (live), which
+  //     dramatically improves transcription accuracy
+  //   - Users can trim out filler / restart attempts before paying for
+  //     analysis
   const stopSession = useCallback(async () => {
     if (sessionState !== 'active') return
-    // Mark as user-initiated so the onclose handler knows this is a
-    // normal termination and doesn't trigger the "connection lost"
-    // recovery path. Must be set BEFORE we touch the WS below.
     userStopRef.current = true
     setSessionState('stopping')
 
-    // Stop face detection + face score broadcasting
+    // Stop face detection + duration timer.
     setFaceActive(false)
     if (faceIntervalRef.current) {
       clearInterval(faceIntervalRef.current)
@@ -142,7 +152,7 @@ export default function useLiveSession() {
       durationIntervalRef.current = null
     }
 
-    // Stop audio capture
+    // Stop audio capture.
     if (audioProcessorRef.current) {
       try { audioProcessorRef.current.disconnect() } catch (e) { /* ignore */ }
       audioProcessorRef.current = null
@@ -152,89 +162,70 @@ export default function useLiveSession() {
       audioCtxRef.current = null
     }
 
-    // Flush remaining audio buffer (final partial chunk dropped on
-    // force=true). flushAudioBuffer is async now (OfflineAudioContext);
-    // we await so the close-out is deterministic.
-    try { await flushAudioBuffer(true) } catch (e) { /* ignore */ }
-
-    // Stop video recorder, expose the blob locally for inline preview,
-    // then upload (non-blocking). Upload failure does NOT discard the blob —
-    // the user must still be able to play back what they just recorded.
-    const videoUploadPromise = (async () => {
-      if (!recorderRef.current) return
-      let blob = null
+    // Stop the local video recorder and grab the blob synchronously.
+    // The blob is what the review screen plays back AND what the
+    // Analyze button submits to /api/upload. We deliberately do NOT
+    // upload to /api/session/upload-video here — that endpoint exists
+    // for the old flow where the WS pipeline created the canonical
+    // Media row. The review-then-upload flow takes a different path
+    // that's owned by the upload pipeline.
+    if (recorderRef.current) {
       try {
-        blob = await recorderRef.current.stop()
+        const blob = await recorderRef.current.stop()
+        if (blob) {
+          recorderRef.current.blob = blob
+          const url = URL.createObjectURL(blob)
+          setVideoBlob(blob)
+          setVideoUrl(url)
+        }
       } catch (e) {
         setError(`Could not finalize recording: ${e.message || e}`)
-        return
       }
-      if (!blob) return
-      recorderRef.current.blob = blob
-      const url = URL.createObjectURL(blob)
-      setVideoBlob(blob)
-      setVideoUrl(url)
-      if (sessionIdRef.current) {
-        try {
-          await recorderRef.current.uploadToServer(sessionIdRef.current)
-        } catch (e) {
-          setError(`Recording saved locally — server upload failed: ${e.message || e}`)
-        }
-      }
-    })()
+    }
 
-    // Ask server to finalize session and send report.
-    // Server responds via WS with {type:'session_ended', report:...} then closes.
+    // Tell the server to discard — no report, no DB row.
     const ws = wsRef.current
-    const sessionId = sessionIdRef.current
-
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
-        ws.send(JSON.stringify({ type: 'stop_session' }))
+        ws.send(JSON.stringify({ type: 'stop_session', discard: true }))
       } catch (e) { /* ignore */ }
-
-      // Wait up to 15 seconds for the report to arrive
-      await new Promise((resolve) => {
-        const timeout = setTimeout(resolve, 15000)
-        const onClose = () => { clearTimeout(timeout); resolve() }
-        ws.addEventListener('close', onClose)
-      })
+      try { ws.close() } catch (e) { /* ignore */ }
     }
-
-    // HTTP fallback: if WS didn't deliver the report, fetch it from disk
-    if (!reportRef.current && sessionId) {
-      try {
-        const res = await apiFetch(`${API_BASE}/api/report/${sessionId}`)
-        if (res.ok) {
-          const data = await res.json()
-          if (data && !data.error) {
-            setReport(data)
-            if (data.recording?.video_url) {
-              setRemoteVideoUrl(mediaUrl(data.recording.video_url))
-            }
-            setSessionState('report')
-          }
-        }
-      } catch (e) { /* fallback failed, leave state */ }
-    }
-
-    // If still no report after both attempts, show an error but transition to report anyway
-    if (!reportRef.current) {
-      setError('Session ended but report could not be retrieved. Check backend logs.')
-    }
-
     wsRef.current = null
 
-    // Stop media tracks
+    // Release the camera + mic so the indicator turns off while the
+    // user is on the review screen.
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop())
       streamRef.current = null
     }
     setMediaStream(null)
 
-    // Wait for video upload to finish (non-critical)
-    await videoUploadPromise.catch(() => {})
+    setSessionState('review')
   }, [sessionState])
+
+  // Called by the review screen when the user picks "Discard & re-record".
+  // Drops the local blob and resets the session so the picker re-renders.
+  const discardReview = useCallback(() => {
+    setVideoBlob(null)
+    if (videoUrl) {
+      try { URL.revokeObjectURL(videoUrl) } catch (e) { /* ignore */ }
+    }
+    setVideoUrl(null)
+    setSessionState('idle')
+    setScores(null)
+    setTranscript('')
+    setTips([])
+    setReport(null)
+    reportRef.current = null
+    setError(null)
+    setScoreHistory([])
+    setDuration(0)
+    sessionIdRef.current = null
+    sessionStartRef.current = null
+    recorderRef.current = null
+    lastTranscriptAppendRef.current = ''
+  }, [videoUrl])
 
   // Keep the ref pointing at the most recent stopSession so the
   // onclose handler in startSession can call the live version.
@@ -715,6 +706,7 @@ export default function useLiveSession() {
     remoteVideoUrl,
     startSession,
     stopSession,
+    discardReview,
     resetSession,
   }
 }

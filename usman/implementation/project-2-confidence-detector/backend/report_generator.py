@@ -79,6 +79,9 @@ def generate_post_session_report(
             "signal_reasons": {},
             "coaching": None,
             "coaching_status": "skipped",
+            "coaching_source": "rule_based",
+            "coaching_skip_reason": "unsupported_language",
+            "coaching_error": None,
             "wins": [],
             "improvements": [],
             "status_message": (
@@ -120,6 +123,9 @@ def generate_post_session_report(
             "signal_reasons": {},
             "coaching": None,
             "coaching_status": "skipped",
+            "coaching_source": "rule_based",
+            "coaching_skip_reason": "insufficient_speech",
+            "coaching_error": None,
             "wins": [],
             "improvements": [],
             "status_message": (
@@ -509,29 +515,46 @@ def generate_post_session_report(
 
     # ── LLM coaching (Gemini Flash-Lite) ─────────────────────────────
     # Runs only when a topic was supplied (practice session) and the
-    # report is otherwise scoreable. Off-topic transcripts and missing
-    # API keys both return None → coaching_status="skipped" so the
-    # frontend's <CoachingPanel> stays hidden and the rule-based
-    # insights/action_items above render instead.
+    # report is otherwise scoreable. We keep the numeric report usable
+    # even when Gemini is skipped or fails, and surface source/reason
+    # metadata so the caller can tell whether the coaching came from
+    # Gemini or the local rule-based fallback.
     coaching = None
     coaching_status = "skipped"
+    coaching_source = "rule_based"
+    coaching_skip_reason = "missing_topic"
+    coaching_error = None
     if prompt_meta and prompt_meta.get("title"):
         try:
-            from llm_coach import generate_practice_coaching
-            coaching = generate_practice_coaching(
+            from llm_coach import generate_practice_coaching_result
+            coaching_result = generate_practice_coaching_result(
                 base_report,
                 transcript_words=all_words,
                 prompt_title=prompt_meta.get("title", ""),
                 prompt_body=prompt_meta.get("body", ""),
             )
-            coaching_status = "ready" if coaching else "skipped"
+            coaching = coaching_result.get("coaching")
+            coaching_status = coaching_result.get("status") or "skipped"
+            coaching_source = coaching_result.get("source") or "rule_based"
+            coaching_skip_reason = coaching_result.get("skip_reason")
+            coaching_error = coaching_result.get("error")
         except Exception as e:
             # Never let an LLM failure block the numeric report.
             import logging as _logging
             _logging.getLogger(__name__).warning(f"[llm_coach] failed: {e}")
             coaching_status = "failed"
+            coaching_source = "rule_based"
+            coaching_skip_reason = None
+            coaching_error = "coaching_pipeline_failed"
     base_report["coaching"] = coaching
     base_report["coaching_status"] = coaching_status
+    base_report["coaching_source"] = coaching_source
+    base_report["coaching_skip_reason"] = coaching_skip_reason
+    base_report["coaching_error"] = coaching_error
+    # Surface the topic so the UI's mismatch banner can name it
+    # ("The transcript didn't cover '<topic>'.").
+    if prompt_meta and prompt_meta.get("title"):
+        base_report["topic"] = prompt_meta["title"]
 
     # If Gemini produced structured coaching, prefer its wins +
     # improvements over the rule-based ones for the top-level fields.

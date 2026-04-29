@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import useLiveSession from '../hooks/useLiveSession'
 import ScoreGauge from '../components/ScoreGauge'
@@ -9,6 +9,9 @@ import PracticeSetup from '../components/PracticeSetup'
 import CountdownOverlay from '../components/CountdownOverlay'
 import PracticeTimer from '../components/PracticeTimer'
 import PermissionScreen from '../components/PermissionScreen'
+import RecordingReview from '../components/RecordingReview'
+import { API_BASE, apiFetch } from '../config'
+import { pollMediaStatus } from '../utils/mediaStatus'
 import { languageDisplayName } from '../utils/language'
 
 function formatDuration(s) {
@@ -34,27 +37,25 @@ function isPermissionError(msg) {
 
 export default function LiveSession() {
   const {
-    sessionState, videoRef, scores, transcript, tips, report, error,
+    sessionState, videoRef, scores, transcript, tips, error,
     connectionStatus, unsupportedLanguage, backpressure, calibrating,
     noSpeechDetected,
     scoreHistory, duration, faceScores,
-    startSession, stopSession,
+    videoBlob, videoUrl,
+    startSession, stopSession, discardReview,
   } = useLiveSession()
 
   const navigate = useNavigate()
-  const navigatedRef = useRef(false)
 
   const [setup, setSetup] = useState(null)
   const [showCountdown, setShowCountdown] = useState(false)
   const [recStartedAt, setRecStartedAt] = useState(null)
   const [permissionDismissed, setPermissionDismissed] = useState(false)
 
-  useEffect(() => {
-    if (sessionState === 'report' && report?.session_id && !navigatedRef.current) {
-      navigatedRef.current = true
-      navigate(`/result/${report.session_id}`, { replace: true })
-    }
-  }, [sessionState, report, navigate])
+  // Review-screen flags driven from the parent to RecordingReview.
+  const [analyzing, setAnalyzing] = useState(false)
+  const [analyzeStatus, setAnalyzeStatus] = useState(null)
+  const [analyzeError, setAnalyzeError] = useState(null)
 
   useEffect(() => {
     if (sessionState === 'active' && !recStartedAt) {
@@ -62,6 +63,9 @@ export default function LiveSession() {
     }
     if (sessionState === 'idle') {
       setRecStartedAt(null)
+      setAnalyzing(false)
+      setAnalyzeStatus(null)
+      setAnalyzeError(null)
     }
   }, [sessionState, recStartedAt])
 
@@ -82,6 +86,63 @@ export default function LiveSession() {
     // message for the backend's llm_coach. Without this the coach
     // path short-circuits to "skipped".
     startSession(setup)
+  }
+
+  // Analyze handler — submits the locally-recorded blob to /api/upload
+  // along with optional trim windows and the title/body the user
+  // confirmed in RecordingReview. The upload pipeline runs Whisper on
+  // the FULL audio in one pass, which is significantly more accurate
+  // than per-3s-chunk live transcription. Polls media status, then
+  // routes to /result/:id.
+  async function handleAnalyze({ title, body, trimSegments }) {
+    if (!videoBlob) {
+      setAnalyzeError('Recording not ready yet. Hold on a moment and try again.')
+      return
+    }
+    setAnalyzeError(null)
+    setAnalyzing(true)
+    setAnalyzeStatus('Uploading recording…')
+
+    const filename = `live_${Date.now().toString(36)}.webm`
+    const formData = new FormData()
+    formData.append('file', videoBlob, filename)
+    if (trimSegments) {
+      formData.append('trim_segments', JSON.stringify(trimSegments))
+    }
+    if (title) {
+      formData.append('prompt_title', title)
+      formData.append('prompt_body', body || '')
+    }
+
+    try {
+      const res = await apiFetch(`${API_BASE}/api/upload`, {
+        method: 'POST',
+        body: formData,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Upload failed' }))
+        throw new Error(err.error || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      if (!data.media_id) throw new Error('Server did not return a media id')
+
+      setAnalyzeStatus('Analyzing video — face, speech, and confidence…')
+      const final = await pollMediaStatus(data.media_id, {
+        onProgress: (s) => {
+          if (s === 'pending') setAnalyzeStatus('Queued — waiting for a worker…')
+          if (s === 'processing') setAnalyzeStatus('Analyzing video — face, speech, and confidence…')
+        },
+      })
+      if (final.status === 'completed') {
+        navigate(`/result/${data.media_id}`)
+      } else {
+        throw new Error(final.error || 'Processing failed.')
+      }
+    } catch (e) {
+      setAnalyzeError(e.message || 'Cannot connect to backend.')
+      setAnalyzing(false)
+      setAnalyzeStatus(null)
+    }
   }
 
   const barScores = scores
@@ -282,19 +343,39 @@ export default function LiveSession() {
         </div>
       )}
 
-      {/* STOPPING fallback (when scores haven't arrived yet) */}
-      {sessionState === 'stopping' && !scores && (
+      {/* REVIEW — shared preview + trim + title + analyze. */}
+      {sessionState === 'review' && !analyzing && (
+        <RecordingReview
+          mediaSrc={videoUrl}
+          mediaKind="video"
+          mediaBytes={videoBlob?.size}
+          initialTitle={setup?.promptTitle || ''}
+          initialBody={setup?.promptBody || ''}
+          submitting={false}
+          error={analyzeError}
+          onAnalyze={handleAnalyze}
+          onDiscard={discardReview}
+        />
+      )}
+
+      {/* ANALYZING — uploading + waiting for the upload pipeline */}
+      {sessionState === 'review' && analyzing && (
         <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
           <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
-          <p className="text-text-primary">Generating session report…</p>
+          <p className="text-text-primary">{analyzeStatus || 'Analyzing recording…'}</p>
+          <p className="text-text-muted text-sm">
+            Running face + speech analysis on the full clip — typically 30–90 seconds.
+          </p>
         </div>
       )}
 
-      {/* REPORT loading */}
-      {sessionState === 'report' && (
+      {/* STOPPING — brief flicker while the recorder hands us the blob.
+          Almost always invisible (~100 ms); kept for the slow-flush
+          edge case so the screen never goes blank between Stop and Review. */}
+      {sessionState === 'stopping' && (
         <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
           <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
-          <p className="text-text-primary">Opening your session report…</p>
+          <p className="text-text-primary">Finalising recording…</p>
         </div>
       )}
     </div>

@@ -1,22 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { API_BASE, apiFetch } from '../config'
+import { API_BASE, apiFetch, mediaUrl } from '../config'
 
 const KIND_LABEL = {
-  session: 'Live session',
-  upload: 'Uploaded video',
-  analyzer_audio: 'Analyzer audio',
+  session: 'Live Practice',
+  upload: 'Video Upload',
+  analyzer_audio: 'Audio Upload',
 }
 
 const PAGE_SIZE = 20
 
 const SORT_LABELS = {
-  created_desc:  'Newest first',
-  created_asc:   'Oldest first',
-  score_desc:    'Highest score',
-  score_asc:     'Lowest score',
+  created_desc: 'Newest first',
+  created_asc: 'Oldest first',
+  score_desc: 'Highest score',
+  score_asc: 'Lowest score',
   duration_desc: 'Longest first',
-  duration_asc:  'Shortest first',
+  duration_asc: 'Shortest first',
 }
 
 function buildQuery(state, extra = {}) {
@@ -28,8 +28,8 @@ function buildQuery(state, extra = {}) {
   if (state.min_score !== '' && state.min_score != null) params.set('min_score', state.min_score)
   if (state.max_score !== '' && state.max_score != null) params.set('max_score', state.max_score)
   if (state.tag) params.set('tag', state.tag)
-  for (const [k, v] of Object.entries(extra)) {
-    if (v != null) params.set(k, v)
+  for (const [key, value] of Object.entries(extra)) {
+    if (value != null) params.set(key, value)
   }
   return params.toString()
 }
@@ -42,7 +42,7 @@ function isAnyFilterActive(state) {
     state.date_to ||
     state.min_score !== '' ||
     state.max_score !== '' ||
-    state.tag,
+    state.tag
   )
 }
 
@@ -73,6 +73,7 @@ export default function History() {
 
   const [qDraft, setQDraft] = useState(filters.q)
   const debounceRef = useRef(null)
+
   useEffect(() => {
     if (qDraft === filters.q) return
     if (debounceRef.current) clearTimeout(debounceRef.current)
@@ -94,6 +95,7 @@ export default function History() {
     let cancelled = false
     setLoading(true)
     setError(null)
+
     ;(async () => {
       try {
         const qs = buildQuery(filters, { limit: PAGE_SIZE, offset: 0 })
@@ -109,13 +111,14 @@ export default function History() {
           setTotal(data.total || 0)
         }
         setLoading(false)
-      } catch (e) {
+      } catch (err) {
         if (!cancelled) {
-          setError(e.message || 'Failed to load sessions')
+          setError(err.message || 'Failed to load sessions')
           setLoading(false)
         }
       }
     })()
+
     return () => { cancelled = true }
   }, [filters])
 
@@ -131,8 +134,8 @@ export default function History() {
       if (!Array.isArray(data) && typeof data.total === 'number') {
         setTotal(data.total)
       }
-    } catch (e) {
-      setError(e.message || 'Failed to load more')
+    } catch (err) {
+      setError(err.message || 'Failed to load more')
     } finally {
       setLoadingMore(false)
     }
@@ -145,9 +148,10 @@ export default function History() {
 
   async function deleteSession(id) {
     const ok = window.confirm(
-      'Delete this recording permanently? The report, video/audio, and all chunk scores will be removed. This cannot be undone.'
+      'Delete this recording permanently? The report, media, and all chunk scores will be removed. This cannot be undone.'
     )
     if (!ok) return
+
     setDeletingId(id)
     try {
       const res = await apiFetch(`${API_BASE}/api/media/${id}`, { method: 'DELETE' })
@@ -155,10 +159,10 @@ export default function History() {
         const err = await res.json().catch(() => ({ error: 'Delete failed' }))
         throw new Error(err.error || `HTTP ${res.status}`)
       }
-      setSessions((prev) => prev.filter((s) => s.session_id !== id))
-      setTotal((t) => Math.max(0, t - 1))
-    } catch (e) {
-      showToast(`Delete failed: ${e.message}`, 'toast-danger')
+      setSessions((prev) => prev.filter((session) => session.session_id !== id))
+      setTotal((value) => Math.max(0, value - 1))
+    } catch (err) {
+      showToast(`Delete failed: ${err.message}`, 'toast-danger')
     } finally {
       setDeletingId(null)
     }
@@ -180,11 +184,12 @@ export default function History() {
     if (!iso) return 'Unknown date'
     try { return new Date(iso).toLocaleString() } catch { return iso }
   }
-  const formatDuration = (s) => {
-    if (s === null || s === undefined) return '—'
-    const m = Math.floor(s / 60)
-    const sec = Math.floor(s % 60)
-    return `${m}:${String(sec).padStart(2, '0')}`
+
+  const formatDuration = (seconds) => {
+    if (seconds === null || seconds === undefined) return '-'
+    const minutes = Math.floor(seconds / 60)
+    const sec = Math.floor(seconds % 60)
+    return `${minutes}:${String(sec).padStart(2, '0')}`
   }
 
   const anyFilters = isAnyFilterActive(filters)
@@ -204,7 +209,7 @@ export default function History() {
         <div>
           <h2 className="mb-1">Library</h2>
           <p className="text-text-secondary text-sm">
-            Past recording sessions.
+            Past recordings and analysis runs.
             {total > 0 && (
               <span className="text-text-muted ml-2">
                 ({sessions.length} of {total})
@@ -215,13 +220,12 @@ export default function History() {
         <Link to="/live" className="btn btn-primary btn-sm">+ New Session</Link>
       </div>
 
-      {/* Search + Sort bar */}
       <div className="flex gap-2 flex-wrap items-center mb-4">
         <input
           type="search"
           value={qDraft}
           onChange={(e) => setQDraft(e.target.value)}
-          placeholder="Search title, topic, tags…"
+          placeholder="Search title, topic, tags..."
           className="input flex-1 min-w-[240px]"
         />
         <select
@@ -229,18 +233,18 @@ export default function History() {
           onChange={(e) => updateFilter('sort', e.target.value)}
           className="input w-auto"
         >
-          {Object.entries(SORT_LABELS).map(([v, label]) => (
-            <option key={v} value={v}>{label}</option>
+          {Object.entries(SORT_LABELS).map(([value, label]) => (
+            <option key={value} value={value}>{label}</option>
           ))}
         </select>
         <button
           type="button"
-          onClick={() => setShowFilters((s) => !s)}
+          onClick={() => setShowFilters((value) => !value)}
           className={`btn btn-sm ${showFilters ? 'btn-primary' : 'btn-secondary'}`}
         >
           {showFilters ? 'Hide filters' : 'Filters'}
           {anyFilters && !showFilters && (
-            <span className="text-text-accent ml-1">•</span>
+            <span className="text-text-accent ml-1">*</span>
           )}
         </button>
         {anyFilters && (
@@ -254,7 +258,6 @@ export default function History() {
         )}
       </div>
 
-      {/* Filter panel */}
       {showFilters && (
         <div className="glass-card p-4 mb-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           <label className="block">
@@ -278,7 +281,10 @@ export default function History() {
           <label className="block">
             <div className="text-xs text-text-muted mb-1">Min score</div>
             <input
-              type="number" min={0} max={100} step={1}
+              type="number"
+              min={0}
+              max={100}
+              step={1}
               value={filters.min_score}
               onChange={(e) => updateFilter('min_score', e.target.value)}
               placeholder="0"
@@ -288,7 +294,10 @@ export default function History() {
           <label className="block">
             <div className="text-xs text-text-muted mb-1">Max score</div>
             <input
-              type="number" min={0} max={100} step={1}
+              type="number"
+              min={0}
+              max={100}
+              step={1}
               value={filters.max_score}
               onChange={(e) => updateFilter('max_score', e.target.value)}
               placeholder="100"
@@ -317,7 +326,7 @@ export default function History() {
       {loading ? (
         <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
           <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
-          <p className="text-text-primary">Loading sessions…</p>
+          <p className="text-text-primary">Loading sessions...</p>
         </div>
       ) : sessions.length === 0 ? (
         anyFilters ? (
@@ -327,27 +336,27 @@ export default function History() {
         ) : (
           <div className="flex flex-col items-center justify-center py-24 space-y-4 text-center">
             <div className="w-16 h-16 rounded-xl bg-accent-soft border border-border-accent flex items-center justify-center text-3xl">
-              ◈
+              O
             </div>
             <h3 className="text-text-primary">No sessions yet</h3>
             <p className="text-text-secondary text-sm max-w-xs">
               Start your first practice session to see your results here.
             </p>
-            <Link to="/live" className="btn btn-primary mt-2">Start Practicing →</Link>
+            <Link to="/live" className="btn btn-primary mt-2">Start Practicing</Link>
           </div>
         )
       ) : (
         <>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {sessions.map((s) => (
+            {sessions.map((session) => (
               <LibraryCard
-                key={s.session_id}
-                recording={s}
-                onDelete={() => deleteSession(s.session_id)}
-                deleting={deletingId === s.session_id}
+                key={session.session_id}
+                recording={session}
+                onDelete={() => deleteSession(session.session_id)}
+                deleting={deletingId === session.session_id}
                 formatDate={formatDate}
                 formatDuration={formatDuration}
-                onTagClick={(t) => updateFilter('tag', t)}
+                onTagClick={(tag) => updateFilter('tag', tag)}
               />
             ))}
           </div>
@@ -359,7 +368,7 @@ export default function History() {
                 disabled={loadingMore}
                 className="btn btn-primary disabled:opacity-50"
               >
-                {loadingMore ? 'Loading…' : `Load more (${total - sessions.length} left)`}
+                {loadingMore ? 'Loading...' : `Load more (${total - sessions.length} left)`}
               </button>
             </div>
           )}
@@ -370,73 +379,109 @@ export default function History() {
 }
 
 function LibraryCard({ recording, onDelete, deleting, formatDate, formatDuration, onTagClick }) {
-  const status = recording.processing_status || (recording.score != null ? 'completed' : null)
-  const failed = status === 'failed'
-  const processing = status === 'pending' || status === 'processing'
-  const completed = status === 'completed' || (status == null && recording.score != null)
+  const [showPreview, setShowPreview] = useState(false)
+  const status = getRecordingStatus(recording)
+  const previewUrl = recording.video_url || recording.audio_url || null
+  const previewType = recording.video_url ? 'video' : recording.audio_url ? 'audio' : null
+  const canPreview = Boolean(previewUrl) && status.key !== 'processing' && status.key !== 'failed'
 
   return (
-    <div className="glass-card p-4 hover:-translate-y-0.5 hover:shadow-accent transition-all duration-200">
+    <div className={`history-card ${status.cardClass}`}>
       {recording.shared_by && (
         <div className="badge badge-accent mb-2">
           Shared by {recording.shared_by.name || recording.shared_by.email}
         </div>
       )}
-      <div className="flex gap-4 items-start">
-        {/* Thumbnail / icon */}
-        <div className="w-20 h-16 rounded-md bg-elevated flex-shrink-0 flex items-center justify-center text-2xl border border-border overflow-hidden">
-          <span>{recording.kind === 'session' ? '🎥' : recording.kind === 'analyzer_audio' ? '🎤' : '📁'}</span>
-        </div>
 
-        {/* Info */}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-start justify-between gap-2">
-            <p className="font-medium text-sm text-text-primary truncate">
-              {recording.title || recording.original_name || 'Untitled recording'}
-            </p>
-            {failed ? (
-              <span className="badge badge-danger flex-shrink-0">Failed</span>
-            ) : processing ? (
-              <span className="badge badge-warning flex-shrink-0">Processing</span>
-            ) : completed && recording.score != null ? (
-              <span className="badge badge-accent flex-shrink-0">{recording.score}</span>
-            ) : (
-              <span className="badge badge-muted flex-shrink-0">—</span>
-            )}
-          </div>
-          {recording.topic && (
-            <p className="text-xs text-text-muted mt-0.5 truncate">Topic: {recording.topic}</p>
-          )}
-          <p className="text-xs text-text-muted mt-0.5">
-            {formatDate(recording.started_at)} · {KIND_LABEL[recording.kind] || recording.kind} · {formatDuration(recording.duration_s)}
-          </p>
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div className="flex gap-2 flex-wrap">
+          <span className="badge badge-muted">{KIND_LABEL[recording.kind] || recording.kind}</span>
+          <span className={status.badgeClass}>{status.label}</span>
         </div>
+        {recording.score != null && status.key === 'completed' ? (
+          <div className="text-right flex-shrink-0">
+            <p className="text-2xl font-display font-bold leading-none text-text-primary">
+              {recording.score}
+            </p>
+            <p className="text-xs text-text-muted">{recording.grade || 'Score'}</p>
+          </div>
+        ) : (
+          <span className="badge badge-muted flex-shrink-0">{formatDuration(recording.duration_s)}</span>
+        )}
       </div>
 
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-text-primary">
+          {recording.title || recording.original_name || 'Untitled recording'}
+        </p>
+        {recording.topic && (
+          <p className="mt-1 text-xs text-text-secondary">Topic: {recording.topic}</p>
+        )}
+        <p className="mt-1 text-xs text-text-muted">
+          {formatDate(recording.started_at)} · {formatDuration(recording.duration_s)}
+        </p>
+      </div>
+
+      {status.note && (
+        <p className="mt-3 text-xs leading-relaxed text-text-secondary">
+          {status.note}
+        </p>
+      )}
+
       {recording.tags && recording.tags.length > 0 && (
-        <div className="flex gap-1 flex-wrap mt-3">
-          {recording.tags.map((t) => (
+        <div className="mt-3 flex gap-1 flex-wrap">
+          {recording.tags.map((tag) => (
             <button
-              key={t}
+              key={tag}
               type="button"
-              onClick={() => onTagClick(t)}
+              onClick={() => onTagClick(tag)}
               className="badge badge-muted hover:badge-accent transition-colors"
-              title={`Filter by tag: ${t}`}
+              title={`Filter by tag: ${tag}`}
             >
-              #{t}
+              #{tag}
             </button>
           ))}
         </div>
       )}
 
-      <div className="flex items-center justify-between mt-3 pt-3 border-t border-border">
-        <Link
-          to={`/result/${recording.session_id}`}
-          className="btn btn-secondary btn-sm"
-        >
-          View →
-        </Link>
-        {!recording.shared_by && (
+      {showPreview && canPreview && (
+        <div className="history-preview">
+          {previewType === 'video' ? (
+            <video
+              src={mediaUrl(previewUrl)}
+              controls
+              preload="metadata"
+              playsInline
+              className="w-full rounded-md bg-black"
+            />
+          ) : (
+            <audio
+              src={mediaUrl(previewUrl)}
+              controls
+              preload="metadata"
+              className="w-full"
+            />
+          )}
+        </div>
+      )}
+
+      <div className="mt-4 flex items-center justify-between gap-3 border-t border-border pt-3 flex-wrap">
+        <div className="flex items-center gap-2 flex-wrap">
+          <Link to={`/result/${recording.session_id}`} className="btn btn-secondary btn-sm">
+            View Result
+          </Link>
+          {canPreview && (
+            <button
+              type="button"
+              onClick={() => setShowPreview((value) => !value)}
+              className="btn btn-ghost btn-sm"
+            >
+              {showPreview ? 'Hide Preview' : 'Preview'}
+            </button>
+          )}
+        </div>
+
+        {recording.is_owner && (
           <button
             type="button"
             onClick={onDelete}
@@ -444,10 +489,52 @@ function LibraryCard({ recording, onDelete, deleting, formatDate, formatDuration
             className="btn btn-danger btn-sm disabled:opacity-50"
             title="Delete permanently"
           >
-            {deleting ? 'Deleting…' : 'Delete'}
+            {deleting ? 'Deleting...' : 'Delete'}
           </button>
         )}
       </div>
     </div>
   )
+}
+
+function getRecordingStatus(recording) {
+  const note = recording.status_message || recording.processing_error || null
+
+  if (recording.processing_status === 'pending' || recording.processing_status === 'processing') {
+    return {
+      key: 'processing',
+      label: 'Processing',
+      badgeClass: 'badge badge-warning',
+      cardClass: 'is-processing',
+      note: 'Analysis is still running. Open the result to follow progress.',
+    }
+  }
+
+  if (recording.unscoreable) {
+    return {
+      key: 'unscoreable',
+      label: 'Unscoreable',
+      badgeClass: 'badge badge-warning',
+      cardClass: 'is-unscoreable',
+      note,
+    }
+  }
+
+  if (recording.processing_status === 'failed') {
+    return {
+      key: 'failed',
+      label: 'Failed',
+      badgeClass: 'badge badge-danger',
+      cardClass: 'is-failed',
+      note,
+    }
+  }
+
+  return {
+    key: 'completed',
+    label: 'Completed',
+    badgeClass: 'badge badge-success',
+    cardClass: '',
+    note: null,
+  }
 }

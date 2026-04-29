@@ -21,7 +21,7 @@ from __future__ import annotations
 import pytest
 
 from signal_scorer import SignalScorer
-from scoring_engine import ScoringEngine
+from scoring_engine import ScoringEngine, generate_tips
 
 
 # ───────────────────── Fix 3: aggregate ──────────────────────
@@ -239,3 +239,61 @@ def test_scoring_engine_update_renormalizes_with_missing_signals():
     assert final["eyeContact"] is None
     assert final["expression"] is None
     assert final["voiceSteadiness"] == 80
+
+
+# ────────────────── generate_tips: None-safe comparison ──────────────────
+
+
+def test_generate_tips_handles_none_signals():
+    """Reproduces the upload-pipeline crash:
+       'TypeError: < not supported between NoneType and int'.
+
+    `dict.get(key, 50)` only returns 50 when the key is MISSING — not
+    when the value is explicitly None. After Batch-5 made missing
+    signals return None, generate_tips broke on the first None signal.
+    Fix: skip None signals when generating tips. This pins the fix.
+    """
+    # Audio-only upload shape: face signals are None.
+    scores = {
+        'voiceSteadiness': 80,
+        'eyeContact': None,
+        'speechPace': 75,
+        'fillerWords': 90,
+        'vocalVariety': 65,
+        'expression': None,
+        'total': 78,
+    }
+    # Must NOT raise. Must return a list.
+    tips = generate_tips(scores)
+    assert isinstance(tips, list)
+    # Every measured signal here is >= its tip threshold, so the only
+    # tip that fires is the encouragement (total=78 >= 70).
+    assert tips == ["Great job! You're presenting with confidence"]
+
+
+def test_generate_tips_total_none_does_not_crash():
+    """Also handle the all-Nones case (silent + no-face clip)."""
+    scores = {
+        'voiceSteadiness': None, 'eyeContact': None, 'speechPace': None,
+        'fillerWords': None, 'vocalVariety': None, 'expression': None,
+        'total': None,
+    }
+    tips = generate_tips(scores)
+    assert tips == []
+
+
+def test_generate_tips_low_score_with_none_neighbors():
+    """Mixed: some scores low, some None. Should tip on the low ones,
+    skip the Nones."""
+    scores = {
+        'voiceSteadiness': None,         # skipped
+        'eyeContact': 30,                # below 50 threshold
+        'speechPace': None,              # skipped
+        'fillerWords': 40,               # below 60 threshold
+        'vocalVariety': 90,              # not below 50
+        'expression': None,              # skipped
+        'total': 40,
+    }
+    tips = generate_tips(scores)
+    assert "Look directly at the camera to maintain eye contact" in tips
+    assert "Reduce filler words like 'um', 'uh', and 'like'" in tips

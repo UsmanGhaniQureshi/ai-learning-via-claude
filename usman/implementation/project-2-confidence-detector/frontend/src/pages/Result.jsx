@@ -1,18 +1,22 @@
-import { useEffect, useRef, useState } from 'react'
-import { useNavigate, useParams, Link } from 'react-router-dom'
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { API_BASE, apiFetch, mediaUrl } from '../config'
+import { pollMediaStatus } from '../utils/mediaStatus'
 import ScoreGauge from '../components/ScoreGauge'
 import SignalBars from '../components/SignalBars'
-import FeedbackTips from '../components/FeedbackTips'
-import PlaybackReview from '../components/PlaybackReview'
-import AudioPlaybackReview from '../components/AudioPlaybackReview'
 import TimelineModal from '../components/TimelineModal'
 import SessionReport from '../components/SessionReport'
 import MetadataEditor from '../components/MetadataEditor'
 import CommentsThread from '../components/CommentsThread'
 import ShareModal from '../components/ShareModal'
 import ScoreBreakdownPanel from '../components/ScoreBreakdownPanel'
-import CoachingPanel from '../components/CoachingPanel'
 
 export default function Result() {
   const { id } = useParams()
@@ -20,6 +24,7 @@ export default function Result() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [statusInfo, setStatusInfo] = useState(null)
   const [discardBusy, setDiscardBusy] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [discardError, setDiscardError] = useState(null)
@@ -36,12 +41,14 @@ export default function Result() {
         const err = await res.json().catch(() => ({}))
         throw new Error(err.error || `HTTP ${res.status}`)
       }
-      const dest = data.kind === 'analyzer_audio' ? '/analyzer'
-                 : data.kind === 'session' ? '/live'
-                 : '/upload'
-      navigate(dest, { replace: true })
-    } catch (e) {
-      setDiscardError(`Discard failed: ${e.message}`)
+      const destination = data.kind === 'analyzer_audio'
+        ? '/analyzer'
+        : data.kind === 'session'
+          ? '/live'
+          : '/upload'
+      navigate(destination, { replace: true })
+    } catch (err) {
+      setDiscardError(`Discard failed: ${err.message}`)
       setDiscardBusy(false)
     }
   }
@@ -50,15 +57,66 @@ export default function Result() {
     let cancelled = false
     setLoading(true)
     setError(null)
+    setStatusInfo(null)
     setData(null)
-    ;(async () => {
+
+    async function fetchStatus() {
+      try {
+        const res = await apiFetch(`${API_BASE}/api/media/${id}/status`)
+        if (!res.ok) return null
+        return await res.json()
+      } catch {
+        return null
+      }
+    }
+
+    async function fetchReport() {
       try {
         const res = await apiFetch(`${API_BASE}/api/report/${id}`)
         if (res.status === 404) {
-          if (!cancelled) {
-            setError('not_found')
+          const status = await fetchStatus()
+          if (cancelled) return
+          if (!status) {
+            setError({ type: 'not_found' })
             setLoading(false)
+            return
           }
+          if (status.status === 'pending' || status.status === 'processing') {
+            setStatusInfo(status)
+            setLoading(false)
+            const final = await pollMediaStatus(id, {
+              onProgress: (_next, payload) => {
+                if (!cancelled) setStatusInfo(payload || status)
+              },
+            })
+            if (cancelled) return
+            if (final.status === 'completed') {
+              setLoading(true)
+              setStatusInfo(final)
+              await fetchReport()
+              return
+            }
+            setError({
+              type: 'failed',
+              message: final.error || 'Analysis failed.',
+              kind: final.kind || status.kind,
+            })
+            setStatusInfo(final)
+            setLoading(false)
+            return
+          }
+          if (status.status === 'failed') {
+            setError({
+              type: 'failed',
+              message: status.error || 'Analysis failed.',
+              kind: status.kind,
+            })
+            setStatusInfo(status)
+            setLoading(false)
+            return
+          }
+          setError({ type: 'not_found' })
+          setLoading(false)
           return
         }
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -66,14 +124,17 @@ export default function Result() {
         if (!cancelled) {
           setData(json)
           setLoading(false)
+          setStatusInfo(null)
         }
-      } catch (e) {
+      } catch (err) {
         if (!cancelled) {
-          setError(e.message || 'Failed to load result')
+          setError({ type: 'load', message: err.message || 'Failed to load result' })
           setLoading(false)
         }
       }
-    })()
+    }
+
+    fetchReport()
     return () => { cancelled = true }
   }, [id])
 
@@ -81,42 +142,55 @@ export default function Result() {
     return (
       <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
         <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
-        <p className="text-text-primary">Loading result…</p>
+        <p className="text-text-primary">Loading result...</p>
       </div>
     )
   }
 
-  if (error === 'not_found') {
+  if (!data && (statusInfo?.status === 'pending' || statusInfo?.status === 'processing')) {
+    return <UploadProcessingState id={id} statusInfo={statusInfo} />
+  }
+
+  if (error?.type === 'not_found') {
     return (
       <div className="text-center py-16 space-y-4">
         <h2>Result not found</h2>
         <p className="text-text-secondary">
           No analysis with id <code className="bg-elevated px-2 py-0.5 rounded text-sm">{id}</code>. It may have been deleted, or the link is wrong.
         </p>
-        <Link to="/library" className="btn btn-primary">← Back to Library</Link>
+        <Link to="/library" className="btn btn-primary">Back to Library</Link>
       </div>
+    )
+  }
+
+  if (error?.type === 'failed') {
+    return (
+      <UploadFailureState
+        id={id}
+        kind={error.kind || statusInfo?.kind}
+        reason={error.message}
+      />
     )
   }
 
   if (error) {
     return (
       <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2">
-        Failed to load result: {error}
+        Failed to load result: {error.message}
       </div>
     )
   }
 
   if (!data) return null
 
-  const looksLikeUpload =
+  const isUploadedMedia = (
     data.kind === 'upload' ||
-    data.overall_confidence != null ||
-    data.sub_scores != null ||
-    Array.isArray(data.face_timeline)
+    data.kind === 'analyzer_audio'
+  )
 
-  if (looksLikeUpload) {
+  if (isUploadedMedia) {
     return (
-      <UploadResult
+      <UploadedMediaResult
         data={data}
         mediaId={data.media_id || id}
         onUpdated={(saved) => setData((prev) => ({ ...prev, ...saved }))}
@@ -139,32 +213,24 @@ export default function Result() {
   if (!looksLikeSessionReport) {
     return (
       <div className="space-y-4">
+        <ResultBreadcrumbs />
         <h2>Partial record</h2>
         <p className="text-text-secondary">
-          This entry was saved by an older version of the app and doesn&apos;t have a full report. You can still browse the raw JSON below.
+          This entry was saved by an older version of the app and does not have a full report. You can still browse the raw JSON below.
         </p>
         <pre className="bg-page/60 border border-border rounded-md p-4 text-xs overflow-auto max-h-96">
           {JSON.stringify(data, null, 2)}
         </pre>
-        <Link to="/library" className="btn btn-primary">← Back to Library</Link>
+        <Link to="/library" className="btn btn-primary">Back to Library</Link>
       </div>
     )
   }
-
-  const isAnalyzerAudio =
-    data.kind === 'analyzer_audio' || data?.recording?.audio_url != null
 
   const isOwner = data.is_owner !== false
 
   return (
     <div>
-      <p className="text-sm text-text-muted mb-6">
-        <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
-        {' / '}
-        <Link to="/library" className="hover:text-text-accent transition-colors">Library</Link>
-        {' / '}
-        <span className="text-text-secondary">Result</span>
-      </p>
+      <ResultBreadcrumbs />
 
       {!isOwner && data.shared_by && (
         <div className="bg-[rgba(6,182,212,0.1)] border border-[rgba(6,182,212,0.3)] text-cyan text-sm rounded-md px-4 py-2 mb-4">
@@ -186,11 +252,10 @@ export default function Result() {
         />
       )}
 
-      {isAnalyzerAudio && <AudioPlaybackReview ref={playerRef} report={data} />}
       <SessionReport
         report={data}
-        showRecording={!isAnalyzerAudio}
-        playerHandleRef={!isAnalyzerAudio ? playerRef : null}
+        showRecording
+        playerHandleRef={playerRef}
       />
 
       <CommentsThread
@@ -199,7 +264,6 @@ export default function Result() {
         playerRef={playerRef}
       />
 
-      {/* Result footer — destructive isolated left, safe right */}
       <div className="flex items-center justify-between pt-6 border-t border-border mt-8 flex-wrap gap-3">
         {isOwner ? (
           <button
@@ -208,18 +272,18 @@ export default function Result() {
             disabled={discardBusy}
             className="text-danger text-sm hover:underline transition-colors disabled:opacity-50"
           >
-            {discardBusy ? 'Discarding…' : 'Discard'}
+            {discardBusy ? 'Discarding...' : 'Discard'}
           </button>
         ) : <span />}
         <div className="flex items-center gap-3 flex-wrap">
-          <Link to="/library" className="btn btn-secondary btn-sm">← Library</Link>
+          <Link to="/library" className="btn btn-secondary btn-sm">Back to Library</Link>
           {isOwner && (
             <button
               type="button"
               onClick={() => setShareOpen(true)}
               className="btn btn-secondary btn-sm"
             >
-              ↗ Share
+              Share
             </button>
           )}
         </div>
@@ -235,81 +299,66 @@ export default function Result() {
   )
 }
 
-function UploadResult({
-  data, mediaId, onUpdated, onDiscard, discardBusy, discardError,
-  isOwner = true, sharedBy = null,
-  onOpenShare, shareModalOpen, onCloseShare,
+function UploadedMediaResult({
+  data,
+  mediaId,
+  onUpdated,
+  onDiscard,
+  discardBusy,
+  discardError,
+  isOwner = true,
+  sharedBy = null,
+  onOpenShare,
+  shareModalOpen,
+  onCloseShare,
   playerRef = null,
 }) {
   const [modalEntry, setModalEntry] = useState(null)
 
+  const mode = getUploadMode(data)
+  const uploadPath = mode === 'audio' ? '/analyzer' : '/upload'
+  const practicePath = mode === 'audio' ? '/analyzer?mode=live' : '/live'
+  const score = getHeadlineScore(data, mode)
+  const isUnscoreable = (
+    score == null ||
+    data.insufficient_speech ||
+    data.unsupported_language
+  )
   const processedVideoUrl = data.recording?.video_url
     ? mediaUrl(data.recording.video_url)
     : data.processed_video
       ? mediaUrl(`/api/video/${data.processed_video}`)
       : null
+  const playerSrc = mode === 'audio'
+    ? mediaUrl(data.recording?.audio_url)
+    : processedVideoUrl
 
-  const allWords = (data.speech_timeline || []).flatMap(
-    (chunk) => chunk.words || []
+  const transcript = useMemo(() => getTranscriptContent(data, mode), [data, mode])
+  const signalBarScores = useMemo(() => getSignalBarScores(data, mode), [data, mode])
+  const signalAverages = useMemo(() => getSignalAverages(data, mode), [data, mode])
+  const signalReasons = getSignalReasons(data, mode)
+  const coachingMetrics = useMemo(() => getCoachingMetrics(data, mode), [data, mode])
+  const strongestMetric = coachingMetrics.length
+    ? [...coachingMetrics].sort((a, b) => b.score - a.score)[0]
+    : null
+  const weakestMetric = coachingMetrics.length
+    ? [...coachingMetrics].sort((a, b) => a.score - b.score)[0]
+    : null
+  const actionItems = useMemo(
+    () => buildActionItems(data, mode, weakestMetric),
+    [data, mode, weakestMetric]
   )
-
-  const scoreColor = (s) => {
-    if (s === null || s === undefined) return 'text-text-muted'
-    return s >= 71 ? 'text-success' : s >= 41 ? 'text-warning' : 'text-danger'
-  }
-  const scoreLabel = (s) => {
-    if (s === null || s === undefined) return 'N/A'
-    if (s >= 85) return 'Highly Confident'
-    if (s >= 71) return 'Confident'
-    if (s >= 50) return 'Moderate'
-    if (s >= 25) return 'Developing'
-    return 'Low Confidence'
-  }
-  const grade = (s) => {
-    if (s == null) return ''
-    if (s >= 85) return 'A'
-    if (s >= 71) return 'B'
-    if (s >= 50) return 'C'
-    if (s >= 25) return 'D'
-    return 'F'
-  }
-
-  if (data.insufficient_speech || data.unsupported_language || data.overall_confidence == null) {
-    return (
-      <div>
-        <p className="text-sm text-text-muted mb-6">
-          <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
-          {' / '}
-          <Link to="/library" className="hover:text-text-accent transition-colors">Library</Link>
-          {' / '}
-          <span className="text-text-secondary">Result</span>
-        </p>
-
-        <div className="glass-card p-8 text-center max-w-xl mx-auto">
-          <div className="text-4xl mb-3">⚠️</div>
-          <h3 className="text-text-primary mb-3">We couldn&apos;t score this recording</h3>
-          <p className="text-text-secondary mb-6">
-            {data.status_message || 'Not enough speech to score. Try recording again and speak for at least a few seconds.'}
-          </p>
-          <Link to="/upload" className="btn btn-primary">Upload another recording</Link>
-        </div>
-      </div>
-    )
-  }
-
-  const score = data.overall_confidence
-  const wins = (data.tips || []).filter((t) => /great|good|nice|keep|excellent|strong/i.test(t))
-  const improvements = (data.tips || []).filter((t) => !wins.includes(t))
+  const nextFocus = buildNextFocusCard(data, mode, weakestMetric, actionItems[0])
+  const detailStats = buildDetailStats(data, mode)
+  const notices = buildUploadNotices(data, mode)
+  const title = getUploadTitle(data, mode)
+  const subtitle = getUploadSubtitle(data)
+  const summaryText = buildHeroSummary(score, strongestMetric, weakestMetric)
+  const allWords = transcript.words
 
   return (
     <div>
-      <p className="text-sm text-text-muted mb-6">
-        <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
-        {' / '}
-        <Link to="/library" className="hover:text-text-accent transition-colors">Library</Link>
-        {' / '}
-        <span className="text-text-secondary">Result</span>
-      </p>
+      <ResultBreadcrumbs />
 
       {!isOwner && sharedBy && (
         <div className="bg-[rgba(6,182,212,0.1)] border border-[rgba(6,182,212,0.3)] text-cyan text-sm rounded-md px-4 py-2 mb-4">
@@ -323,277 +372,1067 @@ function UploadResult({
         </div>
       )}
 
-      {isOwner && (
-        <MetadataEditor
-          mediaId={mediaId}
-          initial={{ title: data.title, topic: data.topic, tags: data.tags }}
-          onUpdated={onUpdated}
-        />
-      )}
+      {notices.map((notice) => (
+        <div
+          key={notice.text}
+          className={`mb-4 rounded-md border px-4 py-2 text-sm ${notice.className}`}
+        >
+          {notice.text}
+        </div>
+      ))}
 
-      {data.no_face_detected && (
-        <div className="bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.3)] text-warning text-sm rounded-md px-4 py-2 mb-4">
-          No face was detected in this video. Face-based scores (eye contact, expression) are marked unavailable and were excluded from the headline score.
+      {/* Title-vs-transcript mismatch banner. The llm_coach module
+          flags this with skip_reason="topic_mismatch" (keyword pre-
+          filter) or "model_topic_mismatch" (Gemini itself returned
+          null for the off-topic transcript). The user typed a topic
+          and the recording didn't cover it. */}
+      {data.coaching_status === 'skipped' &&
+        (data.coaching_skip_reason === 'topic_mismatch' ||
+         data.coaching_skip_reason === 'model_topic_mismatch') && (
+        <div className="mb-4 rounded-md border border-[rgba(245,158,11,0.4)] bg-[rgba(245,158,11,0.08)] px-4 py-3 text-sm">
+          <p className="font-semibold text-warning uppercase tracking-wider mb-1">
+            ⚠ Transcript didn’t match the topic
+          </p>
+          <p className="text-text-secondary leading-relaxed">
+            {data.topic ? (
+              <>The transcript of this recording didn’t cover <strong className="text-text-primary">“{data.topic}”</strong>.</>
+            ) : (
+              <>The transcript of this recording didn’t cover the topic you set.</>
+            )}{' '}
+            We’re showing rule-based feedback below instead of detailed AI coaching.
+            Re-record with a transcript that talks about the topic, or leave the title blank, to get the right kind of coaching.
+          </p>
         </div>
       )}
-      {data.multi_face_warning && (
-        <div className="bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.3)] text-warning text-sm rounded-md px-4 py-2 mb-4">
-          <strong>Multiple faces:</strong> {data.multi_face_warning}
-        </div>
-      )}
-      {data.audio_extraction_error && (
-        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2 mb-4">
-          Audio could not be extracted: {data.audio_extraction_error}
-        </div>
-      )}
-      {data.video_encode_error && (
-        <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2 mb-4">
-          Video re-encode failed: {data.video_encode_error}
-        </div>
-      )}
 
-      {/* Score hero */}
-      <div className="glass-card p-8 flex flex-col sm:flex-row items-center gap-8 mb-6">
-        <ScoreGauge score={score} size={200} />
-        <div className="flex-1 space-y-2 text-center sm:text-left">
-          <div className="flex items-center gap-3 justify-center sm:justify-start flex-wrap">
-            <span className="text-6xl font-display font-extrabold text-text-primary leading-none">
-              {Math.round(score)}
-            </span>
-            <span className={`text-3xl font-display font-bold ${scoreColor(score)}`}>
-              {grade(score)}
-            </span>
-          </div>
-          <p className="text-text-secondary">{scoreLabel(score)}</p>
-        </div>
-      </div>
-
-      {/* Coaching — Gemini-powered when topic was set, rule-based fallback otherwise */}
-      {data.coaching_status === 'ready' && data.coaching ? (
-        <div className="mb-6">
-          <CoachingPanel coaching={data.coaching} status={data.coaching_status} />
-        </div>
-      ) : (
-        (wins.length > 0 || improvements.length > 0) && (
-          <div className="glass-card p-6 mb-6 border border-border-accent">
-            <p className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-4">
-              ✦ Coaching Insights
-            </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-              {wins.length > 0 && (
-                <div>
-                  <p className="text-success text-sm font-semibold mb-2">✅ What went well</p>
-                  <ul className="space-y-1.5">
-                    {wins.map((w, i) => (
-                      <li key={i} className="text-sm text-text-secondary flex gap-2">
-                        <span className="text-text-muted">·</span><span>{w}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {improvements.length > 0 && (
-                <div>
-                  <p className="text-warning text-sm font-semibold mb-2">↗ Work on next</p>
-                  <ul className="space-y-1.5">
-                    {improvements.map((imp, i) => (
-                      <li key={i} className="text-sm text-text-secondary flex gap-2">
-                        <span className="text-text-muted">·</span><span>{imp}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-          </div>
-        )
-      )}
-
-      {/* Practice Again CTA */}
-      <Link to="/upload" className="btn btn-primary btn-full btn-lg mb-8">
-        Analyze another →
-      </Link>
-
-      <hr className="border-border mb-8" />
-
-      {data.sub_scores && (
-        <div className="glass-card p-5 mb-6">
-          <h3 className="mb-4">Signal Breakdown</h3>
-          <SignalBars
-            scores={data.sub_scores}
-            faceUnavailable={!!data.no_face_detected}
+      {isUnscoreable ? (
+        <>
+          <UnscoreableUploadState
+            data={data}
+            mode={mode}
+            title={title}
+            uploadPath={uploadPath}
+            practicePath={practicePath}
           />
-        </div>
-      )}
-
-      {data.sub_scores && (
-        <ScoreBreakdownPanel
-          avgScore={data.overall_confidence}
-          signalAverages={{
-            voice_steadiness: data.sub_scores.voiceSteadiness,
-            eye_contact: data.sub_scores.eyeContact,
-            speech_pace: data.sub_scores.speechPace,
-            filler_words: data.sub_scores.fillerWords,
-            vocal_variety: data.sub_scores.vocalVariety,
-            expression: data.sub_scores.expression,
-          }}
-          signalReasons={data.signal_reasons}
-        />
-      )}
-
-      {data.tips && wins.length === 0 && improvements.length === 0 && (
-        <FeedbackTips tips={data.tips} />
-      )}
-
-      {/* Speech summary */}
-      {data.speech_summary && (
-        <div className="glass-card p-5 mb-6">
-          <h3 className="mb-4">Speech Analysis</h3>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <div className="bg-elevated rounded-md p-3 text-center">
-              <p className="text-xl font-display font-bold text-text-primary">{data.speech_summary.total_words}</p>
-              <p className="text-xs text-text-muted">Total Words</p>
-            </div>
-            <div className="bg-elevated rounded-md p-3 text-center">
-              <p className={`text-xl font-display font-bold ${data.speech_summary.filler_rate > 5 ? 'text-danger' : 'text-success'}`}>
-                {data.speech_summary.total_fillers}
-              </p>
-              <p className="text-xs text-text-muted">Fillers ({data.speech_summary.filler_rate}%)</p>
-            </div>
-            <div className="bg-elevated rounded-md p-3 text-center">
-              <p className={`text-xl font-display font-bold ${data.speech_summary.total_hedges > 3 ? 'text-warning' : 'text-success'}`}>
-                {data.speech_summary.total_hedges}
-              </p>
-              <p className="text-xs text-text-muted">Hedging Phrases</p>
-            </div>
-            <div className="bg-elevated rounded-md p-3 text-center">
-              <p className="text-xl font-display font-bold text-text-primary">{data.speech_summary.average_wpm}</p>
-              <p className="text-xs text-text-muted">Words/Min</p>
-            </div>
-          </div>
-          {data.speech_summary.filler_words && data.speech_summary.filler_words.length > 0 && (
-            <div className="mt-4 text-sm text-text-secondary">
-              <span className="text-warning font-semibold">Fillers found:</span>{' '}
-              {[...new Set(data.speech_summary.filler_words)].map((w) => (
-                <span key={w} className="badge badge-warning ml-1">
-                  {w} ({data.speech_summary.filler_words.filter((x) => x === w).length})
-                </span>
-              ))}
-            </div>
+          {isOwner && (
+            <MetadataEditor
+              mediaId={mediaId}
+              initial={{ title: data.title, topic: data.topic, tags: data.tags }}
+              onUpdated={onUpdated}
+            />
           )}
-        </div>
-      )}
+          <ResultFooterActions
+            mode={mode}
+            uploadPath={uploadPath}
+            practicePath={practicePath}
+            isOwner={isOwner}
+            onOpenShare={onOpenShare}
+          />
+          {isOwner && (
+            <DangerZone
+              discardBusy={discardBusy}
+              onDiscard={onDiscard}
+            />
+          )}
+          {shareModalOpen && (
+            <ShareModal mediaId={mediaId} onClose={onCloseShare} />
+          )}
+        </>
+      ) : (
+        <>
+          <section className="result-hero">
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="badge badge-accent">
+                  {mode === 'audio' ? 'Audio Upload' : 'Video Upload'}
+                </span>
+                {subtitle && <span className="badge badge-muted">{subtitle}</span>}
+              </div>
+              <div className="space-y-2">
+                <h2>{title}</h2>
+                <p className="text-text-secondary">
+                  {summaryText}
+                </p>
+                <p className="text-sm text-text-muted">
+                  {getScoreLabel(score)}
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-3">
+                <Link to={uploadPath} className="btn btn-primary">Upload Another</Link>
+                <Link to="/library" className="btn btn-secondary">Back to Library</Link>
+              </div>
+            </div>
 
-      {(processedVideoUrl || data.processed_video) && (
-        <PlaybackReview
-          ref={playerRef}
-          processedVideo={data.processed_video}
-          processedVideoUrl={processedVideoUrl}
-          faceTimeline={data.face_timeline}
-          speechTimeline={data.speech_timeline}
-        />
-      )}
+            <div className="flex flex-col items-center justify-center gap-4 text-center">
+              <ScoreGauge score={score} size={176} />
+              <div className="space-y-1">
+                <p className="text-2xl font-display font-bold text-text-primary">
+                  Grade {getGrade(score)}
+                </p>
+                <p className="text-sm text-text-secondary">
+                  Overall confidence score {Math.round(score)}
+                </p>
+              </div>
+            </div>
+          </section>
 
-      {data.face_timeline && data.face_timeline.length > 0 && (
-        <div className="glass-card p-5 mt-6">
-          <h3 className="mb-4">Timeline — Confidence Over Time</h3>
-          <details className="bg-page/60 border border-border rounded-md p-3 mb-4 text-sm">
-            <summary className="cursor-pointer font-semibold text-text-primary select-none">What am I looking at?</summary>
-            <div className="mt-2 text-text-secondary leading-relaxed space-y-2">
-              <p>Every 2 seconds during the recording, the app took a quick snapshot of your face and noted what it saw. Each row below is one of those snapshots.</p>
-              <ul className="list-disc pl-5 space-y-1">
-                <li><strong className="text-text-primary">Time</strong> — when in the recording this snapshot was taken (minutes:seconds from the start).</li>
-                <li><strong className="text-text-primary">Expression</strong> — what your face was doing: smiling, focused, neutral, and so on. You&apos;ll see <em>calibrating</em> at the very start.</li>
-                <li><strong className="text-text-primary">Face: X/100</strong> — overall score for this 2-second window. <span className="text-success">Green</span> 71+, <span className="text-warning">yellow</span> 40–70, <span className="text-danger">red</span> needs work.</li>
-                <li><strong className="text-text-primary">Eye: X%</strong> — how much of this window you spent looking at the camera.</li>
-              </ul>
-              <p className="opacity-85">Click any row to see the actual video frame the numbers came from.</p>
+          <section className="mb-6">
+            <div className="mb-4">
+              <h3>Coaching Summary</h3>
+              <p className="text-sm text-text-secondary mt-1">
+                Start here before replaying the recording.
+              </p>
+            </div>
+            <div className="result-summary-grid">
+              {strongestMetric && (
+                <CoachingCard
+                  title="Strongest area"
+                  metric={strongestMetric}
+                  body={getMetricNarrative(strongestMetric, data, mode, 'strong')}
+                />
+              )}
+              {weakestMetric && (
+                <CoachingCard
+                  title="Weakest area"
+                  metric={weakestMetric}
+                  body={getMetricNarrative(weakestMetric, data, mode, 'weak')}
+                />
+              )}
+              {nextFocus && (
+                <CoachingCard
+                  title="Next improvement focus"
+                  metric={nextFocus.metric}
+                  body={nextFocus.body}
+                />
+              )}
+            </div>
+          </section>
+
+          <section className="action-items">
+            <div className="flex items-start justify-between gap-3 flex-wrap mb-4">
+              <div>
+                <h3>Action Items</h3>
+                <p className="text-sm text-text-secondary mt-1">
+                  Focus on the next one or two changes, then record again.
+                </p>
+              </div>
+            </div>
+            <ol className="space-y-3">
+              {actionItems.map((item, index) => (
+                <li key={item} className="flex gap-3 text-sm text-text-secondary leading-relaxed">
+                  <span className="badge badge-accent flex-shrink-0">{index + 1}</span>
+                  <span>{item}</span>
+                </li>
+              ))}
+            </ol>
+          </section>
+
+          <section className="media-review-card">
+            <div className="flex items-start justify-between gap-3 flex-wrap mb-4">
+              <div>
+                <h3>Media Review</h3>
+                <p className="text-sm text-text-secondary mt-1">
+                  Review the recording after reading the coaching above.
+                </p>
+              </div>
+              <span className="badge badge-muted">{formatDuration(getDurationSeconds(data, mode))}</span>
+            </div>
+
+            {playerSrc ? (
+              <UploadedMediaPlayer
+                ref={playerRef}
+                mode={mode}
+                src={playerSrc}
+                transcript={transcript}
+              />
+            ) : (
+              <div className="transcript-empty">
+                Media playback was not available for this recording.
+              </div>
+            )}
+          </section>
+
+          <details className="details-section">
+            <summary>Detailed Breakdown</summary>
+            <div className="mt-5 space-y-6">
+              {signalBarScores && (
+                <div>
+                  <h3 className="mb-3">Signal Breakdown</h3>
+                  <SignalBars
+                    scores={signalBarScores}
+                    faceUnavailable={!!data.no_face_detected}
+                    omitFaceSignals={mode === 'audio'}
+                  />
+                </div>
+              )}
+
+              {signalAverages && (
+                <ScoreBreakdownPanel
+                  avgScore={score}
+                  signalAverages={signalAverages}
+                  signalReasons={signalReasons}
+                  signalBaselineAdjusted={data.signal_baseline_adjusted}
+                  userBaseline={data.user_baseline}
+                  baselineNote={data.baseline_note}
+                  hiddenSignals={mode === 'audio' ? ['eye_contact', 'expression'] : []}
+                />
+              )}
+
+              {detailStats.length > 0 && (
+                <div>
+                  <h3 className="mb-3">Technical Details</h3>
+                  <div className="detail-stat-grid">
+                    {detailStats.map((item) => (
+                      <div key={item.label} className="detail-stat">
+                        <p className="text-xs uppercase tracking-wider text-text-muted">{item.label}</p>
+                        <p className={`mt-2 text-xl font-display font-bold ${item.valueClass || 'text-text-primary'}`}>
+                          {item.value}
+                        </p>
+                        {item.note && (
+                          <p className="mt-2 text-xs text-text-secondary">{item.note}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {mode === 'video' && Array.isArray(data.face_timeline) && data.face_timeline.length > 0 && (
+                <div>
+                  <h3 className="mb-3">Frame Review</h3>
+                  <div className="space-y-3">
+                    {data.face_timeline.slice(0, 10).map((entry, index) => (
+                      <button
+                        key={`${entry.timestamp}-${index}`}
+                        type="button"
+                        onClick={() => setModalEntry(entry)}
+                        className="detail-stat w-full text-left flex gap-3 items-start hover:border-border-accent transition-colors"
+                      >
+                        {entry.thumb ? (
+                          <img
+                            src={entry.thumb}
+                            alt={`Frame at ${entry.time_display || formatDuration(entry.timestamp)}`}
+                            className="w-24 h-14 rounded-md border border-border object-cover flex-shrink-0"
+                          />
+                        ) : (
+                          <div className="w-24 h-14 rounded-md border border-border bg-elevated flex-shrink-0" />
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="badge badge-muted">
+                              {entry.time_display || formatDuration(entry.timestamp)}
+                            </span>
+                            <span className={getScoreBadgeClass(entry.face_confidence)}>
+                              Face {safeRound(entry.face_confidence)}
+                            </span>
+                            {entry.eye_contact_pct != null && (
+                              <span className="text-xs text-text-muted">
+                                Eye contact {safeRound(entry.eye_contact_pct)}%
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-2 text-sm text-text-secondary">
+                            {entry.expression || 'No expression label was available for this frame.'}
+                          </p>
+                        </div>
+                      </button>
+                    ))}
+                    {data.face_timeline.length > 10 && (
+                      <p className="text-xs text-text-muted">
+                        Showing the first 10 snapshots in this summary view.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           </details>
-          <div className="space-y-2">
-            {data.face_timeline.map((entry, i) => (
-              <button
-                key={i}
-                type="button"
-                onClick={() => setModalEntry(entry)}
-                className={`w-full glass-card p-3 text-left flex items-center gap-3 hover:border-border-accent transition-all border-l-4`}
-                style={{
-                  borderLeftColor:
-                    entry.face_confidence >= 71 ? '#10b981'
-                    : entry.face_confidence >= 41 ? '#f59e0b'
-                    : '#ef4444',
-                }}
-                title={`Open ${entry.time_display} window`}
-              >
-                {entry.thumb ? (
-                  <img
-                    src={entry.thumb}
-                    alt={`Frame at ${entry.time_display}`}
-                    className="w-24 h-14 object-cover rounded border border-border flex-shrink-0"
-                  />
-                ) : (
-                  <div className="w-24 h-14 rounded bg-elevated flex-shrink-0" />
-                )}
-                <span className="font-mono text-sm text-text-primary">{entry.time_display}</span>
-                <span className="text-text-secondary text-sm">{entry.expression}</span>
-                <span className={`text-sm font-semibold ${scoreColor(entry.face_confidence)}`}>
-                  Face: {entry.face_confidence}/100
-                </span>
-                <span className="text-text-muted text-sm">Eye: {entry.eye_contact_pct}%</span>
-                <span className="ml-auto text-accent text-sm font-semibold">▶ Open</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
 
-      <CommentsThread
-        mediaId={mediaId}
-        isMediaOwner={isOwner}
-        playerRef={playerRef}
-      />
-
-      {/* Result footer */}
-      <div className="flex items-center justify-between pt-6 border-t border-border mt-8 flex-wrap gap-3">
-        {isOwner ? (
-          <button
-            type="button"
-            onClick={onDiscard}
-            disabled={discardBusy}
-            className="text-danger text-sm hover:underline transition-colors disabled:opacity-50"
-          >
-            {discardBusy ? 'Discarding…' : 'Discard'}
-          </button>
-        ) : <span />}
-        <div className="flex items-center gap-3 flex-wrap">
-          <Link to="/library" className="btn btn-secondary btn-sm">← Library</Link>
           {isOwner && (
-            <button
-              type="button"
-              onClick={onOpenShare}
-              className="btn btn-secondary btn-sm"
-            >
-              ↗ Share
-            </button>
+            <MetadataEditor
+              mediaId={mediaId}
+              initial={{ title: data.title, topic: data.topic, tags: data.tags }}
+              onUpdated={onUpdated}
+            />
           )}
-        </div>
-      </div>
 
-      {shareModalOpen && (
-        <ShareModal mediaId={mediaId} onClose={onCloseShare} />
-      )}
+          {playerSrc && (
+            <CommentsThread
+              mediaId={mediaId}
+              isMediaOwner={isOwner}
+              playerRef={playerRef}
+            />
+          )}
 
-      {modalEntry && processedVideoUrl && (
-        <TimelineModal
-          videoUrl={processedVideoUrl}
-          startTime={modalEntry.timestamp}
-          duration={2}
-          words={allWords}
-          expression={modalEntry.expression}
-          score={modalEntry.face_confidence}
-          onClose={() => setModalEntry(null)}
-        />
+          <ResultFooterActions
+            mode={mode}
+            uploadPath={uploadPath}
+            practicePath={practicePath}
+            isOwner={isOwner}
+            onOpenShare={onOpenShare}
+          />
+
+          {isOwner && (
+            <DangerZone
+              discardBusy={discardBusy}
+              onDiscard={onDiscard}
+            />
+          )}
+
+          {shareModalOpen && (
+            <ShareModal mediaId={mediaId} onClose={onCloseShare} />
+          )}
+
+          {modalEntry && processedVideoUrl && (
+            <TimelineModal
+              videoUrl={processedVideoUrl}
+              startTime={modalEntry.timestamp}
+              duration={2}
+              words={allWords}
+              expression={modalEntry.expression}
+              score={modalEntry.face_confidence}
+              onClose={() => setModalEntry(null)}
+            />
+          )}
+        </>
       )}
     </div>
   )
+}
+
+const UploadedMediaPlayer = forwardRef(function UploadedMediaPlayer(
+  { mode, src, transcript },
+  ref,
+) {
+  const mediaRef = useRef(null)
+  const transcriptContainerRef = useRef(null)
+  const activeWordRef = useRef(null)
+  const [currentWordIdx, setCurrentWordIdx] = useState(-1)
+
+  const words = transcript.words || []
+  const segments = transcript.segments || []
+
+  useImperativeHandle(ref, () => ({
+    getCurrentTime() {
+      return mediaRef.current?.currentTime || 0
+    },
+    seekAndPlay(startS, endS) {
+      const media = mediaRef.current
+      if (!media) return
+      media.currentTime = Math.max(0, Number(startS) || 0)
+      media.play().catch(() => {})
+      if (endS != null && Number(endS) > Number(startS)) {
+        if (media._cdRangePauseHandler) {
+          media.removeEventListener('timeupdate', media._cdRangePauseHandler)
+        }
+        const handler = () => {
+          if (media.currentTime >= Number(endS)) {
+            media.pause()
+            media.removeEventListener('timeupdate', handler)
+            media._cdRangePauseHandler = null
+          }
+        }
+        media._cdRangePauseHandler = handler
+        media.addEventListener('timeupdate', handler)
+      }
+    },
+  }), [])
+
+  useEffect(() => {
+    const media = mediaRef.current
+    if (!media || words.length === 0) return
+
+    const onTimeUpdate = () => {
+      const currentMs = media.currentTime * 1000
+      let idx = -1
+      for (let i = 0; i < words.length; i += 1) {
+        const word = words[i]
+        const startMs = word.start_ms ?? 0
+        const nextWord = words[i + 1]
+        const endMs = word.end_ms ?? (nextWord?.start_ms ?? (startMs + 500))
+        if (startMs <= currentMs && currentMs < endMs) {
+          idx = i
+          break
+        }
+        if (startMs > currentMs) break
+      }
+      setCurrentWordIdx(idx)
+    }
+
+    media.addEventListener('timeupdate', onTimeUpdate)
+    return () => media.removeEventListener('timeupdate', onTimeUpdate)
+  }, [words])
+
+  useEffect(() => {
+    if (activeWordRef.current && transcriptContainerRef.current) {
+      const container = transcriptContainerRef.current
+      const activeWord = activeWordRef.current
+      const containerRect = container.getBoundingClientRect()
+      const wordRect = activeWord.getBoundingClientRect()
+      if (wordRect.top < containerRect.top || wordRect.bottom > containerRect.bottom) {
+        activeWord.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      }
+    }
+  }, [currentWordIdx])
+
+  function jumpToWord(word) {
+    const media = mediaRef.current
+    if (!media || word.start_ms == null) return
+    media.currentTime = word.start_ms / 1000
+    media.play().catch(() => {})
+  }
+
+  return (
+    <div className="space-y-4">
+      {mode === 'video' ? (
+        <video
+          ref={mediaRef}
+          src={src}
+          controls
+          playsInline
+          preload="metadata"
+          className="w-full rounded-md bg-black"
+        />
+      ) : (
+        <audio
+          ref={mediaRef}
+          src={src}
+          controls
+          preload="metadata"
+          className="w-full"
+        />
+      )}
+
+      <div>
+        <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
+          <h3>Transcript</h3>
+          {words.length > 0 && (
+            <p className="text-xs text-text-muted">Click a word to jump to that moment.</p>
+          )}
+        </div>
+
+        {words.length > 0 ? (
+          <div
+            ref={transcriptContainerRef}
+            className="bg-page/60 border border-border rounded-md p-4 max-h-56 overflow-y-auto text-sm leading-relaxed text-text-secondary"
+          >
+            {words.map((word, index) => {
+              const isActive = index === currentWordIdx
+              const className = [
+                'cursor-pointer rounded px-1 py-0.5 transition-colors',
+                isActive ? 'bg-accent text-white' : 'hover:bg-elevated hover:text-text-primary',
+                word.is_filler ? 'text-warning italic' : '',
+                isActive && word.is_filler ? 'bg-warning text-white' : '',
+              ].join(' ')
+              return (
+                <span
+                  key={`${word.word}-${index}`}
+                  ref={isActive ? activeWordRef : null}
+                  className={className}
+                  onClick={() => jumpToWord(word)}
+                >
+                  {word.word}{' '}
+                </span>
+              )
+            })}
+          </div>
+        ) : segments.length > 0 ? (
+          <div className="space-y-3">
+            {segments.map((segment, index) => (
+              <div key={`${segment.timestamp}-${index}`} className="detail-stat">
+                <p className="text-xs text-text-muted uppercase tracking-wider">
+                  {formatDuration(segment.timestamp)}
+                </p>
+                <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+                  {segment.text}
+                </p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="transcript-empty">
+            Transcript was not available for this recording.
+          </div>
+        )}
+      </div>
+    </div>
+  )
+})
+
+function UploadProcessingState({ id, statusInfo }) {
+  const mode = getKindMode(statusInfo?.kind, id)
+  const uploadPath = mode === 'audio' ? '/analyzer' : '/upload'
+  const activeStep = statusInfo?.status === 'processing' ? 2 : 1
+
+  return (
+    <div>
+      <ResultBreadcrumbs />
+      <div className="result-state-card">
+        <span className="badge badge-accent">
+          {mode === 'audio' ? 'Audio Upload' : 'Video Upload'}
+        </span>
+        <h2 className="mt-4 mb-2">Analyzing your recording...</h2>
+        <p className="text-text-secondary">
+          We are extracting speech, measuring confidence signals, and preparing feedback.
+        </p>
+
+        <div className="result-process-steps">
+          {[
+            'Extracting speech',
+            'Measuring confidence signals',
+            'Preparing feedback',
+          ].map((label, index) => {
+            const stepNumber = index + 1
+            const stateClass = stepNumber < activeStep
+              ? 'is-complete'
+              : stepNumber === activeStep
+                ? 'is-active'
+                : ''
+            return (
+              <div key={label} className={`result-process-step ${stateClass}`.trim()}>
+                <span className="badge badge-muted">{stepNumber}</span>
+                <span className="text-sm text-text-primary">{label}</span>
+              </div>
+            )
+          })}
+        </div>
+
+        <div className="mt-6 flex justify-center gap-3 flex-wrap">
+          <Link to="/library" className="btn btn-secondary">Back to Library</Link>
+          <Link to={uploadPath} className="btn btn-ghost">Upload Another</Link>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function UploadFailureState({ id, kind, reason }) {
+  const mode = getKindMode(kind, id)
+  const uploadPath = mode === 'audio' ? '/analyzer' : '/upload'
+
+  return (
+    <div>
+      <ResultBreadcrumbs />
+      <div className="result-state-card">
+        <span className="badge badge-danger">Failed Analysis</span>
+        <h2 className="mt-4 mb-2">We could not finish this recording</h2>
+        <p className="text-text-secondary max-w-2xl mx-auto">
+          {reason || 'The upload did not produce a usable analysis result.'}
+        </p>
+
+        <div className="mt-6 flex justify-center gap-3 flex-wrap">
+          <Link to={uploadPath} className="btn btn-primary">Retry Upload</Link>
+          <Link to={uploadPath} className="btn btn-secondary">
+            {mode === 'audio' ? 'Back to Audio Upload' : 'Back to Upload'}
+          </Link>
+          <Link to="/library" className="btn btn-ghost">Back to Library</Link>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function UnscoreableUploadState({ data, mode, title, uploadPath, practicePath }) {
+  const fixes = [
+    'Make sure your voice is clear and easy to hear.',
+    'Record at least 20-30 seconds of real speech.',
+  ]
+  if (mode === 'video') {
+    fixes.push('Keep your face visible and centered in the frame.')
+  }
+
+  return (
+    <div className="result-state-card mb-6">
+      <span className="badge badge-warning">
+        {mode === 'audio' ? 'Audio Upload' : 'Video Upload'}
+      </span>
+      <h2 className="mt-4 mb-2">{title}</h2>
+      <p className="text-text-secondary max-w-2xl mx-auto">
+        {data.status_message || 'We did not have enough usable signal to produce a reliable score for this recording.'}
+      </p>
+
+      <div className="result-summary-grid mt-6">
+        <div className="coaching-card text-left">
+          <p className="text-xs uppercase tracking-wider text-text-muted">What happened</p>
+          <p className="mt-3 text-sm leading-relaxed text-text-secondary">
+            The analysis could not produce a reliable score, so the coaching summary is withheld instead of showing a misleading number.
+          </p>
+        </div>
+        <div className="coaching-card text-left">
+          <p className="text-xs uppercase tracking-wider text-text-muted">Try another recording</p>
+          <p className="mt-3 text-sm leading-relaxed text-text-secondary">
+            A slightly longer answer with clearer audio usually gives the scorer enough signal to work with.
+          </p>
+        </div>
+        <div className="coaching-card text-left">
+          <p className="text-xs uppercase tracking-wider text-text-muted">Fix before the next try</p>
+          <ul className="mt-3 space-y-2 text-sm text-text-secondary">
+            {fixes.map((fix) => (
+              <li key={fix}>{fix}</li>
+            ))}
+          </ul>
+        </div>
+      </div>
+
+      <div className="mt-6 flex justify-center gap-3 flex-wrap">
+        <Link to={uploadPath} className="btn btn-primary">Try Another Recording</Link>
+        <Link to={practicePath} className="btn btn-secondary">Practice Live</Link>
+        <Link to="/library" className="btn btn-ghost">Back to Library</Link>
+      </div>
+    </div>
+  )
+}
+
+function CoachingCard({ title, metric, body }) {
+  return (
+    <div className="coaching-card">
+      <p className="text-xs uppercase tracking-wider text-text-muted">{title}</p>
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-lg font-display font-bold text-text-primary">
+            {metric.label}
+          </p>
+          <p className="text-sm text-text-muted">{getScoreLabel(metric.score)}</p>
+        </div>
+        <span className={getScoreBadgeClass(metric.score)}>
+          {safeRound(metric.score)}
+        </span>
+      </div>
+      <p className="mt-4 text-sm leading-relaxed text-text-secondary">
+        {body}
+      </p>
+    </div>
+  )
+}
+
+function ResultFooterActions({ mode, uploadPath, practicePath, isOwner, onOpenShare }) {
+  return (
+    <div className="result-footer-actions">
+      <div>
+        <h3>What Next</h3>
+        <p className="mt-1 text-sm text-text-secondary">
+          The fastest way to improve is to run another take with one clear focus.
+        </p>
+      </div>
+      <div className="flex flex-wrap gap-3">
+        <Link to={uploadPath} className="btn btn-primary">Upload Another</Link>
+        <Link to={practicePath} className="btn btn-secondary">
+          {mode === 'audio' ? 'Practice Live Mic' : 'Practice Live'}
+        </Link>
+        <Link to="/library" className="btn btn-secondary">Back to Library</Link>
+        {isOwner && (
+          <button type="button" onClick={onOpenShare} className="btn btn-ghost">
+            Share
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function DangerZone({ discardBusy, onDiscard }) {
+  return (
+    <div className="danger-zone">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h3>Danger Zone</h3>
+          <p className="mt-1 text-sm text-text-secondary">
+            Remove this recording if you do not want it kept in your library.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onDiscard}
+          disabled={discardBusy}
+          className="btn btn-danger"
+        >
+          {discardBusy ? 'Discarding...' : 'Delete / Discard'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function ResultBreadcrumbs() {
+  return (
+    <p className="text-sm text-text-muted mb-6">
+      <Link to="/" className="hover:text-text-accent transition-colors">Home</Link>
+      {' / '}
+      <Link to="/library" className="hover:text-text-accent transition-colors">Library</Link>
+      {' / '}
+      <span className="text-text-secondary">Result</span>
+    </p>
+  )
+}
+
+function getUploadMode(data) {
+  if (data.kind === 'analyzer_audio' || data.recording?.audio_url) return 'audio'
+  return 'video'
+}
+
+function getKindMode(kind, fallbackId = '') {
+  if (kind === 'analyzer_audio' || String(fallbackId).startsWith('analyzer_')) return 'audio'
+  return 'video'
+}
+
+function getHeadlineScore(data, mode) {
+  return mode === 'audio' ? data.avg_score : data.overall_confidence
+}
+
+function getUploadTitle(data, mode) {
+  return (
+    data.title ||
+    data.topic ||
+    data.filename ||
+    (mode === 'audio' ? 'Audio analysis' : 'Video analysis')
+  )
+}
+
+function getUploadSubtitle(data) {
+  if (data.topic && data.title && data.topic !== data.title) return data.topic
+  return null
+}
+
+function getSignalBarScores(data, mode) {
+  if (mode === 'audio') {
+    const averages = data.signal_averages || {}
+    return {
+      voiceSteadiness: averages.voice_steadiness,
+      eyeContact: averages.eye_contact,
+      speechPace: averages.speech_pace,
+      fillerWords: averages.filler_words,
+      vocalVariety: averages.vocal_variety,
+      expression: averages.expression,
+    }
+  }
+  return data.sub_scores || null
+}
+
+function getSignalAverages(data, mode) {
+  if (mode === 'audio') return data.signal_averages || null
+  if (!data.sub_scores) return null
+  return {
+    voice_steadiness: data.sub_scores.voiceSteadiness,
+    eye_contact: data.sub_scores.eyeContact,
+    speech_pace: data.sub_scores.speechPace,
+    filler_words: data.sub_scores.fillerWords,
+    vocal_variety: data.sub_scores.vocalVariety,
+    expression: data.sub_scores.expression,
+  }
+}
+
+function getSignalReasons(data, mode) {
+  if (mode === 'audio') return data.signal_reasons || {}
+  return data.signal_reasons || {}
+}
+
+function getTranscriptContent(data, mode) {
+  if (mode === 'audio') {
+    if (Array.isArray(data.speech_timeline) && data.speech_timeline.length > 0) {
+      const words = data.speech_timeline.flatMap((segment) => segment.words || [])
+      if (words.length > 0) {
+        return { words, segments: [] }
+      }
+    }
+    return {
+      words: Array.isArray(data.transcript) ? data.transcript : [],
+      segments: [],
+    }
+  }
+
+  const speechTimeline = Array.isArray(data.speech_timeline) ? data.speech_timeline : []
+  const words = speechTimeline.flatMap((segment) => segment.words || [])
+  const segments = speechTimeline
+    .filter((segment) => segment.text)
+    .map((segment) => ({
+      timestamp: Number(segment.timestamp) || 0,
+      text: segment.text,
+    }))
+
+  return { words, segments }
+}
+
+function getCoachingMetrics(data, mode) {
+  const metrics = []
+  const signalBars = getSignalBarScores(data, mode) || {}
+
+  if (mode === 'video' && isNumber(data.face_confidence)) {
+    metrics.push({ key: 'face', label: 'Camera confidence', score: Number(data.face_confidence) })
+  }
+
+  if (isNumber(signalBars.voiceSteadiness)) {
+    metrics.push({ key: 'voice', label: 'Vocal confidence', score: Number(signalBars.voiceSteadiness) })
+  }
+
+  if (isNumber(signalBars.speechPace)) {
+    metrics.push({ key: 'pace', label: 'Pacing', score: Number(signalBars.speechPace) })
+  }
+
+  if (isNumber(signalBars.fillerWords)) {
+    metrics.push({ key: 'fillers', label: 'Filler control', score: Number(signalBars.fillerWords) })
+  }
+
+  return metrics
+}
+
+function buildActionItems(data, mode, weakestMetric) {
+  const items = []
+  const seeded = [
+    ...(Array.isArray(data.improvements) ? data.improvements : []),
+    ...(Array.isArray(data.action_items) ? data.action_items : []),
+  ]
+  const nextSession = data.coaching?.next_session
+  if (typeof nextSession === 'string' && nextSession.trim()) {
+    seeded.push(nextSession.trim())
+  }
+
+  seeded.forEach((item) => {
+    const cleaned = String(item || '').trim()
+    if (cleaned && !items.includes(cleaned)) {
+      items.push(cleaned)
+    }
+  })
+
+  const paceWpm = data.pace?.avg_wpm ?? data.speech_summary?.average_wpm
+  const totalFillers = data.total_fillers ?? data.speech_summary?.total_fillers ?? 0
+  const vocalVariety = data.signal_averages?.vocal_variety ?? data.sub_scores?.vocalVariety
+
+  if (items.length < 3 && weakestMetric?.key === 'pace') {
+    if (isNumber(paceWpm) && paceWpm > 160) {
+      pushUnique(items, 'Slow down slightly during longer answers.')
+    } else if (isNumber(paceWpm) && paceWpm < 130) {
+      pushUnique(items, 'Add a little more pace so the answer keeps moving.')
+    } else {
+      pushUnique(items, 'Keep your pace steady from the start of the answer to the end.')
+    }
+  }
+
+  if (items.length < 3 && (weakestMetric?.key === 'fillers' || totalFillers > 0)) {
+    pushUnique(items, 'Pause before the next sentence instead of filling the gap with filler words.')
+  }
+
+  if (items.length < 3 && mode === 'video' && (data.no_face_detected || (isNumber(data.face_confidence) && data.face_confidence < 60))) {
+    pushUnique(items, 'Keep your face centered and well lit so the camera can read your expression.')
+  }
+
+  if (items.length < 3 && weakestMetric?.key === 'voice') {
+    pushUnique(items, 'Start key answers with a calmer breath and a firmer first sentence.')
+  }
+
+  if (items.length < 3 && isNumber(vocalVariety) && vocalVariety < 50) {
+    pushUnique(items, 'Add more pitch changes to highlight the most important words.')
+  }
+
+  while (items.length < 2) {
+    pushUnique(items, 'Record one more take while focusing on a single improvement only.')
+  }
+
+  return items.slice(0, 3)
+}
+
+function buildNextFocusCard(data, mode, weakestMetric, firstAction) {
+  if (firstAction) {
+    return {
+      metric: weakestMetric || { label: mode === 'audio' ? 'Next take' : 'Next take', score: getHeadlineScore(data, mode) || 0 },
+      body: firstAction,
+    }
+  }
+
+  if (weakestMetric) {
+    return {
+      metric: weakestMetric,
+      body: getMetricNarrative(weakestMetric, data, mode, 'next'),
+    }
+  }
+
+  return null
+}
+
+function buildDetailStats(data, mode) {
+  const stats = []
+  const duration = getDurationSeconds(data, mode)
+  if (isNumber(duration)) {
+    stats.push({ label: 'Duration', value: formatDuration(duration) })
+  }
+
+  if (mode === 'audio') {
+    if (isNumber(data.pace?.avg_wpm)) {
+      stats.push({ label: 'Average pace', value: `${safeRound(data.pace.avg_wpm)} WPM` })
+    }
+    if (isNumber(data.total_fillers)) {
+      stats.push({
+        label: 'Fillers',
+        value: safeRound(data.total_fillers),
+        valueClass: data.total_fillers > 6 ? 'text-warning' : 'text-text-primary',
+      })
+    }
+    if (Array.isArray(data.transcript)) {
+      stats.push({ label: 'Transcript words', value: data.transcript.length })
+    }
+    if (data.signal_reasons?.voice_steadiness) {
+      stats.push({
+        label: 'Voice signal',
+        value: 'Ready',
+        note: data.signal_reasons.voice_steadiness,
+      })
+    }
+    return stats
+  }
+
+  const speechSummary = data.speech_summary || {}
+  if (isNumber(speechSummary.total_words)) {
+    stats.push({ label: 'Total words', value: speechSummary.total_words })
+  }
+  if (isNumber(speechSummary.average_wpm)) {
+    stats.push({ label: 'Average pace', value: `${safeRound(speechSummary.average_wpm)} WPM` })
+  }
+  if (isNumber(speechSummary.total_fillers)) {
+    stats.push({
+      label: 'Fillers',
+      value: safeRound(speechSummary.total_fillers),
+      valueClass: speechSummary.total_fillers > 6 ? 'text-warning' : 'text-text-primary',
+    })
+  }
+  if (isNumber(data.face_confidence)) {
+    stats.push({ label: 'Face confidence', value: safeRound(data.face_confidence) })
+  }
+  return stats
+}
+
+function buildUploadNotices(data, mode) {
+  const notices = []
+
+  if (mode === 'video' && data.no_face_detected) {
+    notices.push({
+      text: 'Face-based coaching was unavailable for this upload, so the summary focuses on speech and pacing.',
+      className: 'border-[rgba(245,158,11,0.3)] bg-[rgba(245,158,11,0.08)] text-warning',
+    })
+  }
+  if (data.multi_face_warning) {
+    notices.push({
+      text: data.multi_face_warning,
+      className: 'border-[rgba(245,158,11,0.3)] bg-[rgba(245,158,11,0.08)] text-warning',
+    })
+  }
+  if (data.audio_extraction_error) {
+    notices.push({
+      text: `Audio extraction issue: ${data.audio_extraction_error}`,
+      className: 'border-[rgba(239,68,68,0.3)] bg-[rgba(239,68,68,0.08)] text-danger',
+    })
+  }
+  if (data.video_encode_error) {
+    notices.push({
+      text: `Video processing issue: ${data.video_encode_error}`,
+      className: 'border-[rgba(239,68,68,0.3)] bg-[rgba(239,68,68,0.08)] text-danger',
+    })
+  }
+
+  return notices
+}
+
+function buildHeroSummary(score, strongestMetric, weakestMetric) {
+  if (!strongestMetric || !weakestMetric || !isNumber(score)) {
+    return 'Your upload has been analyzed. Start with the coaching summary, then replay the recording lower on the page.'
+  }
+
+  if (score >= 80) {
+    return `${strongestMetric.label} stood out here. Keep that strength, and tighten ${weakestMetric.label.toLowerCase()} on the next take.`
+  }
+  if (score >= 60) {
+    return `This is a solid foundation. ${strongestMetric.label} is helping you, while ${weakestMetric.label.toLowerCase()} is the clearest next lift.`
+  }
+  return `The foundation is there, but this take still feels tentative. Focus on ${weakestMetric.label.toLowerCase()} first, then record again.`
+}
+
+function getMetricNarrative(metric, data, mode, tone) {
+  const paceWpm = data.pace?.avg_wpm ?? data.speech_summary?.average_wpm
+  const totalFillers = data.total_fillers ?? data.speech_summary?.total_fillers ?? 0
+
+  switch (metric.key) {
+    case 'face':
+      if (tone === 'strong') return 'Your face stayed readable and engaged across most of the clip.'
+      if (tone === 'next') return 'Keep your face centered and well lit so the camera can keep reading your reactions.'
+      return 'Your on-camera presence dropped in parts of the answer. Keep your face centered and visible.'
+    case 'voice':
+      if (tone === 'strong') return 'Your voice sounded steady and controlled, which helps the whole answer feel more confident.'
+      if (tone === 'next') return 'Reset your breathing before longer answers so your voice stays steady all the way through.'
+      return 'Your voice lost some steadiness. A calmer first breath will make the delivery sound more settled.'
+    case 'pace':
+      if (tone === 'strong') {
+        return isNumber(paceWpm)
+          ? `Your pacing stayed close to target at about ${safeRound(paceWpm)} words per minute.`
+          : 'Your pacing stayed close to the target range.'
+      }
+      if (tone === 'next') {
+        return isNumber(paceWpm) && paceWpm > 160
+          ? 'Slow down slightly during longer answers so the message has more space to land.'
+          : 'Keep your pace steadier from the start of the answer to the end.'
+      }
+      return isNumber(paceWpm) && paceWpm > 160
+        ? `You ran fast at roughly ${safeRound(paceWpm)} words per minute. Slow down slightly to sound more deliberate.`
+        : 'Your pace drifted away from the target range. Keep the answer moving, but do not rush the transitions.'
+    case 'fillers':
+      if (tone === 'strong') {
+        return totalFillers > 0
+          ? `You kept fillers relatively contained, which helps the answer sound cleaner.`
+          : 'You kept filler words out of the way, so the answer sounded clean and direct.'
+      }
+      if (tone === 'next') return 'Pause before the next sentence instead of filling the gap with a sound or filler phrase.'
+      return totalFillers > 0
+        ? `Fillers interrupted the flow of the answer. Replace them with a short pause before the next sentence.`
+        : 'This is the easiest area to tighten on the next take. Aim for cleaner transitions between ideas.'
+    default:
+      return 'Use this as the next focus for your next recording.'
+  }
+}
+
+function getScoreLabel(score) {
+  if (!isNumber(score)) return 'Score unavailable'
+  if (score >= 85) return 'Highly confident'
+  if (score >= 70) return 'Confident'
+  if (score >= 55) return 'Developing'
+  return 'Needs another pass'
+}
+
+function getGrade(score) {
+  if (!isNumber(score)) return '-'
+  if (score >= 85) return 'A'
+  if (score >= 70) return 'B'
+  if (score >= 55) return 'C'
+  if (score >= 40) return 'D'
+  return 'F'
+}
+
+function getScoreBadgeClass(score) {
+  if (!isNumber(score)) return 'badge badge-muted'
+  if (score >= 75) return 'badge badge-success'
+  if (score >= 50) return 'badge badge-warning'
+  return 'badge badge-danger'
+}
+
+function getDurationSeconds(data, mode) {
+  if (mode === 'audio') return data.duration_s_current ?? data.duration_s
+  return data.duration_s_current ?? data.duration
+}
+
+function formatDuration(seconds) {
+  if (!isNumber(seconds)) return '-'
+  const totalSeconds = Math.max(0, Math.floor(seconds))
+  const minutes = Math.floor(totalSeconds / 60)
+  const secs = totalSeconds % 60
+  return `${minutes}:${String(secs).padStart(2, '0')}`
+}
+
+function isNumber(value) {
+  return typeof value === 'number' && !Number.isNaN(value)
+}
+
+function safeRound(value) {
+  return isNumber(value) ? Math.round(value) : '-'
+}
+
+function pushUnique(items, value) {
+  if (value && !items.includes(value)) {
+    items.push(value)
+  }
 }

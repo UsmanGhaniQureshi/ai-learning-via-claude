@@ -15,9 +15,17 @@ import os
 import pytest
 
 from llm_coach import (
-    _transcript_matches_topic,
+    _evaluate_topic_match,
     generate_practice_coaching,
 )
+
+
+# Adapter so the original boolean-style assertions still read cleanly.
+# `_evaluate_topic_match` now returns (matches, reason); we only care
+# about the boolean here — the reason is exercised separately below.
+def _transcript_matches_topic(transcript, *, topic_title, topic_body):
+    matched, _reason = _evaluate_topic_match(transcript, topic_title, topic_body)
+    return matched
 from report_generator import generate_post_session_report
 
 

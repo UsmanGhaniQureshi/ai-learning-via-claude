@@ -1,0 +1,3 @@
+/* Component classes moved into src/index.css inside the
+   `@layer components` block where the @tailwind directives live. This
+   file is kept as an empty placeholder because App.jsx imports it. */

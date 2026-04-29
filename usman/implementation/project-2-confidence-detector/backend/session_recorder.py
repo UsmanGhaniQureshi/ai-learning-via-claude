@@ -149,6 +149,10 @@ def list_recordings(
 
         entries = []
         for m in rows:
+            rj = m.report_json or {}
+            unscoreable = bool(
+                rj.get("insufficient_speech") or rj.get("unsupported_language")
+            )
             entry = {
                 "session_id": m.id,
                 "kind": m.source_kind,
@@ -162,6 +166,12 @@ def list_recordings(
                 "has_video": bool(m.has_video),
                 "has_audio": bool(m.has_audio),
                 "has_report": m.report_json is not None,
+                "processing_status": m.processing_status,
+                "processing_error": m.processing_error,
+                "status_message": rj.get("status_message"),
+                "insufficient_speech": bool(rj.get("insufficient_speech")),
+                "unsupported_language": bool(rj.get("unsupported_language")),
+                "unscoreable": unscoreable,
                 "report_url": f"/api/report/{m.id}",
                 "original_name": m.original_name,
                 # User-supplied metadata for Library display.

@@ -15,10 +15,16 @@ function fillClass(v) {
   return 'bg-gradient-to-r from-danger to-orange-500'
 }
 
-export default function SignalBars({ scores = {}, faceUnavailable = false }) {
+export default function SignalBars({
+  scores = {},
+  faceUnavailable = false,
+  omitFaceSignals = false,
+}) {
   return (
     <div className="space-y-4">
-      {SIGNALS.map(({ key, signalDef, label, weight, face }) => {
+      {SIGNALS
+        .filter(({ face }) => !(omitFaceSignals && face))
+        .map(({ key, signalDef, label, weight, face }) => {
         const raw = scores[key]
         const noData = raw === null || raw === undefined
         const faceMissing = face && faceUnavailable
@@ -48,12 +54,12 @@ export default function SignalBars({ scores = {}, faceUnavailable = false }) {
             </div>
             {hide && (
               <p className="text-xs text-text-muted">
-                {faceMissing ? 'No face detected — unavailable' : 'Not measured'}
+                {faceMissing ? 'No face detected - unavailable' : 'Not measured'}
               </p>
             )}
           </div>
         )
-      })}
+        })}
     </div>
   )
 }

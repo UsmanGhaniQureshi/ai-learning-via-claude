@@ -1,4 +1,5 @@
 import { Routes, Route, Link, NavLink, useLocation } from 'react-router-dom'
+import './App.css'
 import Home from './pages/Home'
 import Upload from './pages/Upload'
 import Result from './pages/Result'

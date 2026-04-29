@@ -2,22 +2,21 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
-import { fmtSecs } from '../utils/timeStr'
-import TrimSegmentsEditor, { validateSegments } from '../components/TrimSegmentsEditor'
-import TopicSelector from '../components/TopicSelector'
+import RecordingReview from '../components/RecordingReview'
 
+/**
+ * Upload — drop / pick a video file → unified RecordingReview step
+ * (preview + trim + optional title + analyze) → /api/upload → poll →
+ * /result/:id. Same review component every other recording mode uses,
+ * so the trim and title UX is identical across the four entry points.
+ */
 export default function Upload() {
   const [pickedFile, setPickedFile] = useState(null)
   const [previewUrl, setPreviewUrl] = useState(null)
-  const [previewDuration, setPreviewDuration] = useState(0)
-  const [useFull, setUseFull] = useState(true)
-  const [segments, setSegments] = useState([{ start: '', end: '' }])
   const [uploading, setUploading] = useState(false)
   const [statusText, setStatusText] = useState(null)
   const [uploadError, setUploadError] = useState(null)
-  // Topic info from <TopicSelector>; null = no topic, no LLM coaching.
-  const [topicMeta, setTopicMeta] = useState(null)
-  const videoRef = useRef(null)
+  const [pickError, setPickError] = useState(null)
   const fileInputRef = useRef(null)
   const navigate = useNavigate()
 
@@ -29,13 +28,11 @@ export default function Upload() {
 
   function pickFile(file) {
     if (!file) return
+    setPickError(null)
     setUploadError(null)
     if (previewUrl) URL.revokeObjectURL(previewUrl)
     setPickedFile(file)
     setPreviewUrl(URL.createObjectURL(file))
-    setPreviewDuration(0)
-    setUseFull(true)
-    setSegments([{ start: '', end: '' }])
   }
 
   function handleFilePick(e) {
@@ -47,7 +44,7 @@ export default function Upload() {
     const file = e.dataTransfer?.files?.[0]
     if (!file) return
     if (!file.type.startsWith('video/')) {
-      setUploadError('Please drop a video file (MP4, MOV, WebM).')
+      setPickError('Please drop a video file (MP4, MOV, WebM).')
       return
     }
     pickFile(file)
@@ -57,37 +54,26 @@ export default function Upload() {
     if (previewUrl) URL.revokeObjectURL(previewUrl)
     setPickedFile(null)
     setPreviewUrl(null)
-    setPreviewDuration(0)
-    setUseFull(true)
-    setSegments([{ start: '', end: '' }])
     setUploadError(null)
+    setPickError(null)
   }
 
-  async function handleSubmit() {
+  async function handleAnalyze({ title, body, trimSegments }) {
     if (!pickedFile) return
     setUploadError(null)
-
-    let segmentsPayload = null
-    if (!useFull) {
-      const v = validateSegments(segments, previewDuration)
-      if (!v.ok) {
-        setUploadError(v.error)
-        return
-      }
-      segmentsPayload = v.segments
-    }
-
     setUploading(true)
     setStatusText('Uploading file…')
+
     const formData = new FormData()
     formData.append('file', pickedFile)
-    if (segmentsPayload) {
-      formData.append('trim_segments', JSON.stringify(segmentsPayload))
+    if (trimSegments) {
+      formData.append('trim_segments', JSON.stringify(trimSegments))
     }
-    if (topicMeta?.promptTitle) {
-      formData.append('prompt_title', topicMeta.promptTitle)
-      formData.append('prompt_body', topicMeta.promptBody || '')
+    if (title) {
+      formData.append('prompt_title', title)
+      formData.append('prompt_body', body || '')
     }
+
     try {
       const res = await apiFetch(`${API_BASE}/api/upload`, {
         method: 'POST',
@@ -137,9 +123,9 @@ export default function Upload() {
         <p className="text-text-secondary text-sm">Upload a video — get face + speech + confidence analysis</p>
       </div>
 
-      {uploadError && (
+      {pickError && (
         <div className="bg-[rgba(239,68,68,0.1)] border border-[rgba(239,68,68,0.3)] text-danger text-sm rounded-md px-4 py-2 mb-4">
-          {uploadError}
+          {pickError}
         </div>
       )}
 
@@ -165,48 +151,15 @@ export default function Upload() {
       )}
 
       {pickedFile && !uploading && (
-        <div className="space-y-4">
-          <video
-            ref={videoRef}
-            src={previewUrl}
-            controls
-            playsInline
-            preload="metadata"
-            onLoadedMetadata={(e) => setPreviewDuration(e.currentTarget.duration || 0)}
-            className="w-full max-h-[360px] rounded-md bg-black"
-          />
-
-          <p className="text-sm text-text-secondary">
-            <strong className="text-text-primary">{pickedFile.name}</strong>
-            {previewDuration > 0 && <> · {fmtSecs(previewDuration)}</>}
-          </p>
-
-          <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
-            <input
-              type="checkbox"
-              checked={useFull}
-              onChange={(e) => setUseFull(e.target.checked)}
-              className="accent-accent"
-            />
-            Use full clip (default — analyze the whole video)
-          </label>
-
-          {!useFull && (
-            <TrimSegmentsEditor
-              segments={segments}
-              onChange={setSegments}
-              previewDuration={previewDuration}
-              getCurrentTime={() => videoRef.current?.currentTime ?? 0}
-            />
-          )}
-
-          <TopicSelector value={topicMeta} onChange={setTopicMeta} />
-
-          <div className="flex gap-3">
-            <button onClick={handleSubmit} className="btn btn-primary">Analyze</button>
-            <button onClick={reset} className="btn btn-secondary">Pick a different file</button>
-          </div>
-        </div>
+        <RecordingReview
+          mediaSrc={previewUrl}
+          mediaKind="video"
+          mediaBytes={pickedFile.size}
+          submitting={false}
+          error={uploadError}
+          onAnalyze={handleAnalyze}
+          onDiscard={reset}
+        />
       )}
 
       {uploading && (

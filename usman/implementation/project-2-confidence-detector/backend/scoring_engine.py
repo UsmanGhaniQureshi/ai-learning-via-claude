@@ -192,7 +192,14 @@ class ScoringEngine:
 
 
 def generate_tips(scores):
-    """Generate 1-3 contextual feedback tips based on lowest-scoring signals."""
+    """Generate 1-3 contextual feedback tips based on lowest-scoring signals.
+
+    `None` means "no data was available for this signal" (e.g., audio-only
+    clip → eyeContact is None; silent clip → voiceSteadiness is None).
+    We skip those rather than tipping on missing data — `None < 50` raises
+    TypeError in Python, which is what surfaced as the upload-pipeline
+    error before this guard was added.
+    """
     tips = []
 
     tip_map = [
@@ -205,13 +212,17 @@ def generate_tips(scores):
     ]
 
     for key, threshold, tip in tip_map:
-        if scores.get(key, 50) < threshold:
+        score = scores.get(key)
+        if score is None:
+            continue
+        if score < threshold:
             tips.append(tip)
         if len(tips) >= 3:
             break
 
-    # If all scores are good, give encouragement
-    if not tips and scores.get('total', 50) >= 70:
+    # If all measured scores are good, give encouragement.
+    total = scores.get('total')
+    if not tips and total is not None and total >= 70:
         tips.append("Great job! You're presenting with confidence")
 
     return tips
