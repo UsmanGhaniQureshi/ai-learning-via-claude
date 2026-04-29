@@ -673,11 +673,10 @@ export default function useLiveSession() {
         const raw = fs?._rawFaceRef?.current
         const payload = {
           type: 'face',
-          scores: {
-            eye_contact: fs.eye_contact,
-            expression: fs.expression,
-            tension: fs.tension,
-            face_detected: fs.face_detected,
+          body: {
+            posture: fs?.posture ?? 'unknown',
+            fidget_score: fs?.fidget_score ?? 0,
+            hand_position: fs?.hand_position ?? 'unknown',
           },
         }
         if (raw && raw.landmarks && raw.blendshapes) {

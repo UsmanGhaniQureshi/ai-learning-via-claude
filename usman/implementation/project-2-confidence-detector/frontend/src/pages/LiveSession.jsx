@@ -151,11 +151,11 @@ export default function LiveSession() {
   const barScores = scores
     ? {
         voiceSteadiness: scores.voice_steadiness ?? 50,
-        eyeContact: scores.eye_contact ?? faceScores.eye_contact,
+        eyeContact: scores.eye_contact ?? 50,
         speechPace: scores.speech_pace ?? 50,
         fillerWords: scores.filler_words ?? 50,
         vocalVariety: scores.vocal_variety ?? 50,
-        expression: scores.expression ?? faceScores.expression,
+        expression: scores.expression ?? 50,
       }
     : null
 
@@ -341,6 +341,9 @@ export default function LiveSession() {
             </summary>
             <div className="px-5 pb-5 space-y-5 border-t border-border pt-4">
               {barScores && <SignalBars scores={barScores} />}
+              <p className="text-xs italic opacity-75 border border-border rounded-md px-3 py-2 bg-elevated/50">
+                Baseline comparison unlocks after 3 sessions. Your post-session report will show how this run compares once you have enough history.
+              </p>
               {tips && tips.length > 1 && <FeedbackTips tips={tips.slice(1)} />}
               {transcript && (
                 <div>

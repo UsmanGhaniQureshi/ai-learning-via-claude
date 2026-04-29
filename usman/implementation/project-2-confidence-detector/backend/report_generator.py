@@ -196,6 +196,8 @@ def generate_post_session_report(
         "filler_words": avg("filler_words"),
         "vocal_variety": avg("vocal_variety"),
         "expression": avg("expression"),
+        "blink_rate": None,
+        "tension_score": None,
     }
 
     signal_stderrs = {

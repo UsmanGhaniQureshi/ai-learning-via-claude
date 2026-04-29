@@ -44,6 +44,35 @@ class _BlendshapeShim:
         self.score = float(d.get('score', 0.0) or 0.0)
 
 
+_shared_face_lm = None
+_shared_pose_lm = None
+_shared_models_lock = __import__('threading').Lock()
+_face_lm_call_lock = __import__('threading').Lock()
+_pose_lm_call_lock = __import__('threading').Lock()
+
+
+def _get_shared_models():
+    global _shared_face_lm, _shared_pose_lm
+    if _shared_face_lm is None:
+        with _shared_models_lock:
+            if _shared_face_lm is None:
+                _shared_face_lm = vision.FaceLandmarker.create_from_options(
+                    vision.FaceLandmarkerOptions(
+                        base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
+                        num_faces=2,
+                        output_face_blendshapes=True,
+                        min_face_detection_confidence=0.4,
+                        min_face_presence_confidence=0.4,
+                        running_mode=vision.RunningMode.IMAGE))
+                _shared_pose_lm = vision.PoseLandmarker.create_from_options(
+                    vision.PoseLandmarkerOptions(
+                        base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
+                        num_poses=1,
+                        min_pose_detection_confidence=0.4,
+                        running_mode=vision.RunningMode.IMAGE))
+    return _shared_face_lm, _shared_pose_lm
+
+
 class FaceEngine:
     """Detects expressions (blendshapes), eye contact, blink rate, posture, fidgeting."""
 
@@ -61,26 +90,7 @@ class FaceEngine:
         live session.
         """
         if load_mp_models:
-            # Face landmarker WITH blendshapes (52 direct facial action scores)
-            # num_faces=2 so we can detect when a second person walks into
-            # frame and surface it as a warning. We still only SCORE the
-            # first face; the second is purely a signal for "you may not be
-            # the one being analysed here".
-            self.face_lm = vision.FaceLandmarker.create_from_options(
-                vision.FaceLandmarkerOptions(
-                    base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-                    num_faces=2,
-                    output_face_blendshapes=True,
-                    min_face_detection_confidence=0.4,
-                    min_face_presence_confidence=0.4,
-                    running_mode=vision.RunningMode.IMAGE))
-            # Pose landmarker for body language
-            self.pose_lm = vision.PoseLandmarker.create_from_options(
-                vision.PoseLandmarkerOptions(
-                    base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
-                    num_poses=1,
-                    min_pose_detection_confidence=0.4,
-                    running_mode=vision.RunningMode.IMAGE))
+            self.face_lm, self.pose_lm = _get_shared_models()
         else:
             self.face_lm = None
             self.pose_lm = None
@@ -518,12 +528,13 @@ class FaceEngine:
 
         # Face detection + blendshapes (wrapped in try/except for robustness)
         try:
-            face_r = self.face_lm.detect(mi)
+            with _face_lm_call_lock:
+                face_r = self.face_lm.detect(mi)
         except Exception:
             return None
-        self.frames_processed += 1
         if not face_r.face_landmarks:
             return None
+        self.frames_processed += 1
         if len(face_r.face_landmarks) > 1:
             self.frames_multi_face += 1
 
@@ -532,7 +543,8 @@ class FaceEngine:
 
         # Pose detection (wrapped in try/except for robustness)
         try:
-            pose_r = self.pose_lm.detect(mi)
+            with _pose_lm_call_lock:
+                pose_r = self.pose_lm.detect(mi)
             pose_landmarks = pose_r.pose_landmarks if pose_r.pose_landmarks else None
         except Exception:
             pose_landmarks = None

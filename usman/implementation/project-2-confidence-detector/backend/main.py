@@ -28,6 +28,7 @@ import wave
 import uuid
 import tempfile
 import numpy as np
+from collections import Counter
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi import Request, Depends, HTTPException, BackgroundTasks
@@ -926,6 +927,30 @@ MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500MB
 # Track ready state — backend isn't "ready" for sessions until models are loaded
 _models_ready = False
 
+_whisper_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_whisper_semaphore() -> asyncio.Semaphore:
+    global _whisper_semaphore
+    if _whisper_semaphore is None:
+        _whisper_semaphore = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_WHISPER", "3")))
+    return _whisper_semaphore
+
+
+_upload_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_upload_semaphore() -> asyncio.Semaphore:
+    global _upload_semaphore
+    if _upload_semaphore is None:
+        _upload_semaphore = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_UPLOADS", "2")))
+    return _upload_semaphore
+
+
+_active_sessions = 0
+_active_sessions_lock = asyncio.Lock()
+MAX_LIVE_SESSIONS = int(os.environ.get("MAX_LIVE_SESSIONS", "6"))
+
 
 @app.on_event("startup")
 async def warmup_models():
@@ -1187,11 +1212,15 @@ async def upload_video(
             "body": (prompt_body or "").strip()[:1000],
         }
 
-    background_tasks.add_task(
-        _run_upload_pipeline_sync,
-        upload_id, filepath, original_name, safe_ext, user.id,
-        segments, prompt_meta,
-    )
+    async def _gated():
+        async with _get_upload_semaphore():
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                _run_upload_pipeline_sync,
+                upload_id, filepath, original_name, safe_ext, user.id,
+                segments, prompt_meta,
+            )
+    background_tasks.add_task(_gated)
     return JSONResponse(
         {"media_id": upload_id, "status": "pending"},
         status_code=202,
@@ -1396,7 +1425,7 @@ def _run_upload_pipeline_sync(
         def _frame_loop_sync():
             face_results_by_time = []
             all_face_scores = []
-            process_every = 2
+            process_every = max(1, round((fps or 30) / 30))
             fc = 0
             last_result = None
 
@@ -1433,7 +1462,7 @@ def _run_upload_pipeline_sync(
                             interpolation=cv2.INTER_AREA,
                         )
                         ok_enc, buf = cv2.imencode(
-                            ".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 72]
+                            ".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 60]
                         )
                         if ok_enc:
                             thumb_data_url = (
@@ -1450,6 +1479,10 @@ def _run_upload_pipeline_sync(
                         'eye_contact_pct': last_result['eye_contact_pct'],
                         'blink_rate': last_result['blink_rate'],
                         'tension_score': last_result.get('tension_score', 0),
+                        'posture': last_result.get('posture', 'unknown'),
+                        'fidget_score': last_result.get('fidget_score', 0),
+                        'hand_position': last_result.get('hand_position', 'unknown'),
+                        'face_turned_away': bool(last_result.get('face_turned_away', False)),
                         'face_confidence': last_result['confidence_score'],
                         'thumb': thumb_data_url,
                     })
@@ -1693,13 +1726,17 @@ def _run_upload_pipeline_sync(
         # Build average face result for scoring
         avg_face_result = None
         if face_results_by_time:
+            posture_counter = Counter(r.get('posture', 'unknown') for r in face_results_by_time)
+            hand_counter = Counter(r.get('hand_position', 'unknown') for r in face_results_by_time)
             avg_face_result = {
                 'eye_contact_pct': int(np.mean([r['eye_contact_pct'] for r in face_results_by_time])),
                 'expression': max(set(r['expression'] for r in face_results_by_time),
                                 key=lambda e: sum(1 for r in face_results_by_time if r['expression'] == e)),
                 'tension_score': int(np.mean([r.get('tension_score', 0) for r in face_results_by_time])),
-                'posture': 'upright',  # Default, best available
-                'fidget_score': 0,
+                'blink_rate': int(np.mean([r.get('blink_rate', 0) for r in face_results_by_time])),
+                'posture': posture_counter.most_common(1)[0][0],
+                'fidget_score': int(np.mean([r.get('fidget_score', 0) for r in face_results_by_time])),
+                'hand_position': hand_counter.most_common(1)[0][0],
             }
 
         # Build speech result for scoring. The new filler_words path
@@ -1887,6 +1924,13 @@ def _run_upload_pipeline_sync(
                     "which may not be you."
                 )
 
+        looked_away_pct = 0
+        if face_results_by_time:
+            looked_away_pct = round(
+                100 * sum(1 for r in face_results_by_time if r.get('face_turned_away'))
+                / len(face_results_by_time)
+            )
+
         # Per-signal "what fed each score" strings, mirroring the
         # session-path output in report_generator.py:signal_reasons so
         # the frontend "How was this computed?" panel can show the
@@ -1963,6 +2007,7 @@ def _run_upload_pipeline_sync(
             'has_audio': has_audio,
             'no_face_detected': len(all_face_scores) == 0,
             'multi_face_warning': multi_face_warning,
+            'looked_away_pct': looked_away_pct,
             'audio_extraction_error': audio_extraction_error,
             'video_encode_error': video_encode_error,
             'processed_video': video_serve,
@@ -1994,6 +2039,19 @@ def _run_upload_pipeline_sync(
             'speech_summary': speech_summary,
             'face_timeline': face_results_by_time,
             'speech_timeline': speech_timeline,
+            'signal_averages': {
+                'voice_steadiness': final_scores.get('voiceSteadiness'),
+                'eye_contact': final_scores.get('eyeContact'),
+                'speech_pace': final_scores.get('speechPace'),
+                'filler_words': final_scores.get('fillerWords'),
+                'vocal_variety': final_scores.get('vocalVariety'),
+                'expression': final_scores.get('expression'),
+                'blink_rate': (avg_face_result or {}).get('blink_rate'),
+                'tension_score': (avg_face_result or {}).get('tension_score'),
+                'posture': (avg_face_result or {}).get('posture'),
+                'fidget_score': (avg_face_result or {}).get('fidget_score'),
+                'hand_position': (avg_face_result or {}).get('hand_position'),
+            },
         }
 
         # Top-level wins/improvements derived from `tips`. The simple
@@ -2326,6 +2384,14 @@ async def session_ws(ws: WebSocket, session_id: str):
         await ws.close()
         return
 
+    global _active_sessions
+    async with _active_sessions_lock:
+        if _active_sessions >= MAX_LIVE_SESSIONS:
+            await ws.send_json({"type": "error", "message": "Server at capacity. Try again in a moment."})
+            await ws.close()
+            return
+        _active_sessions += 1
+
     kind = ws.query_params.get("kind", "session")
     if kind not in ("session", "analyzer_audio"):
         kind = "session"
@@ -2535,12 +2601,21 @@ async def session_ws(ws: WebSocket, session_id: str):
         broadcasts the result to the client (unless suppressed by
         the language gate)."""
         nonlocal _unsupported_language, _unsupported_message_sent
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, pipeline.process_chunk, audio
-        )
+        async with _get_whisper_semaphore():
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, pipeline.process_chunk, audio
+            )
         if latest_browser_face:
             result["scores"]["eye_contact"] = latest_browser_face.get("eye_contact", 50)
             result["scores"]["expression"] = latest_browser_face.get("expression", 50)
+            result["face"] = {
+                "posture": latest_browser_face.get("posture", "unknown"),
+                "fidget_score": latest_browser_face.get("fidget_score", 0),
+                "hand_position": latest_browser_face.get("hand_position", "unknown"),
+                "blink_rate": latest_browser_face.get("blink_rate"),
+                "tension_score": latest_browser_face.get("tension"),
+                "expression_label": latest_browser_face.get("expression_label"),
+            }
             result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
 
         # English-only enforcement (Batch 2). See top of session_ws
@@ -2639,6 +2714,7 @@ async def session_ws(ws: WebSocket, session_id: str):
                             except Exception:
                                 fe_result = None
                             if fe_result:
+                                body_msg = data.get('body') or {}
                                 latest_browser_face = {
                                     'eye_contact': fe_result.get('eye_contact_pct', 50),
                                     'expression': _expression_label_to_score(
@@ -2652,6 +2728,9 @@ async def session_ws(ws: WebSocket, session_id: str):
                                     'expression_label': fe_result.get('expression'),
                                     'blink_rate': fe_result.get('blink_rate'),
                                     'calibrating': fe_result.get('expression') == 'calibrating',
+                                    'posture': body_msg.get('posture', 'unknown'),
+                                    'fidget_score': body_msg.get('fidget_score', 0),
+                                    'hand_position': body_msg.get('hand_position', 'unknown'),
                                 }
                                 # Surface calibration state to the UI
                                 # one time per session so a "Calibrating…"
@@ -2740,6 +2819,8 @@ async def session_ws(ws: WebSocket, session_id: str):
             await ws.close()
         except Exception:
             pass
+        async with _active_sessions_lock:
+            _active_sessions = max(0, _active_sessions - 1)
 
 
 # ============================================================
@@ -3311,8 +3392,21 @@ def get_recording_video(
         m = db.get(Media, session_id)
         if not media_readable_by(user.id, m):
             return JSONResponse({"error": "Not found"}, status_code=404)
-    path = RECORDINGS_DIR / f"{session_id}_video.webm"
-    return _serve_with_range(request, str(path), media_type="video/webm")
+        playback = m.playback_path if m else None
+    if playback and _safe_media_id(playback):
+        path = None
+        for base in (RECORDINGS_DIR, Path(UPLOAD_DIR)):
+            candidate = Path(base) / playback
+            if candidate.exists():
+                path = candidate
+                break
+        if path is None:
+            path = Path(RECORDINGS_DIR) / playback
+    else:
+        path = Path(RECORDINGS_DIR) / f"{session_id}_video.webm"
+    suffix = path.suffix.lower()
+    media_type = "video/mp4" if suffix == ".mp4" else "video/webm"
+    return _serve_with_range(request, str(path), media_type=media_type)
 
 
 @app.get("/api/report/{session_id}")

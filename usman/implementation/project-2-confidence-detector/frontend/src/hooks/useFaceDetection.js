@@ -33,6 +33,7 @@ export default function useFaceDetection(videoRef, active) {
   const poseLmRef = useRef(null)
   const intervalRef = useRef(null)
   const eyeContactHistoryRef = useRef([])
+  const poseHistoryRef = useRef([])
   const mountedRef = useRef(true)
 
   // Raw MediaPipe output from the most recent tick — landmarks +
@@ -171,10 +172,79 @@ export default function useFaceDetection(videoRef, active) {
       return 'low/resting'
     }
 
+    function classifyPosture(poseResult) {
+      if (!poseResult || !poseResult.landmarks || poseResult.landmarks.length === 0) {
+        return 'unknown'
+      }
+      const lm = poseResult.landmarks[0]
+      const lS = lm[11], rS = lm[12], lH = lm[23], rH = lm[24]
+      if (!lS || !rS) return 'unknown'
+      const shoulderAxis = Math.atan2(rS.y - lS.y, rS.x - lS.x)
+      const hipsVisible = (lH?.visibility ?? 1.0) > 0.4 && (rH?.visibility ?? 1.0) > 0.4
+      let shoulderTilt
+      if (hipsVisible) {
+        const hipAxis = Math.atan2(rH.y - lH.y, rH.x - lH.x)
+        let rel = Math.abs(shoulderAxis - hipAxis)
+        if (rel > Math.PI) rel = 2 * Math.PI - rel
+        shoulderTilt = rel
+      } else {
+        shoulderTilt = Math.abs(lS.y - rS.y)
+      }
+      const shoulderWidth = Math.hypot(lS.x - rS.x, lS.y - rS.y)
+      let torsoHeight = 0
+      if (hipsVisible) {
+        const midShoulder = [(lS.x + rS.x) / 2, (lS.y + rS.y) / 2]
+        const midHip = [(lH.x + rH.x) / 2, (lH.y + rH.y) / 2]
+        torsoHeight = Math.hypot(midShoulder[0] - midHip[0], midShoulder[1] - midHip[1])
+      }
+      if (shoulderTilt > 0.30) return 'tilted'
+      if (hipsVisible && shoulderWidth > 0 && torsoHeight / shoulderWidth < 1.1) return 'slouching'
+      if (!hipsVisible && shoulderWidth < 0.1) return 'slouching'
+      return 'upright'
+    }
+
+    function computeFidget(poseResult) {
+      if (!poseResult || !poseResult.landmarks || poseResult.landmarks.length === 0) {
+        return 0
+      }
+      const lm = poseResult.landmarks[0]
+      const lS = lm[11], rS = lm[12]
+      if (!lS || !rS) return 0
+      const current = {
+        l_shoulder: [lS.x, lS.y],
+        r_shoulder: [rS.x, rS.y],
+      }
+      const hist = poseHistoryRef.current
+      hist.push(current)
+      if (hist.length > 30) hist.shift()
+      if (hist.length < 10) return 0
+      const oldLong = hist[hist.length - 10]
+      const oldShort = hist[hist.length - 3]
+      let shortMove = 0
+      let longMove = 0
+      for (const key of ['l_shoulder', 'r_shoulder']) {
+        shortMove += Math.hypot(
+          current[key][0] - oldShort[key][0],
+          current[key][1] - oldShort[key][1],
+        )
+        longMove += Math.hypot(
+          current[key][0] - oldLong[key][0],
+          current[key][1] - oldLong[key][1],
+        )
+      }
+      const jerkiness = shortMove / (longMove + 0.01)
+      if (shortMove > 0.03 && jerkiness > 1.2) {
+        return Math.min(100, Math.round((shortMove - 0.03) * 400))
+      }
+      return 0
+    }
+
     function processResults(faceResult, poseResult) {
       if (!mountedRef.current) return
 
       const handPosition = classifyHandPosition(poseResult)
+      const posture = classifyPosture(poseResult)
+      const fidgetScore = computeFidget(poseResult)
 
       const hasFace = faceResult && faceResult.faceLandmarks && faceResult.faceLandmarks.length > 0
       const hasBlendshapes =
@@ -188,6 +258,8 @@ export default function useFaceDetection(videoRef, active) {
           ...prev,
           face_detected: false,
           hand_position: handPosition,
+          posture,
+          fidget_score: fidgetScore,
         }))
         return
       }
@@ -227,49 +299,12 @@ export default function useFaceDetection(videoRef, active) {
         (hist.reduce((a, b) => a + b, 0) / hist.length) * 100
       )
 
-      // --- Expression (simplified from backend/face_engine.py:_detect_expression) ---
-      const squint =
-        ((bs.eyeSquintLeft || 0) + (bs.eyeSquintRight || 0)) / 2
-      const smile =
-        ((bs.mouthSmileLeft || 0) + (bs.mouthSmileRight || 0)) / 2
-      const browDown =
-        ((bs.browDownLeft || 0) + (bs.browDownRight || 0)) / 2
-      const jawOpen = bs.jawOpen || 0
-      const mouthPucker = bs.mouthPucker || 0
-      const mouthFrown =
-        ((bs.mouthFrownLeft || 0) + (bs.mouthFrownRight || 0)) / 2
-
-      let exprLabel = 'neutral'
-      let exprScore = 60
-      if (smile > 0.3 && squint > 0.1) {
-        exprLabel = 'happy'
-        exprScore = 90
-      } else if (jawOpen > 0.2) {
-        exprLabel = 'speaking'
-        exprScore = 80
-      } else if (browDown > 0.25 && mouthPucker < 0.1) {
-        exprLabel = 'focused'
-        exprScore = 70
-      } else if (mouthFrown > 0.15) {
-        exprLabel = 'sad'
-        exprScore = 30
-      } else if (browDown > 0.4 && mouthPucker > 0.15) {
-        exprLabel = 'angry'
-        exprScore = 20
-      }
-
-      // --- Tension (mirror backend/face_engine.py:_detect_tension) ---
-      const tensionRaw =
-        browDown * 400 + mouthPucker * 200 + mouthFrown * 300
-      const tensionScore = Math.max(0, Math.min(100, Math.round(tensionRaw)))
-
       setFaceScores({
         eye_contact: eyeContactPct,
-        expression: exprScore,
-        tension: tensionScore,
         face_detected: true,
-        expression_label: exprLabel,
         hand_position: handPosition,
+        posture,
+        fidget_score: fidgetScore,
       })
     }
 
@@ -290,6 +325,7 @@ export default function useFaceDetection(videoRef, active) {
         poseLmRef.current = null
       }
       eyeContactHistoryRef.current = []
+      poseHistoryRef.current = []
       rawFaceRef.current = { landmarks: null, blendshapes: null, timestamp: 0 }
     }
   }, [active, videoRef])

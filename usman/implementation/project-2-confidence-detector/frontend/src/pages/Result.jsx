@@ -1296,6 +1296,23 @@ function buildDetailStats(data, mode) {
   if (isNumber(data.face_confidence)) {
     stats.push({ label: 'Face confidence', value: safeRound(data.face_confidence) })
   }
+  const blinkRate = data.signal_averages?.blink_rate
+  if (isNumber(blinkRate)) {
+    stats.push({
+      label: 'Blink rate',
+      value: `${safeRound(blinkRate)} / min`,
+      note: 'Insight (not scored)',
+    })
+  }
+  const tension = data.signal_averages?.tension_score
+  if (isNumber(tension)) {
+    stats.push({
+      label: 'Facial tension',
+      value: `${safeRound(tension)} / 100`,
+      valueClass: tension > 60 ? 'text-warning' : 'text-text-primary',
+      note: 'Insight (not scored)',
+    })
+  }
   return stats
 }
 
@@ -1308,9 +1325,14 @@ function buildUploadNotices(data, mode) {
       className: 'border-[rgba(245,158,11,0.3)] bg-[rgba(245,158,11,0.08)] text-warning',
     })
   }
-  if (data.multi_face_warning) {
+  if (data.multi_face_warning || (mode === 'video' && isNumber(data.looked_away_pct) && data.looked_away_pct >= 10)) {
+    const parts = []
+    if (data.multi_face_warning) parts.push(data.multi_face_warning)
+    if (mode === 'video' && isNumber(data.looked_away_pct) && data.looked_away_pct >= 10) {
+      parts.push(`Face was turned away ${data.looked_away_pct}% of the time.`)
+    }
     notices.push({
-      text: data.multi_face_warning,
+      text: parts.join(' '),
       className: 'border-[rgba(245,158,11,0.3)] bg-[rgba(245,158,11,0.08)] text-warning',
     })
   }

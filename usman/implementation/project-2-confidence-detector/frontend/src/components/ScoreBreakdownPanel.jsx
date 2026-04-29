@@ -201,8 +201,11 @@ export default function ScoreBreakdownPanel({
             </>
           )}
 
-          {baselineNote && !signalBaselineAdjusted && (
-            <p className="text-xs italic opacity-75">{baselineNote}</p>
+          {!signalBaselineAdjusted && (
+            <p className="text-xs italic opacity-75 border border-border rounded-md px-3 py-2 bg-elevated/50">
+              {baselineNote
+                || `Baseline comparison unlocks after 3 sessions (you have ${userBaseline?.n_sessions ?? 0}).`}
+            </p>
           )}
 
           <p className="mt-4">
