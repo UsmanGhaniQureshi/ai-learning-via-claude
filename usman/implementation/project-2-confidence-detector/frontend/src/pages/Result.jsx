@@ -127,6 +127,7 @@ export default function Result() {
           setStatusInfo(null)
         }
       } catch (err) {
+        console.error('[Result] fetchReport failed:', err)
         if (!cancelled) {
           setError({ type: 'load', message: err.message || 'Failed to load result' })
           setLoading(false)
@@ -336,21 +337,28 @@ function UploadedMediaResult({
   const transcript = useMemo(() => getTranscriptContent(data, mode), [data, mode])
   const signalBarScores = useMemo(() => getSignalBarScores(data, mode), [data, mode])
   const signalAverages = useMemo(() => getSignalAverages(data, mode), [data, mode])
-  const signalReasons = getSignalReasons(data, mode)
+  const signalReasons = useMemo(() => getSignalReasons(data, mode), [data, mode])
   const coachingMetrics = useMemo(() => getCoachingMetrics(data, mode), [data, mode])
-  const strongestMetric = coachingMetrics.length
-    ? [...coachingMetrics].sort((a, b) => b.score - a.score)[0]
-    : null
-  const weakestMetric = coachingMetrics.length
-    ? [...coachingMetrics].sort((a, b) => a.score - b.score)[0]
-    : null
+  const strongestMetric = useMemo(() => (
+    coachingMetrics.length
+      ? [...coachingMetrics].sort((a, b) => b.score - a.score)[0]
+      : null
+  ), [coachingMetrics])
+  const weakestMetric = useMemo(() => (
+    coachingMetrics.length
+      ? [...coachingMetrics].sort((a, b) => a.score - b.score)[0]
+      : null
+  ), [coachingMetrics])
   const actionItems = useMemo(
     () => buildActionItems(data, mode, weakestMetric),
     [data, mode, weakestMetric]
   )
-  const nextFocus = buildNextFocusCard(data, mode, weakestMetric, actionItems[0])
-  const detailStats = buildDetailStats(data, mode)
-  const notices = buildUploadNotices(data, mode)
+  const nextFocus = useMemo(
+    () => buildNextFocusCard(data, mode, weakestMetric, actionItems[0]),
+    [data, mode, weakestMetric, actionItems]
+  )
+  const detailStats = useMemo(() => buildDetailStats(data, mode), [data, mode])
+  const notices = useMemo(() => buildUploadNotices(data, mode), [data, mode])
   const title = getUploadTitle(data, mode)
   const subtitle = getUploadSubtitle(data)
   const summaryText = buildHeroSummary(score, strongestMetric, weakestMetric)
@@ -709,8 +717,8 @@ const UploadedMediaPlayer = forwardRef(function UploadedMediaPlayer(
   const activeWordRef = useRef(null)
   const [currentWordIdx, setCurrentWordIdx] = useState(-1)
 
-  const words = transcript.words || []
-  const segments = transcript.segments || []
+  const words = useMemo(() => transcript.words || [], [transcript])
+  const segments = useMemo(() => transcript.segments || [], [transcript])
 
   useImperativeHandle(ref, () => ({
     getCurrentTime() {
@@ -1223,8 +1231,11 @@ function buildActionItems(data, mode, weakestMetric) {
     pushUnique(items, 'Add more pitch changes to highlight the most important words.')
   }
 
-  while (items.length < 2) {
+  if (items.length < 2) {
     pushUnique(items, 'Record one more take while focusing on a single improvement only.')
+  }
+  if (items.length < 2) {
+    pushUnique(items, 'Try a slightly different framing or angle on your next attempt.')
   }
 
   return items.slice(0, 3)

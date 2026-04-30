@@ -3432,6 +3432,13 @@ def get_session_report(
         if media is None or media.report_json is None or not media_readable_by(user.id, media):
             return JSONResponse({"error": "Report not found"}, status_code=404)
         payload = dict(media.report_json)
+        ft = payload.get("face_timeline")
+        if isinstance(ft, list):
+            payload["face_timeline"] = [
+                {k: v for k, v in entry.items() if k != "thumb"}
+                if isinstance(entry, dict) else entry
+                for entry in ft
+            ]
         payload["kind"] = media.source_kind
         payload["media_id"] = media.id
         # User-supplied metadata: surface so the Result page can render
