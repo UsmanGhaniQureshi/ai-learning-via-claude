@@ -459,6 +459,36 @@ def extract_audio_features(audio, sr=16000):
     }
 
 
+def measure_silence_noise_rms(audio, vad_segments, sr=16000):
+    """Measure background-noise RMS during the SILENCE portions of a chunk.
+
+    Approach: build a boolean mask of "this sample is inside a VAD speech
+    segment", invert it, and compute RMS over the unvoiced samples only.
+    During real silence (no fan, no chair creak, no traffic) this comes
+    out near 0. Noisy environments push it up — a typing keyboard runs
+    around 0.01-0.02, an open window with traffic around 0.02-0.05.
+
+    Returns None when there is < 0.4 s of silence in the chunk
+    (essentially "they were talking the entire 3 s, can't measure
+    background noise"). Callers then carry the previous chunk's
+    estimate forward via the caller-side rolling history.
+    """
+    if len(audio) == 0:
+        return None
+    n = len(audio)
+    speech_mask = np.zeros(n, dtype=bool)
+    for start_ms, end_ms in vad_segments or []:
+        i0 = max(0, int(start_ms / 1000 * sr))
+        i1 = min(n, int(end_ms / 1000 * sr))
+        if i1 > i0:
+            speech_mask[i0:i1] = True
+    silent = audio[~speech_mask]
+    # Need at least 0.4 s of silence to get a stable RMS estimate.
+    if len(silent) < int(0.4 * sr):
+        return None
+    return float(np.sqrt(np.mean(silent ** 2)))
+
+
 # ══════════════════════════════════════════════════════════════════════
 # MAIN PIPELINE CLASS
 # ══════════════════════════════════════════════════════════════════════
@@ -489,6 +519,12 @@ class AudioPipeline:
         self._language_probed = False
         self._unsupported_language = None  # None = English (or not yet probed)
 
+        # Last good measurement of silence-window RMS (background
+        # noise estimator). Carried across chunks so a chunk where
+        # the user spoke the full 3 s still has a sensible noise
+        # value. None until the first chunk with measurable silence.
+        self._last_silence_rms = None
+
     def process_chunk(self, audio, sr=16000):
         """
         Process a single 3-second audio chunk.
@@ -507,6 +543,16 @@ class AudioPipeline:
         self.rms_history.append(features['rms'])
         rms_std = float(np.std(list(self.rms_history))) if len(self.rms_history) > 2 else 0
 
+        # 2b. Background-noise RMS during the silence portions of the
+        # chunk. Drives the live-HUD "Noise Level" status. Falls back
+        # to the last good measurement when this chunk had no
+        # measurable silence (user spoke the full 3 s).
+        silence_rms = measure_silence_noise_rms(audio, vad_segments, sr)
+        if silence_rms is not None:
+            self._last_silence_rms = silence_rms
+        else:
+            silence_rms = self._last_silence_rms
+
         # 3. Pitch analysis via PYIN
         try:
             pitch = extract_pitch_features(audio, sr)
@@ -518,21 +564,30 @@ class AudioPipeline:
         self.total_acoustic_fillers.extend(acoustic_fillers)
 
         # 5. Whisper transcription — ONLY if VAD detected meaningful speech.
-        # Strict gate: most webcams have an ambient noise floor that easily
-        # cleared the previous (voiced_s>=0.4, rms>0.005) check, which led
-        # to padded silence being fed into Whisper and hallucinated as
-        # "thank you for watching". The current gate (voiced_s>=1.2s of a
-        # 3s chunk, rms>0.02) keeps Whisper away from background noise
-        # like AC / fans / keyboard / breath while still passing every
-        # variant of real speech we could synthesise in tests. Tightened
-        # from 0.8s/0.012 after the audit caught noise-driven phantom
-        # transcripts ("you", "thank you") on silent live sessions.
+        # Gate has two halves:
+        #   - voiced_s >= 1.2: at least 1.2 s of the 3 s chunk was voiced
+        #     per Silero VAD. Filters out chunks that are mostly silence.
+        #   - rms_energy > 0.012: the chunk has enough audio energy to be
+        #     real speech. Any tighter than this and quietly-recorded
+        #     mics (built-in laptop / desk-phone style) below the 0.02
+        #     threshold lose every chunk to skip-Whisper, which leaves
+        #     huge gaps in the transcript shown on the result screen.
+        #
+        # History: this was 0.012 originally, tightened to 0.02 after a
+        # round of "thank you for watching" Whisper hallucinations on
+        # near-silent webcams. The HALLUCINATION_BLACKLIST below catches
+        # those phrases at the segment level, so we can hold the gate at
+        # 0.012 without re-introducing them. Apr 2026: added
+        # `dynaudnorm` to the upload pipeline ffmpeg so quiet recordings
+        # are level-normalised before they reach this gate; live WS
+        # audio still arrives un-normalised (autoGainControl=false) and
+        # benefits directly from the 0.02 → 0.012 relaxation.
         words = []
         language = "en"
         language_probability = 1.0
         low_confidence = False
         rms_energy = features['rms']
-        has_meaningful_speech = voiced_s >= 1.2 and rms_energy > 0.02
+        has_meaningful_speech = voiced_s >= 1.2 and rms_energy > 0.012
 
         # English-only language gate (Batch 2). Run the multilingual
         # detector ONCE per session on the first chunk that has real
@@ -545,8 +600,26 @@ class AudioPipeline:
         if not self._language_probed and has_meaningful_speech:
             try:
                 detector = get_language_detector()
-                lang, prob, _all = detector.detect_language(audio)
-                if lang and lang != "en" and float(prob or 0.0) > 0.6:
+                # Item 8 fix: `WhisperModel` has no `detect_language()`
+                # method (the previous call silently raised AttributeError
+                # on every probe, leaving the English-only gate disabled
+                # for all sessions). The canonical faster-whisper
+                # language-ID path is `model.transcribe(...)` — `info`
+                # is populated synchronously with `.language` and
+                # `.language_probability`. We deliberately do NOT iterate
+                # the returned segments generator: language detection
+                # finishes before any decoding work, so discarding the
+                # generator avoids paying for a full transcription on
+                # the multilingual tiny model.
+                _segments, info = detector.transcribe(
+                    audio,
+                    beam_size=1,
+                    vad_filter=False,
+                    without_timestamps=True,
+                )
+                lang = getattr(info, "language", None)
+                prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+                if lang and lang != "en" and prob > 0.6:
                     self._unsupported_language = lang
             except Exception as e:
                 # Detector failure shouldn't kill the session — log and
@@ -574,27 +647,68 @@ class AudioPipeline:
         word_count = len([w for w in words if len(w['word']) > 1])
         wpm = (word_count / max(voiced_s, 0.1)) * 60 if voiced_s > 0.5 else 0
 
+        # Fix 11: per-chunk Whisper transcript-confidence aggregate.
+        # Average the per-word probabilities (already capped above the
+        # 0.05 accent-fairness cutoff in transcribe_chunk) so callers
+        # can show "transcript was X% recognised" alongside the score.
+        # This is a TRANSCRIPT quality signal, not a speaker-confidence
+        # signal — the report layer must keep it out of the headline.
+        kept_probs = [
+            float(w.get("probability") or 0.0)
+            for w in words
+            if (w.get("probability") or 0.0) >= 0.05
+        ]
+        chunk_transcript_confidence = (
+            round(sum(kept_probs) / len(kept_probs), 2) if kept_probs else None
+        )
+
+        # 9. Compute scores (imported from signal_scorer)
+        from signal_scorer import SignalScorer, dedup_filler_counts
+        # Bug A: dedup lexical + acoustic filler events by time overlap
+        # before scoring. The two detectors fire on the same audio,
+        # often catching the same filler — counting both was double-
+        # charging users. dedup_filler_counts treats lexical as the
+        # primary count and only retains acoustic events that don't
+        # overlap any lexical filler word.
+        lex_count, acu_count_deduped = dedup_filler_counts(
+            lexical_filler_words=lexical_fillers,
+            acoustic_filler_segments=acoustic_fillers,
+        )
+
         # 8. Compile raw signals for scorer
         raw = {
             "rms": features['rms'],
             "rms_std": rms_std,
             "zcr": features['zcr'],
             "spectral_centroid": features['spectral_centroid'],
+            # Background-noise RMS measured over silence-only samples.
+            # Drives the live-HUD "Noise Level" status. None when no
+            # chunk in the session has yielded a measurable silence
+            # window yet.
+            "silence_rms": (
+                round(silence_rms, 6) if silence_rms is not None else None
+            ),
             "pitch": pitch,
             "vad_segments": vad_segments,
             "voiced_s": round(voiced_s, 2),
             "acoustic_fillers": acoustic_fillers,
+            # Dedup-aware count surfaced for the upload aggregator. The
+            # raw event lists above stay as the unmodified ground truth
+            # so a downstream consumer that wants to render filler
+            # markers on a timeline sees every event. Only the COUNT
+            # used for scoring goes through dedup.
+            "acoustic_filler_count_deduped": acu_count_deduped,
             "lexical_fillers": [w['word'] for w in lexical_fillers],
+            "lexical_filler_count": lex_count,
             "word_count": word_count,
             "wpm": round(wpm, 1),
             "timestamp": round(elapsed, 1),
             "language": language,
             "language_probability": language_probability,
             "language_low_confidence": low_confidence,
+            "transcript_confidence": chunk_transcript_confidence,
         }
 
-        # 9. Compute scores (imported from signal_scorer)
-        from signal_scorer import SignalScorer
         pace_score = SignalScorer.speech_pace(words, vad_segments)
         # speech_pace returns None for silence/near-silence chunks so we
         # can exclude them from the session-wide average rather than let
@@ -618,7 +732,8 @@ class AudioPipeline:
             "voice_steadiness": SignalScorer.voice_steadiness(pitch, rms_std, voiced_s=voiced_s),
             "speech_pace": pace_score,
             "filler_words": SignalScorer.filler_words(
-                len(lexical_fillers), len(acoustic_fillers), voiced_s
+                lex_count, acu_count_deduped, voiced_s,
+                word_count=word_count,
             ),
             "vocal_variety": SignalScorer.vocal_variety(pitch, voiced_s=voiced_s),
             # eye_contact and expression filled by caller (face engine
@@ -660,3 +775,4 @@ class AudioPipeline:
         self.start_time = time.time()
         self._language_probed = False
         self._unsupported_language = None
+        self._last_silence_rms = None

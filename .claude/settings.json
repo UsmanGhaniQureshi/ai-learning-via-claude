@@ -204,7 +204,8 @@
       "Bash(\"./detector_env/Scripts/python.exe\" -m pytest tests/test_pipeline_regression.py -v)",
       "Bash(\"./detector_env/Scripts/python.exe\" -m pytest tests/ -v)",
       "Bash(npm run *)",
-      "Bash(./detector_env/Scripts/python -m pytest tests/ --tb=short)"
+      "Bash(./detector_env/Scripts/python -m pytest tests/ --tb=short)",
+      "mcp__code-review-graph__semantic_search_nodes_tool"
     ],
     "additionalDirectories": [
       "\\dev",

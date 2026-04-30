@@ -320,6 +320,7 @@ function UploadedMediaResult({
   const uploadPath = mode === 'audio' ? '/analyzer' : '/upload'
   const practicePath = mode === 'audio' ? '/analyzer?mode=live' : '/live'
   const score = getHeadlineScore(data, mode)
+  const scoreStderr = getHeadlineStderr(data, mode)
   const isUnscoreable = (
     score == null ||
     data.insufficient_speech ||
@@ -479,6 +480,20 @@ function UploadedMediaResult({
                 </p>
                 <p className="text-sm text-text-secondary">
                   Overall confidence score {Math.round(score)}
+                  {scoreStderr != null && scoreStderr > 0 && (
+                    <span
+                      className="text-text-muted"
+                      title="Standard error of the per-chunk headline across this session. Small ± = the score was steady; large ± = it swung a lot. NOT a model-accuracy claim — this is consistency within this session only."
+                    >
+                      {' '}± {Math.round(scoreStderr)}
+                    </span>
+                  )}
+                </p>
+                <p className="text-xs text-text-muted max-w-xs mx-auto leading-snug">
+                  Score reflects measurable speech &amp; body cues against heuristic thresholds. Best used to compare your own sessions over time.
+                </p>
+                <p className="text-xs text-text-muted max-w-xs mx-auto leading-snug">
+                  Compare your sessions over time — scores are relative to your own baseline, not a universal standard.
                 </p>
               </div>
             </div>
@@ -583,6 +598,7 @@ function UploadedMediaResult({
                   userBaseline={data.user_baseline}
                   baselineNote={data.baseline_note}
                   hiddenSignals={mode === 'audio' ? ['eye_contact', 'expression'] : []}
+                  transcriptConfidence={data.transcript_confidence}
                 />
               )}
 
@@ -1087,6 +1103,21 @@ function getHeadlineScore(data, mode) {
   return mode === 'audio' ? data.avg_score : data.overall_confidence
 }
 
+// Item 3: pull the per-session standard error of the headline so the
+// hero can render `± N`. The audio / live-session path stores it as
+// `signal_stderrs.total`; the video upload path emits it as a flat
+// `overall_confidence_stderr` field. Returns null when neither is
+// present (e.g. a single-chunk session with no variance to compute).
+function getHeadlineStderr(data, mode) {
+  if (mode === 'audio') {
+    const stderrs = data.signal_stderrs || {}
+    return isNumber(stderrs.total) ? stderrs.total : null
+  }
+  return isNumber(data.overall_confidence_stderr)
+    ? data.overall_confidence_stderr
+    : null
+}
+
 function getUploadTitle(data, mode) {
   return (
     data.title ||
@@ -1359,6 +1390,15 @@ function buildUploadNotices(data, mode) {
       className: 'border-[rgba(239,68,68,0.3)] bg-[rgba(239,68,68,0.08)] text-danger',
     })
   }
+  // Bug B: warn when the per-user eye-contact baseline is unreliable
+  // because the user was moving during the calibration window.
+  // "good" / "extended" stay silent; only "poor" gets a banner.
+  if (mode === 'video' && data.calibration_quality === 'poor') {
+    notices.push({
+      text: 'You appeared to be moving during the first few seconds of this recording, so the eye-contact baseline may be off and the eye-contact score may not reflect reality. For best results, hold still for the first 3 seconds before you start speaking.',
+      className: 'border-[rgba(245,158,11,0.3)] bg-[rgba(245,158,11,0.08)] text-warning',
+    })
+  }
 
   return notices
 }
@@ -1419,21 +1459,34 @@ function getMetricNarrative(metric, data, mode, tone) {
   }
 }
 
+// Canonical grade table — must match backend/report_generator.py:GRADE_TABLE.
+// Each tuple is [minInclusiveScore, letter, label]. Walked top-to-bottom.
+const GRADE_TABLE = [
+  [90, 'A+', 'Exceptional'],
+  [80, 'A', 'Confident'],
+  [70, 'B+', 'Strong'],
+  [60, 'B', 'Good'],
+  [50, 'C', 'Developing'],
+  [40, 'D', 'Needs work'],
+  [0, 'F', 'Keep practicing'],
+]
+
+function getGradeEntry(score) {
+  if (!isNumber(score)) return null
+  for (const [threshold, letter, label] of GRADE_TABLE) {
+    if (score >= threshold) return { letter, label }
+  }
+  return null
+}
+
 function getScoreLabel(score) {
-  if (!isNumber(score)) return 'Score unavailable'
-  if (score >= 85) return 'Highly confident'
-  if (score >= 70) return 'Confident'
-  if (score >= 55) return 'Developing'
-  return 'Needs another pass'
+  const entry = getGradeEntry(score)
+  return entry ? entry.label : 'Score unavailable'
 }
 
 function getGrade(score) {
-  if (!isNumber(score)) return '-'
-  if (score >= 85) return 'A'
-  if (score >= 70) return 'B'
-  if (score >= 55) return 'C'
-  if (score >= 40) return 'D'
-  return 'F'
+  const entry = getGradeEntry(score)
+  return entry ? entry.letter : '-'
 }
 
 function getScoreBadgeClass(score) {

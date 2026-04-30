@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { API_BASE, apiFetch } from '../config'
+import CameraSelector from './CameraSelector'
 
 const STORAGE_KEY = 'cd_practice_setup'
 
@@ -32,6 +33,11 @@ export default function PracticeSetup({ onStart, ctaLabel = 'Start practice' }) 
   const [durationMin, setDurationMin] = useState(5)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  // Selected camera deviceId — passed through to useLiveSession via
+  // the setup payload so getUserMedia opens the right device. Empty
+  // string = use default. Persisted across sessions inside
+  // CameraSelector itself (localStorage key cd_camera_device_id).
+  const [cameraDeviceId, setCameraDeviceId] = useState('')
 
   const categories = useMemo(() => {
     const set = new Set()
@@ -94,6 +100,7 @@ export default function PracticeSetup({ onStart, ctaLabel = 'Start practice' }) 
       promptTitle: selected?.title || '',
       promptBody: selected?.body || '',
       durationMin,
+      cameraDeviceId,
     })
   }
 
@@ -175,6 +182,14 @@ export default function PracticeSetup({ onStart, ctaLabel = 'Start practice' }) 
         <div className="flex justify-between text-xs text-text-muted">
           <span>1 min</span><span>10 min</span>
         </div>
+      </div>
+
+      {/* Camera picker */}
+      <div className="glass-card p-5">
+        <CameraSelector
+          deviceId={cameraDeviceId}
+          onChange={setCameraDeviceId}
+        />
       </div>
 
       <button

@@ -53,6 +53,16 @@ export default function useLiveSession() {
   // to 'lost' when the WS closes unexpectedly while the session is
   // still active; stays 'connected' during normal user-triggered stop.
   const [connectionStatus, setConnectionStatus] = useState('connected')
+  // Step 3 (Live HUD): label of the camera actually opened by
+  // getUserMedia (e.g. "FaceTime HD Camera"). Read from the
+  // VideoTrack.label after the stream resolves. Empty string when
+  // the browser declines to share a label.
+  const [activeCameraLabel, setActiveCameraLabel] = useState('')
+  // Per-chunk live_hud block. Mirrors the `live_hud` field the
+  // backend now attaches to every score message — surfaced as a
+  // separate state so the LiveHUD overlay can subscribe just to
+  // it and not re-render on transcript appends.
+  const [liveHud, setLiveHud] = useState(null)
   // null when the input is English (or not yet probed). Set to the
   // detected language code (e.g. "hi", "es") once the backend's
   // multilingual probe (in audio_pipeline.AudioPipeline) decides
@@ -280,6 +290,8 @@ export default function useLiveSession() {
     sessionStartRef.current = null
     recorderRef.current = null
     lastTranscriptAppendRef.current = ''
+    setLiveHud(null)
+    setActiveCameraLabel('')
   }, [videoUrl])
 
   // Keep the ref pointing at the most recent stopSession so the
@@ -362,6 +374,8 @@ export default function useLiveSession() {
     setBackpressure(false)
     setCalibrating(false)
     setNoSpeechDetected(false)
+    setLiveHud(null)
+    setActiveCameraLabel('')
     silentChunkCountRef.current = 0
     if (backpressureTimerRef.current) {
       clearTimeout(backpressureTimerRef.current)
@@ -398,8 +412,19 @@ export default function useLiveSession() {
       // get a worse transcript. The honest scoring is worth more
       // than the convenience for those cases. A user with a headset
       // mic in a quiet room gets the same numbers from live + upload.
+      // Step 3D: respect the camera the user picked in PracticeSetup.
+      // `setupMeta.cameraDeviceId` is empty/undefined for the default
+      // camera; passing exact deviceId binds getUserMedia to that
+      // physical device (laptop cam vs USB cam vs OBS Virtual Cam).
+      const videoConstraints = setupMeta?.cameraDeviceId
+        ? {
+            deviceId: { exact: setupMeta.cameraDeviceId },
+            width: 640,
+            height: 480,
+          }
+        : { width: 640, height: 480 }
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480 },
+        video: videoConstraints,
         audio: {
           sampleRate: 16000,
           channelCount: 1,
@@ -410,6 +435,13 @@ export default function useLiveSession() {
       })
       streamRef.current = stream
       setMediaStream(stream) // Triggers useEffect to attach once <video> mounts
+      // Capture the actual camera label for the HUD top bar.
+      // VideoTrack.label is populated once permission is granted; it
+      // matches what enumerateDevices() returns for the same device.
+      try {
+        const track = stream.getVideoTracks()[0]
+        if (track && track.label) setActiveCameraLabel(track.label)
+      } catch { /* ignore */ }
 
       // 3. Generate session ID + open WebSocket
       const sessionId = `session_${Date.now()}`
@@ -481,6 +513,14 @@ export default function useLiveSession() {
             }
             setSessionState('report')
             return
+          }
+
+          // Step 3 (Live HUD): forward the new server-derived overlay
+          // block. Lives next to scores, not inside it — see
+          // backend/main.py:_build_live_hud for the schema. Frontend
+          // LiveHUD component subscribes to this state directly.
+          if (data.live_hud) {
+            setLiveHud(data.live_hud)
           }
 
           // Score update per chunk
@@ -731,6 +771,8 @@ export default function useLiveSession() {
     sessionStartRef.current = null
     recorderRef.current = null
     lastTranscriptAppendRef.current = ''
+    setLiveHud(null)
+    setActiveCameraLabel('')
   }, [])
 
   // Revoke the local blob URL when it changes or on unmount, to prevent leaks.
@@ -773,6 +815,8 @@ export default function useLiveSession() {
     scoreHistory,
     duration,
     faceScores,
+    activeCameraLabel,
+    liveHud,
     videoBlob,
     videoUrl,
     remoteVideoUrl,

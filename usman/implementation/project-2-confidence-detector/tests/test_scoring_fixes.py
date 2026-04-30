@@ -135,24 +135,47 @@ def test_aggregate_one_audio_signal_present_is_enough():
 
 # ──────────────────── Fix 1 + 2: filler_words parity ────────────────────
 
-def test_filler_words_signal_scorer_canonical_step_table():
-    """Pin the canonical step table — the live WS path uses this directly."""
+def test_filler_words_signal_scorer_smooth_curve_legacy_path():
+    """Pin the smooth-curve contract for the legacy per-voiced-minute path
+    (Fix 3 replaced the step table with `100 * exp(-rate/5)` for callers
+    that don't pass word_count). The new curve has no plateaus, so a
+    drop from 5.0 to 4.9 fillers/min no longer jumps the score."""
     # rate = 0/min → 100
     assert SignalScorer.filler_words(lexical_count=0, acoustic_count=0, voiced_s=60) == 100
-    # 1.5/min (under 2/min tier) → 90
-    assert SignalScorer.filler_words(lexical_count=1, acoustic_count=0, voiced_s=40) == 90
-    # 4/min (under 5/min tier) → 75
-    assert SignalScorer.filler_words(lexical_count=4, acoustic_count=0, voiced_s=60) == 75
-    # 25/min (over 20/min tier) → 10
-    assert SignalScorer.filler_words(lexical_count=25, acoustic_count=0, voiced_s=60) == 10
+    # 1.5/min: round(100 * exp(-1.5/5)) = 74
+    assert SignalScorer.filler_words(lexical_count=1, acoustic_count=0, voiced_s=40) == 74
+    # 4/min: round(100 * exp(-4/5)) = 45
+    assert SignalScorer.filler_words(lexical_count=4, acoustic_count=0, voiced_s=60) == 45
+    # 25/min: round(100 * exp(-25/5)) ≈ 1
+    assert SignalScorer.filler_words(lexical_count=25, acoustic_count=0, voiced_s=60) == 1
+
+
+def test_filler_words_signal_scorer_per_100_words_path():
+    """Pin the Fix 4 per-100-words contract: when callers thread
+    word_count through, the rate becomes (fillers/words)*100 and the
+    curve uses divisor 3. A slow speaker (60 wpm, 6 fillers/min) and a
+    fast speaker (200 wpm, 6 fillers/min) now score very differently."""
+    # rate = 0/100w → 100
+    assert SignalScorer.filler_words(0, 0, voiced_s=60, word_count=100) == 100
+    # rate = 3/100w: round(100 * exp(-3/3)) = 37
+    assert SignalScorer.filler_words(3, 0, voiced_s=60, word_count=100) == 37
+    # 6 fillers in a 60-word minute (slow) vs 200-word minute (fast)
+    slow = SignalScorer.filler_words(6, 0, voiced_s=60, word_count=60)
+    fast = SignalScorer.filler_words(6, 0, voiced_s=60, word_count=200)
+    assert slow < fast, "fast speaker should score higher with same filler count"
+    # word_count=0 → no real words → None (no data)
+    assert SignalScorer.filler_words(0, 0, voiced_s=60, word_count=0) is None
 
 
 def test_scoring_engine_filler_words_delegates_to_signal_scorer():
-    """Live (signal_scorer) and upload (scoring_engine) paths must agree."""
+    """Live (signal_scorer) and upload (scoring_engine) paths must agree.
+
+    3 fillers across 60 voiced seconds = 3/min. Under the Fix 3 smooth
+    curve (legacy per-voiced-minute path, no word_count): score =
+    round(100 * exp(-3/5)) = 55. Both paths MUST produce the same
+    number — this test catches drift between them, not a specific
+    value. The exact 55 is only there to keep regressions loud."""
     engine = ScoringEngine()
-    # 3 fillers across 60 voiced seconds = 3/min — strictly inside the
-    # `< 5/min` tier → SignalScorer canonical score 75. Both paths
-    # MUST agree on the same value or the bug is back.
     sub = engine.compute_sub_scores(
         face_result=None,
         speech_result={
@@ -166,7 +189,7 @@ def test_scoring_engine_filler_words_delegates_to_signal_scorer():
     canonical = SignalScorer.filler_words(
         lexical_count=2, acoustic_count=1, voiced_s=60.0,
     )
-    assert sub["filler_words"] == canonical == 75
+    assert sub["filler_words"] == canonical == 55
 
 
 def test_scoring_engine_filler_words_no_division_by_zero():

@@ -40,10 +40,22 @@ def _resolve_secret() -> tuple[bytes, bool]:
     Returns (secret_bytes, used_fallback). The fallback is fine for
     development but operators should set MEDIA_URL_SECRET explicitly in
     production so rotating one secret doesn't invalidate the other.
+
+    Item 5 (Apr 2026): in production (ENV=production) we refuse to use
+    the JWT_SECRET fallback — a misconfigured deploy would otherwise
+    silently couple media-URL signing to the auth secret, so rotating
+    one would invalidate every existing media link.
     """
     explicit = os.environ.get("MEDIA_URL_SECRET")
     if explicit:
         return explicit.encode("utf-8"), False
+    env = os.environ.get("ENV", os.environ.get("APP_ENV", "")).lower()
+    if env in ("production", "prod"):
+        raise RuntimeError(
+            "MEDIA_URL_SECRET must be set when ENV=production. Refusing "
+            "to fall back to JWT_SECRET — coupling the two secrets means "
+            "rotating one invalidates every existing signed media URL."
+        )
     # Lazy-import to avoid an auth ↔ signed_urls cycle at module load.
     from auth import JWT_SECRET
     return (JWT_SECRET.encode("utf-8") if isinstance(JWT_SECRET, str) else JWT_SECRET), True

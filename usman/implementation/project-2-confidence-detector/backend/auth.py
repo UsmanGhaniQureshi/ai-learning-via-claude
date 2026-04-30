@@ -35,8 +35,25 @@ from models import User
 # JWT_SECRET MUST be set in production. The fallback below is a
 # development convenience so a fresh clone runs without env setup;
 # it deliberately looks unsafe so anyone reading logs notices.
+#
+# Item 5 (Apr 2026): we now FAIL FAST in production. When `ENV=production`
+# (or any common variant) the import below raises if JWT_SECRET wasn't
+# explicitly set, so a misconfigured deploy never quietly signs tokens
+# with the documented dev fallback. Keeping the dev default avoids
+# breaking the local-clone-and-run flow.
 _DEFAULT_SECRET = "dev-only-please-set-JWT_SECRET-in-production"
-JWT_SECRET = os.environ.get("JWT_SECRET", _DEFAULT_SECRET)
+_ENV = os.environ.get("ENV", os.environ.get("APP_ENV", "")).lower()
+_IS_PRODUCTION = _ENV in ("production", "prod")
+
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    if _IS_PRODUCTION:
+        raise RuntimeError(
+            "JWT_SECRET must be set when ENV=production. Refusing to "
+            "start with the dev fallback secret — tokens signed with it "
+            "would be trivially forgeable."
+        )
+    JWT_SECRET = _DEFAULT_SECRET
 JWT_ALGORITHM = "HS256"
 JWT_TTL = timedelta(days=int(os.environ.get("JWT_TTL_DAYS", "30")))
 

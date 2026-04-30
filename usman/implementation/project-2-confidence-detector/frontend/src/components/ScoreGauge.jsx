@@ -2,16 +2,44 @@
  * SVG circular gauge displaying confidence score (0-100).
  * Animated arc with gradient stroke + soft glow.
  */
-export default function ScoreGauge({ score = 0, label = '', size = 200 }) {
+
+// Mirrors backend/report_generator.py:GRADE_TABLE so a gauge rendered
+// without an explicit grade prop can still announce one consistent
+// letter to assistive tech.
+const GAUGE_GRADE_TABLE = [
+  [90, 'A+'],
+  [80, 'A'],
+  [70, 'B+'],
+  [60, 'B'],
+  [50, 'C'],
+  [40, 'D'],
+  [0, 'F'],
+]
+
+function deriveGrade(score) {
+  if (typeof score !== 'number' || Number.isNaN(score)) return null
+  for (const [threshold, letter] of GAUGE_GRADE_TABLE) {
+    if (score >= threshold) return letter
+  }
+  return null
+}
+
+export default function ScoreGauge({ score = 0, label = '', size = 200, grade }) {
   const radius = (size - 20) / 2
   const circumference = 2 * Math.PI * radius
   const safe = Math.max(0, Math.min(100, Number(score) || 0))
   const progress = safe / 100
   const offset = circumference * (1 - progress)
   const gradId = `gaugeGrad-${size}`
+  const announcedGrade = grade || deriveGrade(safe) || '-'
 
   return (
-    <div className="relative inline-block" style={{ width: size, height: size }}>
+    <div
+      className="relative inline-block"
+      style={{ width: size, height: size }}
+      role="img"
+      aria-label={`Confidence score ${Math.round(safe)} out of 100, grade ${announcedGrade}`}
+    >
       <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
         <defs>
           <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="0%">

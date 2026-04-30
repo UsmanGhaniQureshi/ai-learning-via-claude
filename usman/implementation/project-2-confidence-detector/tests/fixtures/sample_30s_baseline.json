@@ -1,8 +1,8 @@
 {
   "voice_steadiness": 81,
-  "speech_pace": 46,
+  "speech_pace": 85,
   "filler_words": 100,
-  "vocal_variety": 91,
-  "_avg_score": 71,
+  "vocal_variety": 61,
+  "_avg_score": 76,
   "_note": "Regression baseline. Re-generate with `make test` after a deliberate algorithmic change; otherwise edits here are bugs."
 }

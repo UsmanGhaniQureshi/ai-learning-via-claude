@@ -128,6 +128,26 @@ class FaceEngine:
         self.baseline = None
         self.calibration_frames = []
         self.CALIBRATION_COUNT = 90  # ~3 seconds at 30fps
+        # Bug B (Apr 2026): if the user is still moving during the 3s
+        # calibration window, the resulting baseline is contaminated and
+        # every later eye-contact measurement is biased — for the entire
+        # session. We now check eye-look std-dev across the calibration
+        # frames; if it exceeds the threshold (motion, not stillness) we
+        # extend the window up to CALIBRATION_MAX_COUNT frames, then
+        # lock in whatever we have and surface a `calibration_quality`
+        # flag so callers can warn the user.
+        try:
+            self.CALIBRATION_MOTION_THRESHOLD = float(
+                os.environ.get("CALIBRATION_MOTION_THRESHOLD", "0.025")
+            )
+        except ValueError:
+            self.CALIBRATION_MOTION_THRESHOLD = 0.025
+        self.CALIBRATION_MAX_COUNT = 150  # 5s cap at 30fps
+        # Possible values: None (still calibrating), "good" (locked in
+        # within the first 90 frames with low motion), "extended"
+        # (locked in after 90 < n <= MAX with low motion), "poor"
+        # (locked in at MAX with high motion still present).
+        self.calibration_quality: str | None = None
 
     def _get_blendshape(self, blendshapes, name):
         """Get a blendshape score by name. Returns 0.0 if not found."""
@@ -168,12 +188,45 @@ class FaceEngine:
         # === CALIBRATION PHASE ===
         if self.baseline is None:
             self.calibration_frames.append(signals)
-            if len(self.calibration_frames) >= self.CALIBRATION_COUNT:
-                # Calculate baseline as average of first N frames
+            n_collected = len(self.calibration_frames)
+            if n_collected >= self.CALIBRATION_COUNT:
+                # Bug B: check whether the user was still or moving
+                # during the calibration window. We look at the eye-look
+                # signals because those are what _detect_eye_contact
+                # subtracts as baseline — contamination here biases the
+                # entire session's eye-contact scoring.
+                look_keys = (
+                    'look_down_rest', 'look_up_rest',
+                    'look_in_rest', 'look_out_rest',
+                )
+                stds = [
+                    float(np.std([f[k] for f in self.calibration_frames]))
+                    for k in look_keys
+                ]
+                max_motion = max(stds) if stds else 0.0
+                if (
+                    max_motion > self.CALIBRATION_MOTION_THRESHOLD
+                    and n_collected < self.CALIBRATION_MAX_COUNT
+                ):
+                    # Still moving — keep collecting frames before
+                    # locking in the baseline.
+                    return 'calibrating', 0, signals
+
+                # Lock in the baseline (whatever we have).
                 self.baseline = {}
                 for key in signals:
                     values = [f[key] for f in self.calibration_frames]
                     self.baseline[key] = np.mean(values)
+                if max_motion <= self.CALIBRATION_MOTION_THRESHOLD:
+                    self.calibration_quality = (
+                        "good" if n_collected <= self.CALIBRATION_COUNT
+                        else "extended"
+                    )
+                else:
+                    # Hit the cap with motion still present — the
+                    # baseline is the best we can do but the user
+                    # should know the eye-contact numbers may be off.
+                    self.calibration_quality = "poor"
                 self.calibration_frames = []
             return 'calibrating', 0, signals
 
@@ -723,6 +776,10 @@ class FaceEngine:
             'hand_position': body['hand_position'],
             'confidence_score': confidence,
             'score_breakdown': ' '.join(parts) + f' = {confidence}',
+            # Bug B: tells callers whether the per-user eye-contact
+            # baseline can be trusted. None during the calibration
+            # window itself; "good" / "extended" / "poor" once locked.
+            'calibration_quality': self.calibration_quality,
         }
 
     def draw_overlay(self, frame, result):

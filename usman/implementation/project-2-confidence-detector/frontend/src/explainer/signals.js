@@ -49,10 +49,10 @@ export const SIGNAL_DEFS = {
     short:
       'Words per minute, computed as transcribed words ÷ voiced seconds × 60.',
     detail:
-      'Sweet spot is 130-150 WPM. Below 100 WPM you sound hesitant; above 180 WPM you sound rushed. The score is symmetric around 140 WPM and falls off smoothly on either side. Silent chunks (where you weren\'t speaking) are excluded from the average — pauses don\'t drag your pace score down.',
-    good: '130-150 WPM = top score. 120-160 WPM = strong. 100-180 WPM = OK. Outside that = the rate isn\'t serving the listener.',
+      'Optimal range is approximately 120–170 WPM. Rates outside this range score lower, though natural variation across accents and languages is expected. The curve peaks at 150 WPM and falls off smoothly on either side. Silent chunks (where you weren\'t speaking) are excluded from the average — pauses don\'t drag your pace score down.',
+    good: '120–170 WPM = top scores. Outside that = the rate isn\'t serving the listener — but accent / language variation is expected.',
     limits:
-      'Cultural and linguistic norms differ — 200 WPM is normal conversational pace for many speakers, even though our chart marks it as "too fast". Use this as a relative benchmark over your own sessions, not an absolute pass/fail.',
+      'Cultural and linguistic norms differ — many speakers operate at 170–200 WPM as their natural conversational pace. Use this as a relative benchmark over your own sessions, not an absolute pass/fail.',
     anchor: 'speech-pace',
     weight_pct: 20,
   },
@@ -137,8 +137,8 @@ export const FAQ = [
     a: '50% is the default we show when no face was detected at all (e.g. uploaded a clip with no person on camera). On a real session this would be a real number; if you see 50% on a session with a face, something went wrong with detection.',
   },
   {
-    q: 'My pace was 183 WPM and you marked it as below average. Why?',
-    a: 'The sweet spot is 130-150 WPM and the curve falls off smoothly above 160. At 183 WPM the score is around 60 (out of 100) — listenable but slightly rushed. If you\'re a fast natural speaker, you can intentionally pause more between sentences to bring this down without changing your delivery style.',
+    q: 'My pace was 200 WPM. How is it scored?',
+    a: 'The sweet spot is 120–170 WPM and the curve falls off smoothly above. At 200 WPM the score is around 86 (out of 100) — perfectly listenable for most audiences, just a touch quick. The curve was widened to be fairer to fast natural speakers; if you want to bring the number down further, intentional pauses between sentences will pull your average toward the centre of the range.',
   },
   {
     q: 'What does the "Shared by X" badge on a recording mean?',

@@ -5,6 +5,7 @@ Library queries the `media` table — sessions, uploads, and analyzer audio
 all land in Postgres, so all three kinds surface here. URL fields are
 computed per source_kind so the frontend can just use them directly.
 """
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,8 +15,16 @@ from db import SessionLocal
 from models import Media, User
 from signed_urls import sign_media_url
 
-RECORDINGS_DIR = Path(__file__).parent / "recordings"
-RECORDINGS_DIR.mkdir(exist_ok=True)
+# RECORDINGS_DIR is env-configurable (Item 4): in production we point
+# this at a mounted persistent disk so live-session video / analyzer
+# audio survive container restarts. Default keeps dev behaviour
+# (a `recordings/` directory next to this file).
+_RECORDINGS_DIR_ENV = os.environ.get("RECORDINGS_DIR")
+if _RECORDINGS_DIR_ENV:
+    RECORDINGS_DIR = Path(_RECORDINGS_DIR_ENV)
+else:
+    RECORDINGS_DIR = Path(__file__).parent / "recordings"
+RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # Sort options the frontend may pass. Anything else falls back to the

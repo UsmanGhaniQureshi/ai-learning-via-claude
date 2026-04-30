@@ -65,6 +65,7 @@ export default function SessionReport({
     insufficient_speech, unsupported_language, status_message,
     coaching, coaching_status, coaching_skip_reason,
     wins: reportWins, improvements: reportImprovements,
+    transcript_confidence,
   } = report
 
   // Title-vs-transcript mismatch banner. The llm_coach module flags
@@ -263,6 +264,7 @@ export default function SessionReport({
         signalBaselineAdjusted={signal_baseline_adjusted}
         userBaseline={user_baseline}
         baselineNote={baseline_note}
+        transcriptConfidence={transcript_confidence}
       />
 
       {/* Score timeline */}

@@ -1,4 +1,5 @@
 """Scoring Engine — Evidence-based weighted confidence scoring with rolling average."""
+import math
 import time
 from collections import deque
 
@@ -93,6 +94,7 @@ class ScoringEngine:
                 lexical_count=speech_result['lexical_filler_count'],
                 acoustic_count=speech_result['acoustic_filler_count'],
                 voiced_s=speech_result['voiced_s'],
+                word_count=speech_result.get('word_count'),
             )
         else:
             scores['filler_words'] = None
@@ -229,29 +231,18 @@ def generate_tips(scores):
 
 
 def _wpm_to_score(wpm):
-    """Convert words-per-minute to a 0-100 score.
-    Bell curve: 120-160 WPM = 80-100. Drops linearly outside."""
+    """Convert words-per-minute to a 0-100 score with a smooth tent
+    function. Peak at 150 WPM, gentle exponential falloff above —
+    widened from the old 130-150 plateau (Fix 10) so non-US-English
+    speakers (Indian English, Spanish-influenced English etc.) who
+    naturally run 170-190 WPM no longer get capped at 60-75.
+
+    Anchors: wpm=100 → ~82, wpm=150 → 100, wpm=190 → ~88, wpm=240 → ~72.
+    """
     if wpm <= 0:
         return 20
-
-    # Optimal range: 120-160 WPM
-    if 130 <= wpm <= 150:
-        return 100
-    elif 120 <= wpm <= 160:
-        return 90
-    elif 100 <= wpm < 120:
-        # Linear from 60 to 90 as WPM goes 100->120
-        return 60 + int((wpm - 100) * 1.5)
-    elif 160 < wpm <= 180:
-        # Linear from 90 to 60 as WPM goes 160->180
-        return 90 - int((wpm - 160) * 1.5)
-    elif 80 <= wpm < 100:
-        # Linear from 30 to 60
-        return 30 + int((wpm - 80) * 1.5)
-    elif 180 < wpm <= 200:
-        # Linear from 60 to 30
-        return 60 - int((wpm - 180) * 1.5)
-    elif wpm < 80:
-        return max(10, int(wpm * 0.375))
-    else:  # wpm > 200
-        return max(10, 30 - int((wpm - 200) * 0.5))
+    if wpm <= 150:
+        score = 100 * (wpm / 150) ** 0.5
+    else:
+        score = 100 * math.exp(-0.003 * (wpm - 150))
+    return max(0, min(100, round(score)))

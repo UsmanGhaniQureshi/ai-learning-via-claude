@@ -188,6 +188,37 @@ Add ~$0.15/hour for GPU if using Option A.
 
 ---
 
+## Persistent Storage (required on Render / Railway / any restartable host)
+
+User uploads land in `UPLOAD_DIR` (default `uploads/`) and live-session
+recordings land in `RECORDINGS_DIR` (default `backend/recordings/`).
+Both are read from environment variables; on any platform that recycles
+containers (Render, Railway, ECS Fargate, etc.) the defaults will lose
+all media on every restart.
+
+**Render**: `render.yaml` already declares a 1 GB disk mounted at
+`/var/data` and points `UPLOAD_DIR` / `RECORDINGS_DIR` at it. No extra
+work needed — just deploy.
+
+**Railway**: Railway volumes are dashboard-only (not configurable via
+`railway.json`). Steps:
+1. In the Railway service settings, add a **Volume** mounted at
+   `/var/data` (1 GB minimum for beta).
+2. In **Variables**, set:
+   ```
+   UPLOAD_DIR=/var/data/uploads
+   RECORDINGS_DIR=/var/data/recordings
+   ```
+3. Redeploy. The app creates the subdirectories on startup.
+
+**AWS / Docker / self-hosted**: mount any persistent volume at a path
+of your choice and set `UPLOAD_DIR` / `RECORDINGS_DIR` to subpaths
+inside it. The S3-backed flow described elsewhere in this doc is
+preferred for production but the env-var indirection keeps the simple
+"mount a disk" path open for smaller deployments.
+
+---
+
 ## Security Checklist
 
 - [ ] HTTPS enabled (ACM cert on ALB)
@@ -197,3 +228,7 @@ Add ~$0.15/hour for GPU if using Option A.
 - [ ] Audit logs enabled (CloudTrail + VPC flow logs)
 - [ ] No secrets in Docker image (use AWS Secrets Manager)
 - [ ] IAM roles — backend task has only S3 write + logs permissions
+- [ ] `JWT_SECRET` and `MEDIA_URL_SECRET` set (the app fails fast on
+      missing values when `ENV=production` — see `backend/auth.py`)
+- [ ] Persistent volume mounted at the path `UPLOAD_DIR` /
+      `RECORDINGS_DIR` point at (see "Persistent Storage" above)

@@ -333,6 +333,11 @@ def _set_media_status(
         m.processing_status = status
         m.processing_error = error
         db.commit()
+    # Fix 7: drop the in-memory progress entry on terminal states so
+    # the dict doesn't grow unbounded across the lifetime of the
+    # process. Mid-pipeline statuses (pending/processing) keep theirs.
+    if status in ("completed", "failed"):
+        _clear_progress(media_id)
 
 
 def _complete_media_processing(
@@ -425,6 +430,45 @@ def _complete_media_processing(
         if segments:
             db.add_all(segments)
         db.commit()
+        # Fix 8: one structured INFO log line per finalized session so
+        # outliers and user-reported anomalies are debuggable
+        # retroactively. We log identifiers + numeric metadata only —
+        # never raw transcript text (privacy: a presentation transcript
+        # may contain confidential prep material). Read fields off the
+        # already-built report dict so this stays in sync with whatever
+        # report_generator produces.
+        signal_avgs = rj.get("signal_averages") or {}
+        scored_signals = {
+            k: v for k, v in signal_avgs.items()
+            if isinstance(v, (int, float))
+        }
+        weakest_signal = (
+            min(scored_signals, key=scored_signals.get)
+            if scored_signals else None
+        )
+        try:
+            log.info(
+                "session.completed",
+                extra={
+                    "user_id": getattr(m, "user_id", None),
+                    "media_id": media_id,
+                    "source_kind": getattr(m, "source_kind", None),
+                    "status": final_status,
+                    "final_score": final_score,
+                    "grade": final_grade,
+                    "weakest_signal": weakest_signal,
+                    "voiced_s": rj.get("total_voiced_s"),
+                    "duration_s": duration_s,
+                    "n_chunks": len(rj.get("timeline") or []),
+                    "language": (rj.get("unsupported_language") or "en"),
+                },
+            )
+        except Exception:
+            # Never let a logging failure mask a successful completion.
+            pass
+    # Fix 7: completion path — drop the in-memory progress entry so
+    # the dict doesn't accumulate finished jobs.
+    _clear_progress(media_id)
 
 
 # Pre-upload trim — caps and helpers. Kept near the persist helpers so
@@ -918,7 +962,10 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # `face_engine = FaceEngine()` was a correctness bug waiting for the
 # second simultaneous user.
 
-UPLOAD_DIR = "uploads"
+# UPLOAD_DIR is env-configurable (Item 4): in production we point this at
+# a mounted persistent disk so user uploads survive container restarts.
+# Default keeps dev behaviour (a relative `uploads/` next to backend/).
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500MB
@@ -950,6 +997,47 @@ def _get_upload_semaphore() -> asyncio.Semaphore:
 _active_sessions = 0
 _active_sessions_lock = asyncio.Lock()
 MAX_LIVE_SESSIONS = int(os.environ.get("MAX_LIVE_SESSIONS", "6"))
+
+
+# ── Per-media progress tracking (Fix 7) ─────────────────────────────
+# In-memory only. The status endpoint reads from this dict so the UI
+# can show a real % done instead of a categorical pending/processing/
+# completed spinner. Cleared when the row flips to completed/failed
+# so finished jobs don't leak entries forever. Multi-process workers
+# (gunicorn -w >1) lose visibility because each process has its own
+# dict; that's an acceptable trade for not adding a DB column.
+import threading as _progress_threading
+_media_progress: dict[str, dict] = {}
+_media_progress_lock = _progress_threading.Lock()
+
+
+def _set_progress_total(media_id: str, total_frames: int) -> None:
+    """Record the total frame count discovered by ffprobe so the
+    status endpoint can report frames_processed / total_frames."""
+    with _media_progress_lock:
+        entry = _media_progress.setdefault(media_id, {})
+        entry["total_frames"] = int(total_frames)
+        entry.setdefault("frames_processed", 0)
+
+
+def _bump_progress(media_id: str, frames_done: int) -> None:
+    """Update frames_processed for a media_id. Idempotent on missing."""
+    with _media_progress_lock:
+        entry = _media_progress.setdefault(media_id, {})
+        entry["frames_processed"] = int(frames_done)
+
+
+def _clear_progress(media_id: str) -> None:
+    with _media_progress_lock:
+        _media_progress.pop(media_id, None)
+
+
+def _get_progress(media_id: str) -> tuple[int | None, int | None]:
+    with _media_progress_lock:
+        entry = _media_progress.get(media_id)
+        if not entry:
+            return None, None
+        return entry.get("frames_processed"), entry.get("total_frames")
 
 
 @app.on_event("startup")
@@ -1293,6 +1381,10 @@ def _run_upload_pipeline_sync(
             fps = probed_fps or cap.get(cv2.CAP_PROP_FPS) or 30
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps if fps > 0 else 0
+        # Fix 7: register total so the polled status endpoint can show
+        # a real percentage instead of a categorical spinner.
+        if total_frames > 0:
+            _set_progress_total(upload_id, total_frames)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -1344,6 +1436,18 @@ def _run_upload_pipeline_sync(
                  '-err_detect', 'crccheck+bitstream',
                  '-fflags', '+discardcorrupt',
                  '-i', filepath,
+                 # Dynamic audio normalisation. Live capture runs with
+                 # `autoGainControl: false` so a quiet built-in mic
+                 # produces audio at very low RMS — well under the 0.012
+                 # has_meaningful_speech gate downstream — and Whisper
+                 # gets skipped on chunk after chunk, leaving big gaps
+                 # in the transcript shown on the result screen.
+                 # `dynaudnorm` raises quiet sections without flattening
+                 # loud peaks, so real speech clears the gate while
+                 # near-silent ambient noise stays below it. p=0.9
+                 # (peak target) and m=8 (max gain factor) are
+                 # ffmpeg's recommended speech-friendly defaults.
+                 '-af', 'dynaudnorm=p=0.9:m=8',
                  '-ar', '16000', '-ac', '1',
                  '-f', 's16le', '-', '-loglevel', 'error'],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1445,6 +1549,11 @@ def _run_upload_pipeline_sync(
                 frame_with_overlay = face_engine.draw_overlay(frame.copy(), last_result)
                 writer.write(frame_with_overlay)
 
+                # Fix 7: update progress every ~1s of video so the UI
+                # poll sees movement without flooding the lock.
+                if fc % max(1, int(fps)) == 0:
+                    _bump_progress(upload_id, fc)
+
                 # Log face data at intervals
                 if last_result and fc % (int(fps) * 2) == 0:  # every 2 seconds
                     # Capture a tiny base64 JPEG thumbnail from the same frame we
@@ -1485,6 +1594,12 @@ def _run_upload_pipeline_sync(
                         'face_turned_away': bool(last_result.get('face_turned_away', False)),
                         'face_confidence': last_result['confidence_score'],
                         'thumb': thumb_data_url,
+                        # Bug B: surface the engine's calibration_quality
+                        # so we can surface a "your eye-contact baseline
+                        # may be off" warning in the report. Same value
+                        # repeats for every frame after calibration locks;
+                        # report-builder takes any non-None occurrence.
+                        'calibration_quality': last_result.get('calibration_quality'),
                     })
 
             cap.release()
@@ -1505,8 +1620,18 @@ def _run_upload_pipeline_sync(
                     w for s in snapshots for w in s.get("transcript_words", [])
                 ]
                 lex_fillers = [w["word"] for w in all_words if w.get("is_filler")]
+                # Bug A: use the per-chunk deduped acoustic filler count
+                # (computed in AudioPipeline.process_chunk against the
+                # lexical fillers from the SAME chunk). Falls back to
+                # the raw segment count for legacy snapshots that pre-
+                # date the dedup field — those will keep the old double-
+                # counted behaviour but no new uploads do.
                 acoustic_fillers_total = sum(
-                    len(s["raw"].get("acoustic_fillers", [])) for s in snapshots
+                    int(s["raw"].get(
+                        "acoustic_filler_count_deduped",
+                        len(s["raw"].get("acoustic_fillers", [])),
+                    ))
+                    for s in snapshots
                 )
                 full_transcript = " ".join(
                     s.get("transcript_text", "") for s in snapshots
@@ -1728,6 +1853,19 @@ def _run_upload_pipeline_sync(
         if face_results_by_time:
             posture_counter = Counter(r.get('posture', 'unknown') for r in face_results_by_time)
             hand_counter = Counter(r.get('hand_position', 'unknown') for r in face_results_by_time)
+            # Bug B: take the worst calibration_quality reported by any
+            # frame in the session — once the engine locks the baseline
+            # the value repeats, so any non-None entry tells us how the
+            # baseline ended up. "poor" beats "extended" beats "good".
+            _quality_rank = {"poor": 2, "extended": 1, "good": 0}
+            quality_values = [
+                r.get('calibration_quality') for r in face_results_by_time
+                if r.get('calibration_quality')
+            ]
+            calibration_quality = (
+                max(quality_values, key=lambda q: _quality_rank.get(q, -1))
+                if quality_values else None
+            )
             avg_face_result = {
                 'eye_contact_pct': int(np.mean([r['eye_contact_pct'] for r in face_results_by_time])),
                 'expression': max(set(r['expression'] for r in face_results_by_time),
@@ -1737,6 +1875,7 @@ def _run_upload_pipeline_sync(
                 'posture': posture_counter.most_common(1)[0][0],
                 'fidget_score': int(np.mean([r.get('fidget_score', 0) for r in face_results_by_time])),
                 'hand_position': hand_counter.most_common(1)[0][0],
+                'calibration_quality': calibration_quality,
             }
 
         # Build speech result for scoring. The new filler_words path
@@ -1758,11 +1897,19 @@ def _run_upload_pipeline_sync(
         ) if snapshots else 0.0
         avg_speech_result = None
         if speech_summary:
+            # Total transcribed (non-junk) words across the whole upload
+            # — used by SignalScorer.filler_words as the per-100-words
+            # denominator (Fix 4). Falls back to 0 so the scorer's
+            # "no real words" guard returns None rather than dividing.
+            total_word_count = sum(
+                int(s["raw"].get("word_count") or 0) for s in snapshots
+            )
             avg_speech_result = {
                 'wpm': speech_summary['average_wpm'],
                 'lexical_filler_count': len(lex_fillers),
                 'acoustic_filler_count': acoustic_fillers_total,
                 'voiced_s': total_voiced_s,
+                'word_count': total_word_count,
             }
 
         # Build audio result for scoring. pitch_std is what the scoring engine
@@ -1902,6 +2049,26 @@ def _run_upload_pipeline_sync(
         final_scores = upload_scoring.update(sub_scores)
         overall_score = final_scores['total']
 
+        # Item 3 (uncertainty band): per-chunk variance of the headline.
+        # ScoringEngine.update is called once over session-averaged
+        # inputs in this path, so its rolling-window doesn't capture the
+        # session-wide variance we want. Compute it directly from the
+        # per-chunk SignalScorer.aggregate results that AudioPipeline
+        # already attached to each snapshot. None entries (silent
+        # chunks) are skipped — variance over real measurements only.
+        _per_chunk_totals = [
+            s["scores"].get("total") for s in snapshots
+            if s.get("scores", {}).get("total") is not None
+        ]
+        if len(_per_chunk_totals) >= 2:
+            _mean = sum(_per_chunk_totals) / len(_per_chunk_totals)
+            _var = sum((t - _mean) ** 2 for t in _per_chunk_totals) / (len(_per_chunk_totals) - 1)
+            overall_stderr = round(
+                (_var ** 0.5) / (len(_per_chunk_totals) ** 0.5), 1
+            )
+        else:
+            overall_stderr = None
+
         # Legacy compat scores
         speech_score = sub_scores.get('filler_words')
         pace_score = sub_scores.get('speech_pace')
@@ -2008,6 +2175,15 @@ def _run_upload_pipeline_sync(
             'no_face_detected': len(all_face_scores) == 0,
             'multi_face_warning': multi_face_warning,
             'looked_away_pct': looked_away_pct,
+            # Bug B: surface the worst calibration_quality the engine
+            # reported during the session. UI uses this to render a
+            # banner ("you may have been moving during the calibration
+            # window — eye-contact numbers may be off") when value is
+            # "poor". "good" / "extended" / None are silent.
+            'calibration_quality': (
+                avg_face_result.get('calibration_quality')
+                if avg_face_result else None
+            ),
             'audio_extraction_error': audio_extraction_error,
             'video_encode_error': video_encode_error,
             'processed_video': video_serve,
@@ -2023,6 +2199,12 @@ def _run_upload_pipeline_sync(
                 ),
             },
             'overall_confidence': overall_score,
+            # Item 3: standard error of the per-chunk headline across
+            # the session. Rendered as `± N` next to the headline gauge
+            # so users can tell whether the score was steady (small ±)
+            # or swung a lot (large ±). NOT a model-accuracy claim —
+            # this is consistency within this session only.
+            'overall_confidence_stderr': overall_stderr,
             'face_confidence': avg_face_confidence,
             'speech_score': speech_score,
             'pace_score': pace_score,
@@ -2319,6 +2501,12 @@ def get_media_status(
         m = db.get(Media, media_id)
         if m is None or not media_readable_by(user.id, m):
             return JSONResponse({"error": "Not found"}, status_code=404)
+        # Fix 7: surface in-memory progress alongside the categorical
+        # status. The frontend can compute pct = frames_processed /
+        # total_frames once both are non-null. Either field may be
+        # null — for legacy rows, completed/failed terminal states,
+        # or processes restarted mid-pipeline.
+        frames_done, total_frames = _get_progress(m.id)
         return {
             "media_id": m.id,
             "status": m.processing_status,
@@ -2327,6 +2515,8 @@ def get_media_status(
             "kind": m.source_kind,
             "title": m.title,
             "has_report": m.report_json is not None,
+            "frames_processed": frames_done,
+            "total_frames": total_frames,
         }
 
 
@@ -2414,6 +2604,18 @@ async def session_ws(ws: WebSocket, session_id: str):
     _calibration_done_announced = False
     snapshots = []
     latest_browser_face = {}  # Face scores from browser MediaPipe
+    # Step 3 (Live HUD): rolling deque of the last 4 per-chunk total
+    # scores. Drives the headline number in the HUD overlay. Skips
+    # None entries (silent chunks) so the live gauge doesn't dip
+    # toward 0 just because the user paused. Length 4 → 12 s of
+    # smoothing at the 3-s chunk cadence.
+    from collections import deque as _hud_deque
+    hud_total_history = _hud_deque(maxlen=4)
+    # Server time (monotonic) of the last face message we received.
+    # Used so the HUD detection-light can flip to "Poor" when the
+    # browser stops sending face data (user stepped away from the
+    # camera, lid closed, MediaPipe failure). Reset every face msg.
+    last_face_msg_at = 0.0
     # Practice topic + brief, populated by the client's first
     # `session_meta` WS message (see useLiveSession.js). Empty dict
     # means free practice / no topic — coaching short-circuits to
@@ -2596,6 +2798,137 @@ async def session_ws(ws: WebSocket, session_id: str):
     # TCP buffer with no flow-control feedback.
     audio_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
 
+    def _build_live_hud(chunk_result, browser_face, face_msg_age_s):
+        """Build the per-chunk `live_hud` block the frontend overlay
+        consumes. Pure derivation — does NOT mutate any existing field
+        on `chunk_result`. Returns a dict with rolling_total + 4 status
+        entries (Excellent / Good / Fair / Poor / null). Each
+        thresholds map is documented inline; tweak in one place if a
+        signal feels wrong in real-world testing.
+        """
+        # ── Rolling 4-chunk total (Step 3E left-side number) ──
+        chunk_total = chunk_result.get("scores", {}).get("total")
+        if isinstance(chunk_total, (int, float)):
+            hud_total_history.append(int(chunk_total))
+        rolling_total = (
+            int(round(sum(hud_total_history) / len(hud_total_history)))
+            if hud_total_history else None
+        )
+
+        # ── Detection (Step 3A) ──
+        # Order:
+        #   1. No browser face data ever → "poor"
+        #   2. Last face message is stale (> ~1.5 s old) → "poor"
+        #   3. Browser flagged calibrating → "fair" (signal isn't
+        #      reliable yet, but the face IS present)
+        #   4. Use eye_contact_pct as a face-visibility proxy: an
+        #      occluded or partially-turned face drops eye_contact
+        #      well before MediaPipe loses tracking entirely.
+        if not browser_face:
+            detection = "poor"
+        elif face_msg_age_s > 1.5:
+            detection = "poor"
+        elif browser_face.get("calibrating"):
+            detection = "fair"
+        else:
+            eye_pct = browser_face.get("eye_contact", 0) or 0
+            face_turned = browser_face.get("face_turned_away", False)
+            if face_turned:
+                detection = "fair"
+            elif eye_pct >= 70:
+                detection = "excellent"
+            elif eye_pct >= 45:
+                detection = "good"
+            elif eye_pct >= 20:
+                detection = "fair"
+            else:
+                detection = "poor"
+
+        # ── Voice pitch (Step 3B) ──
+        # std_hz is the chunk pitch standard deviation. Anchors
+        # match the smooth `vocal_variety` curve in signal_scorer
+        # (logistic centred at 30): below 5 = monotone, 15-50 =
+        # natural conversational range, 50+ = animated.
+        pitch = chunk_result.get("raw", {}).get("pitch") or {}
+        std_hz = float(pitch.get("std_hz") or 0)
+        voiced_s = float(chunk_result.get("raw", {}).get("voiced_s") or 0)
+        if voiced_s < 0.5:
+            voice_pitch = None  # silent chunk — can't measure pitch
+        elif std_hz < 5:
+            voice_pitch = "poor"
+        elif std_hz < 15:
+            voice_pitch = "fair"
+        elif std_hz < 35:
+            voice_pitch = "good"
+        else:
+            voice_pitch = "excellent"
+
+        # ── Noise level (Step 3C) ──
+        # Background-noise RMS measured during silence-only samples.
+        # Anchors observed empirically: a near-silent room reads
+        # ~0.001 from mic self-noise; a typing keyboard sits in the
+        # 0.01-0.02 range; an open window with traffic 0.02-0.05;
+        # genuinely loud environments 0.05+.
+        silence_rms = chunk_result.get("raw", {}).get("silence_rms")
+        if silence_rms is None:
+            noise_level = None  # not yet measured this session
+        elif silence_rms < 0.005:
+            noise_level = "excellent"
+        elif silence_rms < 0.015:
+            noise_level = "good"
+        elif silence_rms < 0.035:
+            noise_level = "fair"
+        else:
+            noise_level = "poor"
+
+        # ── Speech pace (Step 3E right side card) ──
+        # Reuses speech_pace score (already widened to 120-170 wpm
+        # peak in the smooth tent function). Map score → status.
+        pace_score = chunk_result.get("scores", {}).get("speech_pace")
+        if pace_score is None:
+            speech_pace = None
+        elif pace_score >= 85:
+            speech_pace = "excellent"
+        elif pace_score >= 65:
+            speech_pace = "good"
+        elif pace_score >= 45:
+            speech_pace = "fair"
+        else:
+            speech_pace = "poor"
+
+        # ── Worst signal → coaching nudge (Step 3E bottom + 3G) ──
+        # Only the WORST signal is named. None values are skipped so
+        # the nudge doesn't say "Poor pitch" during a silent chunk.
+        STATUS_RANK = {"poor": 0, "fair": 1, "good": 2, "excellent": 3}
+        signals = {
+            "detection": detection,
+            "voice_pitch": voice_pitch,
+            "noise_level": noise_level,
+            "speech_pace": speech_pace,
+        }
+        scoreable = {k: v for k, v in signals.items() if v is not None}
+        worst_key = (
+            min(scoreable, key=lambda k: STATUS_RANK[scoreable[k]])
+            if scoreable else None
+        )
+        worst_status = scoreable.get(worst_key) if worst_key else None
+
+        return {
+            "rolling_total": rolling_total,
+            "detection": detection,
+            "voice_pitch": voice_pitch,
+            "noise_level": noise_level,
+            "speech_pace": speech_pace,
+            # Frontend uses `worst_signal` to pick the nudge message
+            # and to flash the right card. When all signals are
+            # "good" or "excellent", worst_signal stays set (so
+            # the frontend can also detect that case and rotate
+            # encouragement messages) and worst_status is "good"
+            # or "excellent".
+            "worst_signal": worst_key,
+            "worst_status": worst_status,
+        }
+
     async def _process_one_chunk(audio):
         """Consumer body — runs the audio pipeline on one chunk and
         broadcasts the result to the client (unless suppressed by
@@ -2633,6 +2966,14 @@ async def session_ws(ws: WebSocket, session_id: str):
                 })
             except Exception:
                 pass
+
+        # Step 3 (Live HUD): attach the derived overlay-friendly
+        # status block. Pure derivation; never overwrites existing
+        # fields. We compute even when the chunk would be suppressed
+        # by the language gate so the same payload shape is logged
+        # consistently in `snapshots` for debugging.
+        face_age_s = max(0.0, time.time() - last_face_msg_at) if last_face_msg_at else 999.0
+        result["live_hud"] = _build_live_hud(result, latest_browser_face, face_age_s)
 
         snapshots.append(result)
         # Suppress live score broadcasts once the language gate fires
@@ -2687,6 +3028,11 @@ async def session_ws(ws: WebSocket, session_id: str):
                 try:
                     data = json.loads(message['text'])
                     if data.get('type') == 'face':
+                        # Stamp the wall-clock receive time so the
+                        # live-HUD detection light can flip to "Poor"
+                        # if the stream goes stale (browser stops
+                        # sending: tab backgrounded, MediaPipe error).
+                        last_face_msg_at = time.time()
                         # Two payload shapes accepted:
                         #
                         # 1. New (Batch 4) — browser sent raw MediaPipe
@@ -2955,6 +3301,12 @@ def _run_analyzer_pipeline_sync(
              '-err_detect', 'crccheck+bitstream',
              '-fflags', '+discardcorrupt',
              '-i', str(saved_path),
+             # Same dynamic-range normalisation as the upload pipeline
+             # (see _run_upload_pipeline_sync for the rationale). Audio
+             # uploaded via the Speech Analyzer page may also be quiet
+             # — phone recordings, voice memos, etc. — so the same
+             # treatment applies.
+             '-af', 'dynaudnorm=p=0.9:m=8',
              '-ar', '16000', '-ac', '1',
              '-f', 's16le', '-', '-loglevel', 'error'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,

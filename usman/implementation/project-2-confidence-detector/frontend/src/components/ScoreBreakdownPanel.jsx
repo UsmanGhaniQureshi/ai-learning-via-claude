@@ -9,6 +9,7 @@ export default function ScoreBreakdownPanel({
   userBaseline,
   baselineNote,
   hiddenSignals = [],
+  transcriptConfidence = null,
 }) {
   if (!signalAverages) return null
 
@@ -123,6 +124,19 @@ export default function ScoreBreakdownPanel({
             <p className="text-xs italic opacity-75">
               {skippedCount === 1 ? '1 signal was' : `${skippedCount} signals were`} skipped because no data was available.
               The remaining weights were renormalized so they still sum to 100%.
+            </p>
+          )}
+
+          {/* Fix 11: transcript-quality indicator. Not part of the
+              headline score — surfaced separately so a user with a
+              noisy mic understands why the filler / pace numbers may
+              be soft. */}
+          {transcriptConfidence != null && (
+            <p
+              className="text-xs text-text-muted"
+              title="Average Whisper word-recognition confidence. Lower values mean the transcript (and filler detection) may be less accurate."
+            >
+              Transcript confidence: {transcriptConfidence.toFixed(2)}
             </p>
           )}
 

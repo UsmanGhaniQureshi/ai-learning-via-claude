@@ -2,7 +2,60 @@
 Signal Scorer — Calibrated, evidence-based scoring functions.
 Each method converts raw signals into a 0-100 score.
 """
+import math
 import numpy as np
+
+
+# Bug A (Apr 2026): the lexical detector (Whisper transcript) and the
+# acoustic detector (raw-audio spectral heuristic) often fire on the
+# SAME filler event — Whisper transcribes "um" at 1500-1700 ms and
+# the acoustic detector finds the same hump at 1480-1720 ms. Summing
+# the two counts double-charged the user. We now treat lexical as the
+# primary signal and only count an acoustic detection if it does NOT
+# overlap any lexical filler. The 150 ms tolerance below absorbs
+# normal misalignment between Whisper word timestamps and the spectral
+# detector's centroid windows.
+_FILLER_OVERLAP_TOLERANCE_MS = 150
+
+
+def dedup_filler_counts(
+    lexical_filler_words: list[dict] | None,
+    acoustic_filler_segments: list[dict] | None,
+) -> tuple[int, int]:
+    """Return (lexical_count, deduped_acoustic_count).
+
+    Each input is a list of dicts with ``start_ms`` and ``end_ms``
+    (lexical also has ``word``; acoustic also has ``type``). Both share
+    the same chunk-local time base.
+
+    Two events overlap if their time ranges intersect after expanding
+    each by ``_FILLER_OVERLAP_TOLERANCE_MS / 2`` on each side. We do
+    NOT mutate the inputs — just return the counts.
+    """
+    lex = list(lexical_filler_words or [])
+    acu = list(acoustic_filler_segments or [])
+    if not acu:
+        return len(lex), 0
+    if not lex:
+        return 0, len(acu)
+
+    pad = _FILLER_OVERLAP_TOLERANCE_MS / 2
+
+    def _overlaps_any(seg, others):
+        s_lo = (seg.get("start_ms") or 0) - pad
+        s_hi = (seg.get("end_ms") or 0) + pad
+        for o in others:
+            o_lo = (o.get("start_ms") or 0) - pad
+            o_hi = (o.get("end_ms") or 0) + pad
+            # Two intervals [a,b] and [c,d] overlap iff a <= d AND c <= b.
+            if s_lo <= o_hi and o_lo <= s_hi:
+                return True
+        return False
+
+    deduped_acoustic = sum(
+        1 for seg in acu if not _overlaps_any(seg, lex)
+    )
+    return len(lex), deduped_acoustic
 
 
 class SignalScorer:
@@ -40,11 +93,14 @@ class SignalScorer:
     def speech_pace(words, vad_segments):
         """Score speech pace using articulation rate (words per voiced second).
 
-        The old piecewise curve had a cliff at 180 WPM — a chunk at 181
-        WPM got 0 while a chunk at 180 WPM got 40. That produced huge
-        false penalties for anyone speaking a bit fast. The curve below
-        is smooth and mirror-symmetric around the 140 WPM sweet spot,
-        matching the one in scoring_engine._wpm_to_score.
+        Smooth tent function peaking at 150 WPM with a gentle
+        exponential falloff above (Fix 10) — widened from the old
+        130-150 plateau to fairly accommodate Indian-English /
+        Spanish-influenced speakers who naturally run 170-190 WPM.
+        Mirrors scoring_engine._wpm_to_score so the live-WS path and
+        the upload path produce identical scores for the same audio.
+
+        Anchors: wpm=100 → ~82, wpm=150 → 100, wpm=190 → ~88, wpm=240 → ~72.
 
         Returns None for chunks with no meaningful speech (voiced_s<0.5)
         so callers can exclude silence from the aggregate rather than
@@ -58,56 +114,51 @@ class SignalScorer:
         count = len([w for w in words if len(w.get("word", "")) > 1])
         wpm = (count / voiced_s) * 60
 
-        # Sweet spot 130-150, gentle falloff on either side, floor 10.
         if wpm <= 0:
             return 20
-        if 130 <= wpm <= 150:
-            score = 100
-        elif 120 <= wpm <= 160:
-            score = 90
-        elif 100 <= wpm < 120:
-            score = 60 + (wpm - 100) * 1.5     # 60 → 90
-        elif 160 < wpm <= 180:
-            score = 90 - (wpm - 160) * 1.5     # 90 → 60
-        elif 80 <= wpm < 100:
-            score = 30 + (wpm - 80) * 1.5      # 30 → 60
-        elif 180 < wpm <= 200:
-            score = 60 - (wpm - 180) * 1.5     # 60 → 30
-        elif wpm < 80:
-            score = max(10, int(wpm * 0.375))
-        else:  # wpm > 200
-            score = max(10, 30 - int((wpm - 200) * 0.5))
-        return round(score)
+        if wpm <= 150:
+            score = 100 * (wpm / 150) ** 0.5
+        else:
+            score = 100 * math.exp(-0.003 * (wpm - 150))
+        return max(0, min(100, round(score)))
 
     @staticmethod
-    def filler_words(lexical_count, acoustic_count, voiced_s):
-        """Score filler word usage.
+    def filler_words(lexical_count, acoustic_count, voiced_s, word_count=None):
+        """Score filler word usage as a smooth exponential decay.
 
         lexical_count: fillers found in transcript.
         acoustic_count: filler sounds detected from audio.
-        voiced_s: total voiced seconds.
+        voiced_s:      total voiced seconds (kept for the silent-chunk
+                       gate — without it we'd reward silence).
+        word_count:    total real (non-filler) word count. When
+                       supplied (Fix 4), the rate is computed as
+                       fillers per 100 words rather than per voiced
+                       minute. Slow deliberate speakers and fast
+                       packed speakers should NOT share a denominator.
 
         Returns None when voiced_s < 0.5 — zero fillers in zero
         voiced seconds is "no data," not "perfect 100." The old
-        `rate == 0 → 100` shortcut was the silent-speaker bug:
-        a user who said nothing got a perfect filler-words score
-        and the headline came out a grade A.
+        `rate == 0 → 100` step-table also gave gameable plateaus
+        (5.0/min and 4.9/min jumped 55→75); the smooth curve here
+        removes that.
         """
         if voiced_s < 0.5:
             return None
-        rate = ((lexical_count + acoustic_count) / max(voiced_s, 1)) * 60
-        if rate == 0:
-            return 100
-        elif rate < 2:
-            return 90
-        elif rate < 5:
-            return 75
-        elif rate < 10:
-            return 55
-        elif rate < 20:
-            return 30
+        filler_count = lexical_count + acoustic_count
+        # Fix 4: per-100-words denominator. Falls back to per-voiced-
+        # minute only if the caller cannot provide word_count (legacy
+        # paths). The divisor in the exponential is tuned to each
+        # denominator so the same ground-truth filler rate produces
+        # comparable scores across the two regimes.
+        if word_count is not None:
+            if word_count <= 0:
+                return None
+            rate = (filler_count / word_count) * 100
+            score = 100 * math.exp(-rate / 3)
         else:
-            return 10
+            rate = (filler_count / max(voiced_s, 1)) * 60
+            score = 100 * math.exp(-rate / 5)
+        return max(0, min(100, round(score)))
 
     @staticmethod
     def silence_penalty(vad_segments, chunk_duration_ms=3000):
@@ -143,24 +194,20 @@ class SignalScorer:
     def vocal_variety(pitch, voiced_s=None):
         """Score vocal variety from pitch standard deviation.
 
-        Monotone = low score, natural variation = high score,
-        erratic = drops. Returns None on a silent chunk
-        (voiced_s < 0.5) so a silent speaker isn't labelled
-        "monotone" (the old behaviour: pitch_std=0 → score 20).
+        Smooth logistic curve centred at std_hz=30 with k=0.08:
+            score = 100 / (1 + exp(-0.08 * (std_hz - 30)))
+        Anchor checks: 10 → ~18, 30 → 50, 60 → ~91. The previous
+        piecewise version had a flat 100 plateau across 50-80 Hz
+        which made small differences inside the plateau invisible.
+
+        Returns None on a silent chunk (voiced_s < 0.5) so a silent
+        speaker isn't labelled "monotone".
         """
         if voiced_s is not None and voiced_s < 0.5:
             return None
         std = pitch.get("std_hz", 0)
-        if std < 5:
-            return 20
-        elif std < 15:
-            return 40 + int((std - 5) * 4)
-        elif std < 50:
-            return int(80 + (std - 15) * (20 / 35))
-        elif std < 80:
-            return 100
-        else:
-            return max(50, 100 - int((std - 80) * 2))
+        score = 100.0 / (1.0 + math.exp(-0.08 * (std - 30)))
+        return max(0, min(100, round(score)))
 
     @staticmethod
     def aggregate(signals):

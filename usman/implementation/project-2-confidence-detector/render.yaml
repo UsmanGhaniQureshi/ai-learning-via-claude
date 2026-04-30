@@ -3,13 +3,33 @@ services:
     name: confidence-detector-backend
     env: python
     buildCommand: pip install -r requirements.txt && bash scripts/download_models.sh backend/
-    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2
+    startCommand: cd backend && mkdir -p /var/data/uploads /var/data/recordings && uvicorn main:app --host 0.0.0.0 --port $PORT --workers 2
     healthCheckPath: /health
+    # Persistent disk: user uploads + live-session recordings live here so
+    # they survive container restarts. 1 GB is enough for the beta tier;
+    # bump and add a cleanup cron when usage demands.
+    disk:
+      name: confidence-detector-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PORT
         value: 8000
-      - key: CORS_ORIGINS
-        value: "*"
+      # ENV=production makes the backend fail-fast if JWT_SECRET or
+      # MEDIA_URL_SECRET are missing, instead of silently falling back to
+      # the documented dev defaults. Both secrets must be set in the
+      # Render dashboard (Environment → Add Environment Variable) before
+      # the first deploy will succeed.
+      - key: ENV
+        value: production
+      # CORS_ORIGINS must be set to the real frontend URL in the Render
+      # dashboard before launch — the backend will reject unknown
+      # origins. Leaving this unset here forces an explicit setting per
+      # environment instead of accidentally shipping `*`.
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+      - key: RECORDINGS_DIR
+        value: /var/data/recordings
 
   - type: web
     name: confidence-detector-frontend

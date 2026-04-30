@@ -16,6 +16,22 @@ _BASELINE_SIGNALS = (
 )
 
 
+# Canonical grade table — single source of truth for backend AND frontend.
+# Each tuple is (min_score_inclusive, letter, label). Iterated in descending
+# threshold order. The frontend at frontend/src/pages/Result.jsx mirrors
+# these exact thresholds and letters so the same numeric score yields the
+# same letter in every UI surface.
+GRADE_TABLE = [
+    (90, "A+", "Exceptional"),
+    (80, "A", "Confident"),
+    (70, "B+", "Strong"),
+    (60, "B", "Good"),
+    (50, "C", "Developing"),
+    (40, "D", "Needs work"),
+    (0, "F", "Keep practicing"),
+]
+
+
 def generate_post_session_report(
     snapshots: list,
     session_id: str,
@@ -304,15 +320,8 @@ def generate_post_session_report(
     }
 
     # ── Grade ────────────────────────────────────────────────────────
-    grade_table = [
-        (90, "A+", "Exceptional"),
-        (80, "A", "Confident"),
-        (70, "B+", "Strong"),
-        (60, "B", "Good"),
-        (50, "C", "Developing"),
-        (40, "D", "Needs work"),
-        (0, "F", "Keep practicing"),
-    ]
+    # GRADE_TABLE is defined at module top — keep it the only place the
+    # thresholds live. The frontend mirrors the same constants.
     grade, label = "F", "Keep practicing"
     if avg_total is None:
         # Every per-chunk total was None — happens when all signals
@@ -321,7 +330,7 @@ def generate_post_session_report(
         # case). Surface "no grade" rather than defaulting to F.
         grade, label = None, None
     else:
-        for threshold, g, l in grade_table:
+        for threshold, g, l in GRADE_TABLE:
             if avg_total >= threshold:
                 grade, label = g, l
                 break
@@ -480,6 +489,19 @@ def generate_post_session_report(
                 f"(you have {n_seen})."
             )
 
+    # Fix 11: session-level Whisper transcript-confidence — mean of
+    # per-word probabilities (above the 0.05 accent-fairness cutoff)
+    # across the whole session. Surfaced as a transcript-quality
+    # indicator only; deliberately NOT folded into the headline score.
+    chunk_transcript_confs = [
+        r.get("transcript_confidence") for r in all_raw
+        if isinstance(r.get("transcript_confidence"), (int, float))
+    ]
+    transcript_confidence = (
+        round(sum(chunk_transcript_confs) / len(chunk_transcript_confs), 2)
+        if chunk_transcript_confs else None
+    )
+
     base_report = {
         "session_id": session_id,
         "duration_s": duration_s,
@@ -489,6 +511,7 @@ def generate_post_session_report(
         "grade": grade,
         "grade_label": label,
         "signal_averages": signal_avgs,
+        "transcript_confidence": transcript_confidence,
         "signal_baseline_adjusted": signal_baseline_adjusted,
         "user_baseline": user_baseline,
         "baseline_note": baseline_note,
