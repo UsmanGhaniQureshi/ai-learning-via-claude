@@ -17,6 +17,7 @@ import MetadataEditor from '../components/MetadataEditor'
 import CommentsThread from '../components/CommentsThread'
 import ShareModal from '../components/ShareModal'
 import ScoreBreakdownPanel from '../components/ScoreBreakdownPanel'
+import ResultHUD from '../components/ResultHUD'
 
 export default function Result() {
   const { id } = useParams()
@@ -567,6 +568,7 @@ function UploadedMediaResult({
                 mode={mode}
                 src={playerSrc}
                 transcript={transcript}
+                liveHudTimeline={data.live_hud_timeline}
               />
             ) : (
               <div className="transcript-empty">
@@ -725,13 +727,33 @@ function UploadedMediaResult({
 }
 
 const UploadedMediaPlayer = forwardRef(function UploadedMediaPlayer(
-  { mode, src, transcript },
+  { mode, src, transcript, liveHudTimeline = null },
   ref,
 ) {
   const mediaRef = useRef(null)
   const transcriptContainerRef = useRef(null)
   const activeWordRef = useRef(null)
   const [currentWordIdx, setCurrentWordIdx] = useState(-1)
+  // Drives the ResultHUD overlay. Updated on every `timeupdate` event
+  // alongside `currentWordIdx` so a single linear scan over the
+  // timeline arrays handles both lookups.
+  const [currentTime, setCurrentTime] = useState(0)
+  const [durationS, setDurationS] = useState(null)
+  // HUD density toggle — same Signals on / Minimal / Hidden vocabulary
+  // as LiveHUD. Persisted under a result-specific localStorage key so
+  // users can keep different defaults for live capture vs. replay.
+  const [hudDensity, setHudDensityState] = useState(() => {
+    try {
+      const saved = localStorage.getItem('cd_result_hud_density')
+      return ['full', 'minimal', 'hidden'].includes(saved) ? saved : 'full'
+    } catch {
+      return 'full'
+    }
+  })
+  const setHudDensity = (next) => {
+    setHudDensityState(next)
+    try { localStorage.setItem('cd_result_hud_density', next) } catch { /* ignore */ }
+  }
 
   const words = useMemo(() => transcript.words || [], [transcript])
   const segments = useMemo(() => transcript.segments || [], [transcript])
@@ -764,9 +786,17 @@ const UploadedMediaPlayer = forwardRef(function UploadedMediaPlayer(
 
   useEffect(() => {
     const media = mediaRef.current
-    if (!media || words.length === 0) return
+    if (!media) return
 
     const onTimeUpdate = () => {
+      // Drive both the transcript-word highlighter (when transcript
+      // words are present) AND the ResultHUD overlay (always, as
+      // long as the video is mounted).
+      setCurrentTime(media.currentTime || 0)
+      if (words.length === 0) {
+        setCurrentWordIdx(-1)
+        return
+      }
       const currentMs = media.currentTime * 1000
       let idx = -1
       for (let i = 0; i < words.length; i += 1) {
@@ -783,8 +813,17 @@ const UploadedMediaPlayer = forwardRef(function UploadedMediaPlayer(
       setCurrentWordIdx(idx)
     }
 
+    const onLoadedMetadata = () => {
+      const d = media.duration
+      if (Number.isFinite(d) && d > 0) setDurationS(d)
+    }
+
     media.addEventListener('timeupdate', onTimeUpdate)
-    return () => media.removeEventListener('timeupdate', onTimeUpdate)
+    media.addEventListener('loadedmetadata', onLoadedMetadata)
+    return () => {
+      media.removeEventListener('timeupdate', onTimeUpdate)
+      media.removeEventListener('loadedmetadata', onLoadedMetadata)
+    }
   }, [words])
 
   useEffect(() => {
@@ -809,76 +848,118 @@ const UploadedMediaPlayer = forwardRef(function UploadedMediaPlayer(
   return (
     <div className="space-y-4">
       {mode === 'video' ? (
-        <video
-          ref={mediaRef}
-          src={src}
-          controls
-          playsInline
-          preload="metadata"
-          className="w-full rounded-md bg-black"
-        />
+        // Wrap the <video> in a relative container so the ResultHUD
+        // overlay can `absolute`-position over it without disturbing
+        // the native controls underneath. The HUD itself is
+        // `pointer-events-none` so clicks fall through to the
+        // <video controls>.
+        <div className="relative">
+          <video
+            ref={mediaRef}
+            src={src}
+            controls
+            playsInline
+            preload="metadata"
+            className="w-full rounded-md bg-black"
+          />
+          <ResultHUD
+            liveHudTimeline={liveHudTimeline}
+            currentTime={currentTime}
+            durationS={durationS}
+            density={hudDensity}
+            onDensityChange={setHudDensity}
+          />
+        </div>
       ) : (
-        <audio
-          ref={mediaRef}
-          src={src}
-          controls
-          preload="metadata"
-          className="w-full"
-        />
+        // Audio mode: there's no video surface to overlay onto, so we
+        // render a dark "stage" card with the same HUD on it followed
+        // by the native <audio controls> below. Same liveHudTimeline
+        // data, same currentTime / density wiring as the video branch
+        // — the HUD just sits over a black panel instead of pixels.
+        <div className="space-y-3">
+          <div className="relative bg-black rounded-md overflow-hidden aspect-[16/9] min-h-[260px]">
+            <ResultHUD
+              liveHudTimeline={liveHudTimeline}
+              currentTime={currentTime}
+              durationS={durationS}
+              density={hudDensity}
+              onDensityChange={setHudDensity}
+            />
+          </div>
+          <audio
+            ref={mediaRef}
+            src={src}
+            controls
+            preload="metadata"
+            className="w-full"
+          />
+        </div>
       )}
 
-      <div>
-        <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
-          <h3>Transcript</h3>
+      {/* Transcript moved into a collapsed <details> drawer. The
+          synced word-by-word highlighter still works for users who
+          want it, but it no longer dominates the result page by
+          default — the HUD overlay above handles per-moment status
+          glance, and the headline summary cards above carry the
+          big-picture takeaways. Click "▾ Transcript" to expand. */}
+      <details className="glass-card group">
+        <summary className="px-5 py-3 cursor-pointer text-sm font-medium text-text-secondary flex items-center justify-between gap-2 select-none">
+          <span className="flex items-center gap-2">
+            <span className="transition-transform group-open:rotate-180">▾</span>
+            <span>Transcript</span>
+          </span>
           {words.length > 0 && (
-            <p className="text-xs text-text-muted">Click a word to jump to that moment.</p>
+            <span className="text-xs text-text-muted font-normal">
+              Click a word to jump to that moment
+            </span>
+          )}
+        </summary>
+        <div className="px-5 pb-5 border-t border-border pt-4">
+          {words.length > 0 ? (
+            <div
+              ref={transcriptContainerRef}
+              className="bg-page/60 border border-border rounded-md p-4 max-h-56 overflow-y-auto text-sm leading-relaxed text-text-secondary"
+            >
+              {words.map((word, index) => {
+                const isActive = index === currentWordIdx
+                const className = [
+                  'cursor-pointer rounded px-1 py-0.5 transition-colors',
+                  isActive ? 'bg-accent text-white' : 'hover:bg-elevated hover:text-text-primary',
+                  word.is_filler ? 'text-warning italic' : '',
+                  isActive && word.is_filler ? 'bg-warning text-white' : '',
+                ].join(' ')
+                return (
+                  <span
+                    key={`${word.word}-${index}`}
+                    ref={isActive ? activeWordRef : null}
+                    className={className}
+                    onClick={() => jumpToWord(word)}
+                  >
+                    {word.word}{' '}
+                  </span>
+                )
+              })}
+            </div>
+          ) : segments.length > 0 ? (
+            <div className="space-y-3">
+              {segments.map((segment, index) => (
+                <div key={`${segment.timestamp}-${index}`} className="detail-stat">
+                  <p className="text-xs text-text-muted uppercase tracking-wider">
+                    {formatDuration(segment.timestamp)}
+                  </p>
+                  <p className="mt-2 text-sm leading-relaxed text-text-secondary">
+                    {segment.text}
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="transcript-empty">
+              Transcript was not available for this recording.
+            </div>
           )}
         </div>
-
-        {words.length > 0 ? (
-          <div
-            ref={transcriptContainerRef}
-            className="bg-page/60 border border-border rounded-md p-4 max-h-56 overflow-y-auto text-sm leading-relaxed text-text-secondary"
-          >
-            {words.map((word, index) => {
-              const isActive = index === currentWordIdx
-              const className = [
-                'cursor-pointer rounded px-1 py-0.5 transition-colors',
-                isActive ? 'bg-accent text-white' : 'hover:bg-elevated hover:text-text-primary',
-                word.is_filler ? 'text-warning italic' : '',
-                isActive && word.is_filler ? 'bg-warning text-white' : '',
-              ].join(' ')
-              return (
-                <span
-                  key={`${word.word}-${index}`}
-                  ref={isActive ? activeWordRef : null}
-                  className={className}
-                  onClick={() => jumpToWord(word)}
-                >
-                  {word.word}{' '}
-                </span>
-              )
-            })}
-          </div>
-        ) : segments.length > 0 ? (
-          <div className="space-y-3">
-            {segments.map((segment, index) => (
-              <div key={`${segment.timestamp}-${index}`} className="detail-stat">
-                <p className="text-xs text-text-muted uppercase tracking-wider">
-                  {formatDuration(segment.timestamp)}
-                </p>
-                <p className="mt-2 text-sm leading-relaxed text-text-secondary">
-                  {segment.text}
-                </p>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="transcript-empty">
-            Transcript was not available for this recording.
-          </div>
-        )}
-      </div>
+      </details>
     </div>
   )
 })

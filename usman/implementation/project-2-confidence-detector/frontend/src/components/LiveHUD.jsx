@@ -1,4 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  STATUS_BADGE,
+  STATUS_DOT_BG,
+  STATUS_LABEL,
+  STATUS_FILL_WIDTH,
+  NUDGE_BY_SIGNAL as NUDGES,
+  ENCOURAGEMENT_NUDGES as ENCOURAGEMENT,
+} from './hudStatus'
 
 /**
  * LiveHUD — overlay-on-camera coaching surface for live practice.
@@ -18,48 +26,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
  *   2. Signal cards animate (brief flash) when their status changes.
  *   3. No streaming text feed — keep eyes on the camera.
  *
- * Tailwind palette: ONLY existing classes (badge-success, badge-accent,
- * badge-warning, badge-danger, badge-muted, plus the success / warning /
- * danger / accent text tokens declared in tailwind.config.js).
+ * Status maps + nudge strings live in `./hudStatus.js` so the
+ * ResultHUD (playback overlay) can reuse them verbatim.
  */
-
-// 4-tier mapping. The 4 spec statuses map to the existing Tailwind
-// badge palette — no new colours introduced.
-const STATUS_BADGE = {
-  excellent: 'badge-success',
-  good: 'badge-accent',
-  fair: 'badge-warning',
-  poor: 'badge-danger',
-}
-
-// Mirrors the dot used in the detection light. `bg-*` tokens come
-// from tailwind.config.js (success, warning, danger, accent are
-// declared; text-muted is the "no data" fallback).
-const STATUS_DOT_BG = {
-  excellent: 'bg-success',
-  good: 'bg-accent',
-  fair: 'bg-warning',
-  poor: 'bg-danger',
-}
-
-const STATUS_LABEL = {
-  excellent: 'Excellent',
-  good: 'Good',
-  fair: 'Fair',
-  poor: 'Poor',
-}
-
-// Coaching nudges — one short string per worst-signal case. The
-// "all good" case rotates so the user doesn't see the same word for
-// minutes. Picked deterministically by elapsed time so it doesn't
-// jump around on every chunk.
-const ENCOURAGEMENT = ['Keep going', 'Good energy', 'Stay relaxed']
-const NUDGES = {
-  detection: 'Keep your face visible to the camera',
-  voice_pitch: 'Vary your pitch — avoid monotone',
-  noise_level: 'Move to a quieter space',
-  speech_pace: 'Adjust your speaking pace',
-}
 
 function formatTimer(seconds) {
   const m = Math.floor(seconds / 60)
@@ -123,13 +92,7 @@ function SignalCard({ label, status, accentSubLabel }) {
       <div className="h-1 bg-white/10 rounded-full overflow-hidden">
         <div
           className={`h-full ${dotClass} transition-all duration-500`}
-          style={{
-            width: status === 'excellent'
-              ? '100%' : status === 'good'
-              ? '70%' : status === 'fair'
-              ? '40%' : status === 'poor'
-              ? '15%' : '0%',
-          }}
+          style={{ width: STATUS_FILL_WIDTH[status] || '0%' }}
         />
       </div>
     </div>

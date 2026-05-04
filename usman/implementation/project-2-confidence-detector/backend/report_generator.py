@@ -502,6 +502,15 @@ def generate_post_session_report(
         if chunk_transcript_confs else None
     )
 
+    # Pass-through of the per-chunk overlay-status block the WS / upload
+    # / analyzer pipelines now attach to each snapshot. The result-screen
+    # HUD overlay reads this array indexed by `t_s` (chunk index × 3 s).
+    live_hud_timeline = [
+        ({**snap["live_hud"], "t_s": i * 3}
+         if snap.get("live_hud") else None)
+        for i, snap in enumerate(snapshots)
+    ]
+
     base_report = {
         "session_id": session_id,
         "duration_s": duration_s,
@@ -512,6 +521,7 @@ def generate_post_session_report(
         "grade_label": label,
         "signal_averages": signal_avgs,
         "transcript_confidence": transcript_confidence,
+        "live_hud_timeline": live_hud_timeline,
         "signal_baseline_adjusted": signal_baseline_adjusted,
         "user_baseline": user_baseline,
         "baseline_note": baseline_note,

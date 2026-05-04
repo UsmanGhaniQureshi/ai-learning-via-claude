@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import ScoreGauge from './ScoreGauge'
 import SignalInfoTooltip from './SignalInfoTooltip'
@@ -7,6 +7,7 @@ import TranscriptView from './TranscriptView'
 import ProgressChart from './ProgressChart'
 import ScoreBreakdownPanel from './ScoreBreakdownPanel'
 import CoachingPanel from './CoachingPanel'
+import ResultHUD from './ResultHUD'
 import { API_BASE, apiFetch, mediaUrl } from '../config'
 
 export default function SessionReport({
@@ -17,6 +18,43 @@ export default function SessionReport({
   playerHandleRef = null,
 }) {
   const videoElRef = useRef(null)
+
+  // Result-screen HUD overlay state — drives the on-video status
+  // cards via the persisted live_hud_timeline. Hooks live ABOVE the
+  // early-return checks below so they always run in the same order
+  // regardless of whether the report is null or errored.
+  const [hudCurrentTime, setHudCurrentTime] = useState(0)
+  const [hudDurationS, setHudDurationS] = useState(null)
+  const [hudDensity, setHudDensityState] = useState(() => {
+    try {
+      const saved = localStorage.getItem('cd_result_hud_density')
+      return ['full', 'minimal', 'hidden'].includes(saved) ? saved : 'full'
+    } catch {
+      return 'full'
+    }
+  })
+  const setHudDensity = (next) => {
+    setHudDensityState(next)
+    try { localStorage.setItem('cd_result_hud_density', next) } catch { /* ignore */ }
+  }
+
+  useEffect(() => {
+    const v = videoElRef.current
+    if (!v) return
+    const onTime = () => setHudCurrentTime(v.currentTime || 0)
+    const onMeta = () => {
+      const d = v.duration
+      if (Number.isFinite(d) && d > 0) setHudDurationS(d)
+    }
+    v.addEventListener('timeupdate', onTime)
+    v.addEventListener('loadedmetadata', onMeta)
+    return () => {
+      v.removeEventListener('timeupdate', onTime)
+      v.removeEventListener('loadedmetadata', onMeta)
+    }
+  // recordingVideoUrl change is the only trigger that swaps in a new
+  // <video> element; we want a fresh listener pair when that happens.
+  }, [report?.recording?.video_url])
 
   if (playerHandleRef) {
     playerHandleRef.current = {
@@ -66,6 +104,7 @@ export default function SessionReport({
     coaching, coaching_status, coaching_skip_reason,
     wins: reportWins, improvements: reportImprovements,
     transcript_confidence,
+    live_hud_timeline: liveHudTimeline,
   } = report
 
   // Title-vs-transcript mismatch banner. The llm_coach module flags
@@ -234,28 +273,49 @@ export default function SessionReport({
       <hr className="border-border" />
 
       {showRecording && recordingVideoUrl && (
+        // Wrap the <video> in a relative container so the ResultHUD
+        // overlay can position absolutely on top of the playback
+        // surface. The HUD is `pointer-events-none`, so the native
+        // video controls remain interactive underneath.
         <div className="glass-card p-4">
-          <video
-            ref={videoElRef}
-            src={recordingVideoUrl}
-            controls
-            playsInline
-            preload="metadata"
-            className="w-full rounded-md bg-black"
-          />
+          <div className="relative">
+            <video
+              ref={videoElRef}
+              src={recordingVideoUrl}
+              controls
+              playsInline
+              preload="metadata"
+              className="w-full rounded-md bg-black"
+            />
+            <ResultHUD
+              liveHudTimeline={liveHudTimeline}
+              currentTime={hudCurrentTime}
+              durationS={hudDurationS}
+              density={hudDensity}
+              onDensityChange={setHudDensity}
+            />
+          </div>
         </div>
       )}
 
-      {/* Signal bars */}
-      <div className="glass-card p-5">
-        <h3 className="mb-4">Signal Breakdown</h3>
-        <ReportSignalBars
-          signals={signal_averages}
-          stderrs={signal_stderrs}
-          reasons={signal_reasons}
-          faceUnavailable={faceUnavailable}
-        />
-      </div>
+      {/* Signal Breakdown moved into a collapsed drawer — the HUD
+          overlay above carries the per-moment status at-a-glance, so
+          this card no longer needs to take prime real estate beside
+          the video. Click "▾ Signal Breakdown" to expand. */}
+      <details className="glass-card group">
+        <summary className="px-5 py-3 cursor-pointer text-sm font-medium text-text-secondary flex items-center gap-2 select-none">
+          <span className="transition-transform group-open:rotate-180">▾</span>
+          <span>Signal Breakdown</span>
+        </summary>
+        <div className="px-5 pb-5 border-t border-border pt-4">
+          <ReportSignalBars
+            signals={signal_averages}
+            stderrs={signal_stderrs}
+            reasons={signal_reasons}
+            faceUnavailable={faceUnavailable}
+          />
+        </div>
+      </details>
 
       <ScoreBreakdownPanel
         avgScore={avg_score}

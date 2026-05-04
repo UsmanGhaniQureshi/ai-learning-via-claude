@@ -83,6 +83,143 @@ _EXPRESSION_TO_SCORE = {
 }
 
 
+# ── Live HUD builder ───────────────────────────────────────────────
+# Module-level so all three pipelines (live WS, video upload, audio
+# analyzer) can call it. Pure derivation: caller owns the rolling
+# history deque (4-chunk window) and updates it via this function's
+# side-effect on `hud_total_history.append(...)`. Returns the
+# overlay-friendly status block the frontend persists into the report
+# as `live_hud_timeline` so the result-screen HUD has data to show.
+_HUD_STATUS_RANK = {"poor": 0, "fair": 1, "good": 2, "excellent": 3}
+
+
+def _build_live_hud(chunk_result, browser_face, face_msg_age_s, hud_total_history):
+    """Build the per-chunk `live_hud` block.
+
+    Args:
+        chunk_result:        the dict returned by AudioPipeline.process_chunk.
+        browser_face:        latest browser-side face data, or {} if absent.
+        face_msg_age_s:      seconds since the last face message arrived.
+                             >1.5 means the stream is stale → detection: poor.
+                             Use 0.0 in non-live paths (upload / analyzer)
+                             where there is no face message stream.
+        hud_total_history:   a `deque(maxlen=4)` owned by the caller. We
+                             append the chunk's total score (when numeric)
+                             and read the rolling mean back out.
+
+    Returns a dict with:
+        rolling_total      0-100 int or None
+        detection          "excellent" | "good" | "fair" | "poor"
+        voice_pitch        same enum or None on silent chunks
+        noise_level        same enum or None when silence not yet measured
+        speech_pace        same enum or None when no speech
+        worst_signal       key name of the lowest-tier signal (or None)
+        worst_status       its status string (or None)
+    """
+    # Rolling 4-chunk total — drives the headline number on the HUD.
+    chunk_total = chunk_result.get("scores", {}).get("total")
+    if isinstance(chunk_total, (int, float)):
+        hud_total_history.append(int(chunk_total))
+    rolling_total = (
+        int(round(sum(hud_total_history) / len(hud_total_history)))
+        if hud_total_history else None
+    )
+
+    # Detection light. Order:
+    #   1. No browser face data ever → "poor"
+    #   2. Last face message stale (>1.5 s) → "poor"
+    #   3. Browser flagged calibrating → "fair"
+    #   4. eye_contact_pct as a face-visibility proxy.
+    if not browser_face:
+        detection = "poor"
+    elif face_msg_age_s > 1.5:
+        detection = "poor"
+    elif browser_face.get("calibrating"):
+        detection = "fair"
+    else:
+        eye_pct = browser_face.get("eye_contact", 0) or 0
+        face_turned = browser_face.get("face_turned_away", False)
+        if face_turned:
+            detection = "fair"
+        elif eye_pct >= 70:
+            detection = "excellent"
+        elif eye_pct >= 45:
+            detection = "good"
+        elif eye_pct >= 20:
+            detection = "fair"
+        else:
+            detection = "poor"
+
+    # Voice pitch — anchors match the smooth vocal_variety curve in
+    # signal_scorer (logistic centred at 30): below 5 Hz = monotone,
+    # 15-50 = natural, 50+ = animated.
+    pitch = chunk_result.get("raw", {}).get("pitch") or {}
+    std_hz = float(pitch.get("std_hz") or 0)
+    voiced_s = float(chunk_result.get("raw", {}).get("voiced_s") or 0)
+    if voiced_s < 0.5:
+        voice_pitch = None
+    elif std_hz < 5:
+        voice_pitch = "poor"
+    elif std_hz < 15:
+        voice_pitch = "fair"
+    elif std_hz < 35:
+        voice_pitch = "good"
+    else:
+        voice_pitch = "excellent"
+
+    # Noise level — silence-window RMS. Empirical anchors: ~0.001 mic
+    # self-noise, 0.01-0.02 typing, 0.02-0.05 traffic, 0.05+ loud.
+    silence_rms = chunk_result.get("raw", {}).get("silence_rms")
+    if silence_rms is None:
+        noise_level = None
+    elif silence_rms < 0.005:
+        noise_level = "excellent"
+    elif silence_rms < 0.015:
+        noise_level = "good"
+    elif silence_rms < 0.035:
+        noise_level = "fair"
+    else:
+        noise_level = "poor"
+
+    # Speech pace — map the speech_pace score to a status enum.
+    pace_score = chunk_result.get("scores", {}).get("speech_pace")
+    if pace_score is None:
+        speech_pace = None
+    elif pace_score >= 85:
+        speech_pace = "excellent"
+    elif pace_score >= 65:
+        speech_pace = "good"
+    elif pace_score >= 45:
+        speech_pace = "fair"
+    else:
+        speech_pace = "poor"
+
+    # Worst signal → drives the bottom coaching nudge. None values are
+    # skipped so the nudge doesn't say "Poor pitch" on a silent chunk.
+    signals = {
+        "detection": detection,
+        "voice_pitch": voice_pitch,
+        "noise_level": noise_level,
+        "speech_pace": speech_pace,
+    }
+    scoreable = {k: v for k, v in signals.items() if v is not None}
+    worst_key = (
+        min(scoreable, key=lambda k: _HUD_STATUS_RANK[scoreable[k]])
+        if scoreable else None
+    )
+    worst_status = scoreable.get(worst_key) if worst_key else None
+
+    return {
+        "rolling_total": rolling_total,
+        "detection": detection,
+        "voice_pitch": voice_pitch,
+        "noise_level": noise_level,
+        "speech_pace": speech_pace,
+        "worst_signal": worst_key,
+        "worst_status": worst_status,
+    }
+
+
 def _expression_label_to_score(label: str | None) -> int:
     return _EXPRESSION_TO_SCORE.get(label or 'neutral', 50)
 
@@ -1417,6 +1554,12 @@ def _run_upload_pipeline_sync(
         # at a time.
         has_audio = False
         snapshots: list[dict] = []
+        # Rolling 4-chunk total used by _build_live_hud. Same buffer the
+        # live WS path keeps; instantiated locally here so the upload
+        # pipeline produces an equivalent live_hud_timeline that the
+        # result-screen overlay can replay back to the user.
+        from collections import deque as _hud_deque
+        hud_total_history = _hud_deque(maxlen=4)
         try:
             # Hardening against malformed / malicious media files:
             #   -err_detect crccheck+bitstream  — bail on structural errors
@@ -1476,13 +1619,27 @@ def _run_upload_pipeline_sync(
                             piece = buf[:chunk_bytes]
                             buf = buf[chunk_bytes:]
                             arr = np.frombuffer(piece, dtype=np.int16).astype(np.float32) / 32768.0
-                            snapshots.append(pipeline.process_chunk(arr, sr=16000))
+                            chunk_result = pipeline.process_chunk(arr, sr=16000)
+                            # Attach the same overlay-friendly status
+                            # block the live WS path produces so the
+                            # result-screen HUD can show it later.
+                            # `face_msg_age_s=0.0` is a sentinel meaning
+                            # "no face stream"; the builder treats
+                            # missing browser_face as detection: poor.
+                            chunk_result["live_hud"] = _build_live_hud(
+                                chunk_result, {}, 0.0, hud_total_history,
+                            )
+                            snapshots.append(chunk_result)
                         leftover = buf
                     if leftover:
                         arr = np.frombuffer(leftover, dtype=np.int16).astype(np.float32) / 32768.0
                         if len(arr) < chunk_samples:
                             arr = np.pad(arr, (0, chunk_samples - len(arr)))
-                        snapshots.append(pipeline.process_chunk(arr, sr=16000))
+                        chunk_result = pipeline.process_chunk(arr, sr=16000)
+                        chunk_result["live_hud"] = _build_live_hud(
+                            chunk_result, {}, 0.0, hud_total_history,
+                        )
+                        snapshots.append(chunk_result)
                     try:
                         rc = proc.wait(timeout=30)
                     except subprocess.TimeoutExpired:
@@ -2221,6 +2378,14 @@ def _run_upload_pipeline_sync(
             'speech_summary': speech_summary,
             'face_timeline': face_results_by_time,
             'speech_timeline': speech_timeline,
+            # Result-screen HUD overlay timeline. One entry per
+            # processed audio chunk, stamped with `t_s` so the
+            # frontend can map video.currentTime → status block.
+            'live_hud_timeline': [
+                ({**s["live_hud"], "t_s": i * 3}
+                 if s.get("live_hud") else None)
+                for i, s in enumerate(snapshots)
+            ],
             'signal_averages': {
                 'voice_steadiness': final_scores.get('voiceSteadiness'),
                 'eye_contact': final_scores.get('eyeContact'),
@@ -2751,6 +2916,19 @@ async def session_ws(ws: WebSocket, session_id: str):
             # words, regardless of how transcript was built.
             report["speech_timeline"] = speech_tl
 
+            # Attach live_hud_timeline so the result-screen overlay can
+            # replay the same status cards the user saw during recording.
+            # Each entry is the per-chunk live_hud block + a chunk-time
+            # marker (`t_s`). Snapshots without a live_hud (e.g. older
+            # WS handlers, or chunks that errored before the builder
+            # ran) contribute a None entry so indices stay aligned with
+            # the other timelines.
+            report["live_hud_timeline"] = [
+                ({**snap["live_hud"], "t_s": i * 3}
+                 if snap.get("live_hud") else None)
+                for i, snap in enumerate(snapshots)
+            ]
+
             # Default title for a LIVE recording: timestamped, with the
             # medium ("Video" / "Audio") suffixed so a quick Library
             # scan tells you what kind of practice it was. UTC because
@@ -2798,137 +2976,6 @@ async def session_ws(ws: WebSocket, session_id: str):
     # TCP buffer with no flow-control feedback.
     audio_queue: asyncio.Queue = asyncio.Queue(maxsize=2)
 
-    def _build_live_hud(chunk_result, browser_face, face_msg_age_s):
-        """Build the per-chunk `live_hud` block the frontend overlay
-        consumes. Pure derivation — does NOT mutate any existing field
-        on `chunk_result`. Returns a dict with rolling_total + 4 status
-        entries (Excellent / Good / Fair / Poor / null). Each
-        thresholds map is documented inline; tweak in one place if a
-        signal feels wrong in real-world testing.
-        """
-        # ── Rolling 4-chunk total (Step 3E left-side number) ──
-        chunk_total = chunk_result.get("scores", {}).get("total")
-        if isinstance(chunk_total, (int, float)):
-            hud_total_history.append(int(chunk_total))
-        rolling_total = (
-            int(round(sum(hud_total_history) / len(hud_total_history)))
-            if hud_total_history else None
-        )
-
-        # ── Detection (Step 3A) ──
-        # Order:
-        #   1. No browser face data ever → "poor"
-        #   2. Last face message is stale (> ~1.5 s old) → "poor"
-        #   3. Browser flagged calibrating → "fair" (signal isn't
-        #      reliable yet, but the face IS present)
-        #   4. Use eye_contact_pct as a face-visibility proxy: an
-        #      occluded or partially-turned face drops eye_contact
-        #      well before MediaPipe loses tracking entirely.
-        if not browser_face:
-            detection = "poor"
-        elif face_msg_age_s > 1.5:
-            detection = "poor"
-        elif browser_face.get("calibrating"):
-            detection = "fair"
-        else:
-            eye_pct = browser_face.get("eye_contact", 0) or 0
-            face_turned = browser_face.get("face_turned_away", False)
-            if face_turned:
-                detection = "fair"
-            elif eye_pct >= 70:
-                detection = "excellent"
-            elif eye_pct >= 45:
-                detection = "good"
-            elif eye_pct >= 20:
-                detection = "fair"
-            else:
-                detection = "poor"
-
-        # ── Voice pitch (Step 3B) ──
-        # std_hz is the chunk pitch standard deviation. Anchors
-        # match the smooth `vocal_variety` curve in signal_scorer
-        # (logistic centred at 30): below 5 = monotone, 15-50 =
-        # natural conversational range, 50+ = animated.
-        pitch = chunk_result.get("raw", {}).get("pitch") or {}
-        std_hz = float(pitch.get("std_hz") or 0)
-        voiced_s = float(chunk_result.get("raw", {}).get("voiced_s") or 0)
-        if voiced_s < 0.5:
-            voice_pitch = None  # silent chunk — can't measure pitch
-        elif std_hz < 5:
-            voice_pitch = "poor"
-        elif std_hz < 15:
-            voice_pitch = "fair"
-        elif std_hz < 35:
-            voice_pitch = "good"
-        else:
-            voice_pitch = "excellent"
-
-        # ── Noise level (Step 3C) ──
-        # Background-noise RMS measured during silence-only samples.
-        # Anchors observed empirically: a near-silent room reads
-        # ~0.001 from mic self-noise; a typing keyboard sits in the
-        # 0.01-0.02 range; an open window with traffic 0.02-0.05;
-        # genuinely loud environments 0.05+.
-        silence_rms = chunk_result.get("raw", {}).get("silence_rms")
-        if silence_rms is None:
-            noise_level = None  # not yet measured this session
-        elif silence_rms < 0.005:
-            noise_level = "excellent"
-        elif silence_rms < 0.015:
-            noise_level = "good"
-        elif silence_rms < 0.035:
-            noise_level = "fair"
-        else:
-            noise_level = "poor"
-
-        # ── Speech pace (Step 3E right side card) ──
-        # Reuses speech_pace score (already widened to 120-170 wpm
-        # peak in the smooth tent function). Map score → status.
-        pace_score = chunk_result.get("scores", {}).get("speech_pace")
-        if pace_score is None:
-            speech_pace = None
-        elif pace_score >= 85:
-            speech_pace = "excellent"
-        elif pace_score >= 65:
-            speech_pace = "good"
-        elif pace_score >= 45:
-            speech_pace = "fair"
-        else:
-            speech_pace = "poor"
-
-        # ── Worst signal → coaching nudge (Step 3E bottom + 3G) ──
-        # Only the WORST signal is named. None values are skipped so
-        # the nudge doesn't say "Poor pitch" during a silent chunk.
-        STATUS_RANK = {"poor": 0, "fair": 1, "good": 2, "excellent": 3}
-        signals = {
-            "detection": detection,
-            "voice_pitch": voice_pitch,
-            "noise_level": noise_level,
-            "speech_pace": speech_pace,
-        }
-        scoreable = {k: v for k, v in signals.items() if v is not None}
-        worst_key = (
-            min(scoreable, key=lambda k: STATUS_RANK[scoreable[k]])
-            if scoreable else None
-        )
-        worst_status = scoreable.get(worst_key) if worst_key else None
-
-        return {
-            "rolling_total": rolling_total,
-            "detection": detection,
-            "voice_pitch": voice_pitch,
-            "noise_level": noise_level,
-            "speech_pace": speech_pace,
-            # Frontend uses `worst_signal` to pick the nudge message
-            # and to flash the right card. When all signals are
-            # "good" or "excellent", worst_signal stays set (so
-            # the frontend can also detect that case and rotate
-            # encouragement messages) and worst_status is "good"
-            # or "excellent".
-            "worst_signal": worst_key,
-            "worst_status": worst_status,
-        }
-
     async def _process_one_chunk(audio):
         """Consumer body — runs the audio pipeline on one chunk and
         broadcasts the result to the client (unless suppressed by
@@ -2973,7 +3020,9 @@ async def session_ws(ws: WebSocket, session_id: str):
         # by the language gate so the same payload shape is logged
         # consistently in `snapshots` for debugging.
         face_age_s = max(0.0, time.time() - last_face_msg_at) if last_face_msg_at else 999.0
-        result["live_hud"] = _build_live_hud(result, latest_browser_face, face_age_s)
+        result["live_hud"] = _build_live_hud(
+            result, latest_browser_face, face_age_s, hud_total_history,
+        )
 
         snapshots.append(result)
         # Suppress live score broadcasts once the language gate fires
@@ -3270,6 +3319,10 @@ def _run_analyzer_pipeline_sync(
     chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
     pipeline = AudioPipeline()
     snapshots: list[dict] = []
+    # Rolling 4-chunk total used by _build_live_hud — see
+    # _run_upload_pipeline_sync for the rationale.
+    from collections import deque as _hud_deque
+    hud_total_history = _hud_deque(maxlen=4)
 
     if trim_segments:
         try:
@@ -3345,6 +3398,14 @@ def _run_analyzer_pipeline_sync(
                     result["scores"]["eye_contact"] = None
                     result["scores"]["expression"] = None
                     result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
+                    # Same overlay-status block the live + upload paths
+                    # produce. Audio-only flow has no face data so the
+                    # builder's `detection` slot will read "poor" for
+                    # every chunk — the result-screen HUD code-paths
+                    # render that gracefully.
+                    result["live_hud"] = _build_live_hud(
+                        result, {}, 0.0, hud_total_history,
+                    )
                     snapshots.append(result)
                 leftover = buf
             if leftover:
@@ -3355,6 +3416,9 @@ def _run_analyzer_pipeline_sync(
                 result["scores"]["eye_contact"] = None
                 result["scores"]["expression"] = None
                 result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
+                result["live_hud"] = _build_live_hud(
+                    result, {}, 0.0, hud_total_history,
+                )
                 snapshots.append(result)
             try:
                 rc = proc.wait(timeout=30)
@@ -3442,6 +3506,15 @@ def _run_analyzer_pipeline_sync(
         # can always reach absolute-timestamped words even if report.transcript
         # is ever off.
         report["speech_timeline"] = speech_tl
+
+        # live_hud_timeline drives the result-screen HUD overlay. One
+        # entry per processed chunk, stamped with t_s. Audio-only path
+        # contributes "poor" detection but real audio statuses.
+        report["live_hud_timeline"] = [
+            ({**snap["live_hud"], "t_s": i * 3}
+             if snap.get("live_hud") else None)
+            for i, snap in enumerate(snapshots)
+        ]
 
         _complete_media_processing(
             media_id=media_id,
