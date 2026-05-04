@@ -12,6 +12,7 @@ import PermissionScreen from '../components/PermissionScreen'
 import RecordingReview from '../components/RecordingReview'
 import BackgroundPicker from '../components/BackgroundPicker'
 import LiveHUD from '../components/LiveHUD'
+import EmotionMix from '../components/EmotionMix'
 import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import { languageDisplayName } from '../utils/language'
@@ -33,7 +34,7 @@ export default function LiveSession() {
     connectionStatus, unsupportedLanguage, backpressure, calibrating,
     noSpeechDetected,
     scoreHistory, duration,
-    activeCameraLabel, liveHud,
+    activeCameraLabel, liveHud, emotion,
     videoBlob, videoUrl,
     bgMode, setBgMode, segmenterReady, segmenterError,
     setPreviewCanvas,
@@ -162,6 +163,7 @@ export default function LiveSession() {
         speechPace: scores.speech_pace ?? 50,
         fillerWords: scores.filler_words ?? 50,
         vocalVariety: scores.vocal_variety ?? 50,
+        voiceTrembling: scores.voice_trembling ?? null,
         expression: scores.expression ?? 50,
       }
     : null
@@ -377,6 +379,14 @@ export default function LiveSession() {
             </summary>
             <div className="px-5 pb-5 space-y-5 border-t border-border pt-4">
               {barScores && <SignalBars scores={barScores} />}
+              {emotion?.mix && (
+                <div className="border border-border rounded-md px-3 py-2 bg-elevated/50">
+                  <p className="text-xs uppercase tracking-wider text-text-muted font-semibold mb-2">
+                    Live emotion mix
+                  </p>
+                  <EmotionMix emotion={emotion} compact />
+                </div>
+              )}
               <p className="text-xs italic opacity-75 border border-border rounded-md px-3 py-2 bg-elevated/50">
                 Baseline comparison unlocks after 3 sessions. Your post-session report will show how this run compares once you have enough history.
               </p>

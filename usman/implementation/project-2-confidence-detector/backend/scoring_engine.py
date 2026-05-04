@@ -24,9 +24,13 @@ WEIGHTS = {
 }
 
 # Signals tracked in rolling history and echoed back in the update()
-# response for UI display. Superset of WEIGHTS: expression appears here
-# but not in WEIGHTS, so it renders in the UI without biasing the total.
-DISPLAYED_SIGNALS = list(WEIGHTS.keys()) + ['expression']
+# response for UI display. Superset of WEIGHTS: expression and
+# voice_trembling appear here but not in WEIGHTS, so they render in
+# the UI without biasing the weighted total. Voice trembling is fed
+# into the headline number through a fixed penalty (see
+# SignalScorer.trembling_penalty), not as a weighted contribution —
+# this keeps the "−10 to −20 points" spec semantics intact.
+DISPLAYED_SIGNALS = list(WEIGHTS.keys()) + ['expression', 'voice_trembling']
 
 # Rolling window: 4 entries at 500ms intervals = 2 seconds of smoothing.
 # Was 10 (5s). 5s of lag meant a user's score still reflected what they
@@ -42,7 +46,8 @@ class ScoringEngine:
         self.history = {key: deque(maxlen=ROLLING_WINDOW) for key in DISPLAYED_SIGNALS}
         self.total_history = deque(maxlen=ROLLING_WINDOW)
 
-    def compute_sub_scores(self, face_result=None, speech_result=None, audio_result=None):
+    def compute_sub_scores(self, face_result=None, speech_result=None, audio_result=None,
+                           trembling=None):
         """Convert raw signal data into 6 sub-scores (each 0-100).
 
         Returns dict with each sub-score. Missing source data → None
@@ -116,6 +121,16 @@ class ScoringEngine:
         else:
             scores['vocal_variety'] = None
 
+        # --- Voice Trembling (display-only — penalty applied separately) ---
+        # 0-100 score where 100 = rock-steady. Mirrors the audio_pipeline
+        # detector. Excluded from the weighted total because the spec
+        # requires a fixed -10 to -20 penalty rather than a proportional
+        # weight.
+        if trembling and trembling.get("windows", 0) > 0:
+            scores['voice_trembling'] = SignalScorer.voice_trembling(trembling)
+        else:
+            scores['voice_trembling'] = None
+
         # --- Expression (display-only — excluded from total) ---
         if face_result and face_result.get('expression'):
             expr = face_result['expression']
@@ -130,7 +145,7 @@ class ScoringEngine:
 
         return scores
 
-    def update(self, sub_scores):
+    def update(self, sub_scores, trembling=None):
         """Push sub-scores into rolling average and compute weighted total.
 
         `None` for a signal means "no data" — we DON'T push it into
@@ -170,7 +185,12 @@ class ScoringEngine:
             weighted_sum += v * w
             weight_total += w
         if weight_total > 0:
-            total = max(0, min(100, int(round(weighted_sum / weight_total))))
+            base_total = weighted_sum / weight_total
+            # Apply voice-trembling penalty (-10 to -20). Same shape as
+            # SignalScorer.aggregate so the live and per-chunk paths
+            # stay in sync.
+            penalty = SignalScorer.trembling_penalty(trembling)
+            total = max(0, min(100, int(round(max(0.0, base_total - penalty)))))
             self.total_history.append(total)
         else:
             total = 50
@@ -183,6 +203,9 @@ class ScoringEngine:
             'fillerWords': smoothed['filler_words'],
             'vocalVariety': smoothed['vocal_variety'],
             'expression': smoothed['expression'],
+            'voiceTrembling': smoothed.get('voice_trembling'),
+            'tremblingPenalty': SignalScorer.trembling_penalty(trembling),
+            'isTrembling': bool((trembling or {}).get('is_trembling')),
             'timestamp': time.time(),
         }
 

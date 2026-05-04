@@ -212,6 +212,11 @@ def generate_post_session_report(
         "filler_words": avg("filler_words"),
         "vocal_variety": avg("vocal_variety"),
         "expression": avg("expression"),
+        # New signal: voice trembling (jitter+shimmer-derived). Its
+        # 0-100 score is shown in the UI alongside the other signals;
+        # the session-level penalty applied to the headline number is
+        # already baked in per-chunk by SignalScorer.aggregate.
+        "voice_trembling": avg("voice_trembling"),
         "blink_rate": None,
         "tension_score": None,
     }
@@ -223,8 +228,63 @@ def generate_post_session_report(
         "filler_words": stderr("filler_words"),
         "vocal_variety": stderr("vocal_variety"),
         "expression": stderr("expression"),
+        "voice_trembling": stderr("voice_trembling"),
         "total": stderr("total"),
     }
+
+    # ── Voice trembling aggregate ────────────────────────────────────
+    # The per-chunk detector returns jitter, shimmer, instability and an
+    # is_trembling flag. We bubble up the SESSION-level numbers so the
+    # report UI can show a single "voice was trembling for X% of the
+    # session" line. Same denominator (total chunks) so the percentages
+    # are comparable across sessions of different lengths.
+    trembling_chunks = [r.get("trembling") for r in all_raw if r.get("trembling")]
+    n_chunks = max(len(all_raw), 1)
+    if trembling_chunks:
+        avg_jitter = round(
+            sum(float(t.get("jitter_pct") or 0) for t in trembling_chunks)
+            / max(len(trembling_chunks), 1), 2,
+        )
+        avg_shimmer = round(
+            sum(float(t.get("shimmer_pct") or 0) for t in trembling_chunks)
+            / max(len(trembling_chunks), 1), 2,
+        )
+        avg_instability = round(
+            sum(float(t.get("instability") or 0) for t in trembling_chunks)
+            / max(len(trembling_chunks), 1), 3,
+        )
+        trembling_chunk_count = sum(
+            1 for t in trembling_chunks if t.get("is_trembling")
+        )
+        trembling_summary = {
+            "avg_jitter_pct": avg_jitter,
+            "avg_shimmer_pct": avg_shimmer,
+            "avg_instability": avg_instability,
+            "trembling_chunk_count": trembling_chunk_count,
+            "trembling_chunk_pct": round(trembling_chunk_count / n_chunks * 100, 1),
+            "is_trembling_session": trembling_chunk_count >= max(2, n_chunks // 4),
+        }
+    else:
+        trembling_summary = {
+            "avg_jitter_pct": 0.0,
+            "avg_shimmer_pct": 0.0,
+            "avg_instability": 0.0,
+            "trembling_chunk_count": 0,
+            "trembling_chunk_pct": 0.0,
+            "is_trembling_session": False,
+        }
+
+    # ── Emotion mix aggregate ───────────────────────────────────────
+    # Combine per-chunk multi-label probabilities into a single session
+    # mix that sums to 1.0. Frontend renders this as a stacked bar /
+    # legend ("60% nervous, 30% confident, 10% excited").
+    try:
+        from emotion_detector import aggregate_emotion_mixes
+        emotion_summary = aggregate_emotion_mixes(
+            [s.get("emotion") for s in snapshots if s.get("emotion")]
+        )
+    except Exception:
+        emotion_summary = {"mix": None, "dominant": None, "dominant_pct": None}
 
     # ── Filler word breakdown ────────────────────────────────────────
     filler_counts = {}
@@ -375,6 +435,58 @@ def generate_post_session_report(
             "Voice trembling detected — nervousness was audible."
         )
 
+    # Dedicated trembling insight (jitter+shimmer detector, separate
+    # from the broader voice_steadiness signal). Surfaces the % of the
+    # session where the speaker's voice was actively shivering, plus a
+    # nudge to slow down + breathe.
+    if trembling_summary.get("is_trembling_session"):
+        pct = trembling_summary.get("trembling_chunk_pct", 0)
+        insights.append(
+            f"Voice was trembling/shivering during {pct}% of the session "
+            f"(jitter {trembling_summary['avg_jitter_pct']}%, "
+            f"shimmer {trembling_summary['avg_shimmer_pct']}%). "
+            "This is a strong nervousness signal — try a slow breath "
+            "before key sentences."
+        )
+
+    # Dominant-emotion insight. Skipped when the mix is None (silent
+    # session) or the dominant label is benign (calm/confident at low
+    # confidence wouldn't be useful for the user to see).
+    em_mix = (emotion_summary or {}).get("mix")
+    em_dom = (emotion_summary or {}).get("dominant")
+    em_pct = (emotion_summary or {}).get("dominant_pct")
+    if em_mix and em_dom and em_pct is not None and em_pct >= 40:
+        if em_dom in ("nervous", "hesitant", "monotone"):
+            insights.append(
+                f"Tone read as {em_dom} for ~{em_pct}% of the session. "
+                "Mix in confident phrasing and steady pacing to balance it."
+            )
+        elif em_dom == "excited":
+            insights.append(
+                f"Energy was high ({em_pct}% excited). Make sure your "
+                "audience can keep up — drop into measured pacing for the "
+                "key points."
+            )
+        elif em_dom == "bored":
+            insights.append(
+                f"Energy was flat for ~{em_pct}% of the session. Add "
+                "audience cues — questions, contrasts, varied pace — to "
+                "keep them with you."
+            )
+        elif em_dom == "sad":
+            insights.append(
+                f"Tone read low / subdued ({em_pct}% sad). If that wasn't "
+                "the intent, lift your pitch and energy on key sentences."
+            )
+        elif em_dom == "angry":
+            insights.append(
+                f"Tone read sharp / heated ({em_pct}% angry). Consider "
+                "softening delivery on contentious points unless the "
+                "heat is intentional."
+            )
+        # `engaged` and `confident` are positive labels — no insight,
+        # the headline + signal bars already say "good job".
+
     if signal_avgs["vocal_variety"] is not None and signal_avgs["vocal_variety"] < 50:
         insights.append(
             "Delivery was monotone. Vary your pitch to stay engaging."
@@ -431,8 +543,23 @@ def generate_post_session_report(
             "speech_pace": _or_null(s.get("speech_pace")),
             "filler_words": s.get("filler_words", 0),
             "vocal_variety": s.get("vocal_variety", 0),
+            "voice_trembling": _or_null(s.get("voice_trembling")),
+            # Dominant emotion + its weight at this chunk; the full
+            # mix lives in `emotion_timeline` below for callers that
+            # want to render a stacked area chart.
+            "emotion_dominant": (snapshots[i].get("emotion") or {}).get("dominant"),
+            "emotion_dominant_pct": (snapshots[i].get("emotion") or {}).get("dominant_pct"),
         }
         for i, s in enumerate(all_scores)
+    ]
+    emotion_timeline = [
+        {
+            "t_s": i * 3,
+            "mix": (snap.get("emotion") or {}).get("mix"),
+            "dominant": (snap.get("emotion") or {}).get("dominant"),
+            "dominant_pct": (snap.get("emotion") or {}).get("dominant_pct"),
+        }
+        for i, snap in enumerate(snapshots)
     ]
 
     # ── Full transcript with filler markers ──────────────────────────
@@ -546,6 +673,19 @@ def generate_post_session_report(
         "improvements": list(action_items or []),
         "timeline": timeline,
         "transcript": transcript,
+        # Voice trembling (jitter + shimmer) — session-level rollup of
+        # the per-chunk detector. Frontend renders a "Voice Trembling"
+        # row in SignalBars and (if `is_trembling_session`) a callout in
+        # the insights panel. The penalty applied to the headline score
+        # is already baked in per-chunk; this object is for display
+        # only.
+        "voice_trembling": trembling_summary,
+        # Multi-label emotion mix — session aggregate plus the per-chunk
+        # timeline. Frontend renders the session mix as a stacked
+        # legend ("60% nervous, 30% confident, 10% excited") and uses
+        # the timeline for the result-screen tooltip on the score chart.
+        "emotion": emotion_summary,
+        "emotion_timeline": emotion_timeline,
     }
 
     # ── LLM coaching (Gemini Flash-Lite) ─────────────────────────────

@@ -63,6 +63,10 @@ export default function useLiveSession() {
   // separate state so the LiveHUD overlay can subscribe just to
   // it and not re-render on transcript appends.
   const [liveHud, setLiveHud] = useState(null)
+  // Per-chunk multi-label emotion mix (audio_pipeline.process_chunk
+  // emits this at the top level, not inside `scores`). Frontend
+  // EmotionMix component reads it as a stacked-bar visual.
+  const [emotion, setEmotion] = useState(null)
   // null when the input is English (or not yet probed). Set to the
   // detected language code (e.g. "hi", "es") once the backend's
   // multilingual probe (in audio_pipeline.AudioPipeline) decides
@@ -291,6 +295,7 @@ export default function useLiveSession() {
     recorderRef.current = null
     lastTranscriptAppendRef.current = ''
     setLiveHud(null)
+    setEmotion(null)
     setActiveCameraLabel('')
   }, [videoUrl])
 
@@ -375,6 +380,7 @@ export default function useLiveSession() {
     setCalibrating(false)
     setNoSpeechDetected(false)
     setLiveHud(null)
+    setEmotion(null)
     setActiveCameraLabel('')
     silentChunkCountRef.current = 0
     if (backpressureTimerRef.current) {
@@ -521,6 +527,12 @@ export default function useLiveSession() {
           // LiveHUD component subscribes to this state directly.
           if (data.live_hud) {
             setLiveHud(data.live_hud)
+          }
+          // Multi-label emotion mix per chunk. Always set (even when
+          // .mix is null) so the EmotionMix card can render its
+          // "no audio captured" placeholder cleanly.
+          if (data.emotion !== undefined) {
+            setEmotion(data.emotion || null)
           }
 
           // Score update per chunk
@@ -772,6 +784,7 @@ export default function useLiveSession() {
     recorderRef.current = null
     lastTranscriptAppendRef.current = ''
     setLiveHud(null)
+    setEmotion(null)
     setActiveCameraLabel('')
   }, [])
 
@@ -817,6 +830,7 @@ export default function useLiveSession() {
     faceScores,
     activeCameraLabel,
     liveHud,
+    emotion,
     videoBlob,
     videoUrl,
     remoteVideoUrl,

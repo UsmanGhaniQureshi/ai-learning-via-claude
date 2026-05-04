@@ -38,16 +38,27 @@ export default function HowItWorks() {
         <strong className="block mb-2 text-text-primary">On this page</strong>
         <ul className="space-y-1 pl-4 list-disc text-sm">
           <li><a href="#overall-score" className="text-text-accent hover:underline">Overall score</a></li>
-          {signals.map((s) => (
-            <li key={s.key}>
-              <a href={`#${s.anchor}`} className="text-text-accent hover:underline">
-                {s.label}{' '}
-                <span className="text-text-muted">
-                  ({s.weight_pct > 0 ? `${s.weight_pct}% of total` : 'display only'})
-                </span>
-              </a>
-            </li>
-          ))}
+          <li>
+            <a href="#emotion-mix" className="text-text-accent hover:underline">
+              Emotion mix{' '}
+              <span className="text-text-muted">(display only — 10 labels)</span>
+            </a>
+          </li>
+          {signals.map((s) => {
+            const tag =
+              s.key === 'voice_trembling'
+                ? '−10 to −20 penalty'
+                : s.weight_pct > 0
+                  ? `${s.weight_pct}% of total`
+                  : 'display only'
+            return (
+              <li key={s.key}>
+                <a href={`#${s.anchor}`} className="text-text-accent hover:underline">
+                  {s.label} <span className="text-text-muted">({tag})</span>
+                </a>
+              </li>
+            )
+          })}
           <li><a href="#glossary" className="text-text-accent hover:underline">Glossary</a></li>
           <li><a href="#faq" className="text-text-accent hover:underline">FAQ</a></li>
         </ul>
@@ -55,7 +66,7 @@ export default function HowItWorks() {
 
       <Section id="overall-score" title="Overall score">
         <p>
-          The headline 0-100 number on every report is a weighted combination of <strong>five</strong> signals (Voice Steadiness, Eye Contact, Speech Pace, Filler Words, Vocal Variety). Expression is computed and shown but <strong>does NOT</strong> contribute to the total — its underlying mapping is arbitrary and culturally biased.
+          The headline 0-100 number on every report is a weighted combination of <strong>five</strong> signals (Voice Steadiness, Eye Contact, Speech Pace, Filler Words, Vocal Variety), then a fixed <strong>Voice Trembling</strong> penalty is subtracted when applicable. Expression and Emotion Mix are shown for awareness but <strong>do NOT</strong> contribute directly to the total.
         </p>
         <p>The current weights are:</p>
         <table className="w-full text-sm my-3">
@@ -74,35 +85,93 @@ export default function HowItWorks() {
                 <td className="py-2 px-2 text-right">{s.weight_pct}%</td>
               </tr>
             ))}
+            <tr className="border-b border-border/40">
+              <td className="py-2 px-2">
+                <a href="#voice-trembling" className="text-text-accent hover:underline">Voice Trembling penalty</a>
+              </td>
+              <td className="py-2 px-2 text-right">−10 to −20</td>
+            </tr>
             <tr>
               <td className="py-2 px-2"><em>Total</em></td>
-              <td className="py-2 px-2 text-right">100%</td>
+              <td className="py-2 px-2 text-right">100% − penalty</td>
             </tr>
           </tbody>
         </table>
         <p>
           Each per-chunk score (every 3 seconds of recording) gets one number; the report you see averages those across the session. Silent chunks are excluded from speech-pace specifically so a long pause doesn&apos;t drag your pace down.
         </p>
+        <p>
+          <strong className="text-text-primary">How the trembling penalty works:</strong> per chunk we measure period-to-period pitch jitter and amplitude shimmer in 200&nbsp;ms windows. When jitter exceeds 1.04% or shimmer exceeds 3.81% (Praat&apos;s outside-normal thresholds) <em>and</em> the combined instability score is above 0.35, the chunk is flagged. The flag costs 10 points at threshold severity, scaling up to 20 at severe shivering. Steady chunks pay nothing.
+        </p>
         <div className="bg-[rgba(6,182,212,0.1)] border border-[rgba(6,182,212,0.3)] rounded-md p-3 text-sm">
           <strong className="text-cyan">Honest caveat:</strong> these weights are reasonable defaults pulled from presentation-coaching literature, NOT empirically fit against a labelled dataset of confident vs un-confident speakers. Use the score as a self-comparison tool over your own sessions.
         </div>
       </Section>
 
-      {signals.map((s) => (
-        <Section
-          key={s.key}
-          id={s.anchor}
-          title={s.label}
-          subtitle={s.weight_pct > 0 ? `${s.weight_pct}% of total score` : 'Display only — not in score'}
-        >
-          <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">What it measures</h4>
-          <p>{s.detail}</p>
-          <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">What good looks like</h4>
-          <p>{s.good}</p>
-          <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">Known limitations</h4>
-          <p className="opacity-85">{s.limits}</p>
-        </Section>
-      ))}
+      <Section id="emotion-mix" title="Emotion mix">
+        <p>
+          Alongside the score, the report shows an <strong>emotion mix</strong> — a probability distribution over 10 labels that always sums to 100%. It answers &quot;how did the speaker actually sound?&quot; rather than &quot;how high did they score?&quot;.
+        </p>
+        <p>
+          The detector combines <strong>lexical signals</strong> (filler density, hedge phrases, assertive phrases, repetition rate, excited / calm / angry / sad token density, audience-direct verbs) with <strong>prosodic signals</strong> (pitch mean and SD, speech rate, RMS, RMS variation, pitch tremor, jitter %, shimmer %). Each of the 10 labels accumulates a raw score, then a softmax (temperature 2.0) converts those into the visible mix. Runner-ups are kept visible — a typical chunk reads as something like &quot;55% nervous, 20% hesitant, 12% confident, …&quot; rather than collapsing to one label.
+        </p>
+        <p>The 10 labels:</p>
+        <table className="w-full text-sm my-3">
+          <thead>
+            <tr className="text-left text-text-muted border-b border-border">
+              <th className="py-2 px-2 font-semibold">Label</th>
+              <th className="py-2 px-2 font-semibold">Strongest evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[
+              ['nervous', 'Fillers, hedges, raised pitch, tremor / jitter / shimmer.'],
+              ['confident', 'Assertive phrases, low fillers, WPM near 145, steady pitch, varied delivery.'],
+              ['excited', 'Excited tokens, fast WPM, high pitch SD, loud variable energy.'],
+              ['calm', 'Calm-marker tokens, low pitch arousal, slow rate, no tremor (with some pitch life).'],
+              ['hesitant', 'Many fillers + hedges + slow WPM + repetition.'],
+              ['monotone', 'Very low pitch SD and / or very flat RMS variation.'],
+              ['engaged', 'Audience-direct verbs (imagine / picture / look), good variety, centred WPM, audible energy variation.'],
+              ['bored', 'Low pitch SD AND (low RMS or slow WPM) AND flat energy. Compound — pitch flatness alone is monotone, not bored.'],
+              ['angry', 'Sharp negatives (wrong / never / ridiculous), loud RMS, raised pitch, fast WPM. Penalised when energy is low.'],
+              ['sad', 'Subdued tokens (unfortunately / sorry / wish), low pitch mean, slow WPM, quiet energy.'],
+            ].map(([label, evidence]) => (
+              <tr key={label} className="border-b border-border/40">
+                <td className="py-2 px-2 font-semibold text-text-primary">{label}</td>
+                <td className="py-2 px-2">{evidence}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">What good looks like</h4>
+        <p>This isn&apos;t a pass/fail signal — it&apos;s diagnostic. A teacher delivering a lesson should land near &quot;engaged&quot; and &quot;calm&quot;; a sales pitch might want some &quot;excited&quot; in the mix; an apology should read sad-not-angry. Use it to confirm your delivery matched your intent.</p>
+        <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">Known limitations</h4>
+        <p className="opacity-85">The token lists are English-only and intentionally small to avoid false positives. The prosodic mappings (pitch arousal, WPM ramp) are coarse and not per-speaker calibrated. Treat percentages as relative weights, not ground-truth probabilities.</p>
+      </Section>
+
+      {signals.map((s) => {
+        const subtitle =
+          s.key === 'voice_trembling'
+            ? 'Fixed −10 to −20 penalty applied to the headline'
+            : s.weight_pct > 0
+              ? `${s.weight_pct}% of total score`
+              : 'Display only — not in score'
+        return (
+          <Section
+            key={s.key}
+            id={s.anchor}
+            title={s.label}
+            subtitle={subtitle}
+          >
+            <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">What it measures</h4>
+            <p>{s.detail}</p>
+            <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">What good looks like</h4>
+            <p>{s.good}</p>
+            <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">Known limitations</h4>
+            <p className="opacity-85">{s.limits}</p>
+          </Section>
+        )
+      })}
 
       <Section id="glossary" title="Glossary">
         <dl className="space-y-3">

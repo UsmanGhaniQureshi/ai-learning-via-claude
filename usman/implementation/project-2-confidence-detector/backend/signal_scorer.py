@@ -191,6 +191,54 @@ class SignalScorer:
         return penalty
 
     @staticmethod
+    def voice_trembling(trembling, voiced_s=None):
+        """Score voice trembling/shivering as a 0-100 signal where 100
+        means "rock-steady voice" and lower means audible instability.
+
+        Reads the dict produced by `audio_pipeline.compute_voice_trembling`:
+            { jitter_pct, shimmer_pct, instability (0-1), is_trembling, windows }
+
+        Mapping:
+          - instability 0.00 (rock steady)        → 100
+          - instability 0.35 (Praat trembling)    → 60
+          - instability 0.70 (clearly shivering)  → 25
+          - instability 1.00 (severe)             →  0
+
+        Returns None on a silent chunk (voiced_s < 0.5) or when no
+        windows contributed — there's nothing to measure, not a perfect 100.
+        """
+        if voiced_s is not None and voiced_s < 0.5:
+            return None
+        if not trembling or trembling.get("windows", 0) == 0:
+            return None
+        instability = float(trembling.get("instability") or 0.0)
+        # Linear curve anchored to the four points above. Easy to reason
+        # about; if we want a smoother shape later, swap in an
+        # exponential.
+        score = 100.0 - instability * 100.0
+        return max(0, min(100, round(score)))
+
+    @staticmethod
+    def trembling_penalty(trembling) -> int:
+        """Penalty (0-20 points) subtracted from the aggregate confidence
+        score when the speaker's voice is trembling.
+
+        Spec: "weight: -10 to -20 points" applied to the overall score.
+        We scale linearly with `instability` so small wobbles cost ~10
+        and severe shivering costs the full 20. Returns 0 when no
+        trembling was detected (so the aggregate stays unchanged) and
+        when the trembling dict is missing entirely.
+        """
+        if not trembling:
+            return 0
+        if not trembling.get("is_trembling"):
+            return 0
+        instability = float(trembling.get("instability") or 0.0)
+        # Map 0.35 → 10 (entry threshold), 1.0 → 20 (severe).
+        scaled = 10.0 + (max(instability, 0.35) - 0.35) / 0.65 * 10.0
+        return int(round(max(10, min(20, scaled))))
+
+    @staticmethod
     def vocal_variety(pitch, voiced_s=None):
         """Score vocal variety from pitch standard deviation.
 
@@ -210,7 +258,7 @@ class SignalScorer:
         return max(0, min(100, round(score)))
 
     @staticmethod
-    def aggregate(signals):
+    def aggregate(signals, trembling=None):
         """Compute weighted aggregate confidence score.
 
         Expression is deliberately excluded — its mapping (happy 90,
@@ -258,4 +306,12 @@ class SignalScorer:
             weight_total += w
         if weight_total <= 0:
             return None
-        return round(weighted_sum / weight_total)
+        total = weighted_sum / weight_total
+        # Voice-trembling penalty (-10 to -20). Applied after the
+        # weighted average so it carries a fixed, predictable cost
+        # regardless of how the other signals split their weight on a
+        # given chunk.
+        penalty = SignalScorer.trembling_penalty(trembling)
+        if penalty:
+            total = max(0.0, total - penalty)
+        return round(total)

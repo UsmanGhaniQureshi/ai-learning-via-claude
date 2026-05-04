@@ -2183,11 +2183,57 @@ def _run_upload_pipeline_sync(
             )
             return
 
+        # Session-level voice-trembling rollup. The per-chunk
+        # SignalScorer.aggregate() already applied a trembling penalty
+        # to each chunk's `total`, but compute_sub_scores+update below
+        # operate on session-AVERAGED sub-scores — so without a
+        # session-level `trembling` argument, the penalty would be
+        # lost on the headline number this endpoint returns. Mirrors
+        # the heuristic in report_generator.py:trembling_summary:
+        # session is "trembling" if at least 25% of chunks (min 2)
+        # were flagged.
+        _trembling_chunks = [
+            s.get("raw", {}).get("trembling")
+            for s in snapshots
+            if s.get("raw", {}).get("trembling")
+        ]
+        _trembling_flag_count = sum(
+            1 for t in _trembling_chunks if t.get("is_trembling")
+        )
+        if _trembling_chunks:
+            _avg_inst = sum(
+                float(t.get("instability") or 0) for t in _trembling_chunks
+            ) / max(len(_trembling_chunks), 1)
+            _avg_jitter = sum(
+                float(t.get("jitter_pct") or 0) for t in _trembling_chunks
+            ) / max(len(_trembling_chunks), 1)
+            _avg_shimmer = sum(
+                float(t.get("shimmer_pct") or 0) for t in _trembling_chunks
+            ) / max(len(_trembling_chunks), 1)
+            _is_trembling_session = (
+                _trembling_flag_count >= max(2, len(snapshots) // 4)
+            )
+        else:
+            _avg_inst = 0.0
+            _avg_jitter = 0.0
+            _avg_shimmer = 0.0
+            _is_trembling_session = False
+        session_trembling = {
+            "jitter_pct": round(_avg_jitter, 3),
+            "shimmer_pct": round(_avg_shimmer, 3),
+            "instability": round(_avg_inst, 3),
+            "is_trembling": _is_trembling_session,
+            "windows": sum(int(t.get("windows") or 0) for t in _trembling_chunks),
+        }
+
         # Compute sub-scores via scoring engine. Missing inputs return
         # None now (not 50) — see scoring_engine.compute_sub_scores
         # docstring for why.
         upload_scoring = ScoringEngine()
-        sub_scores = upload_scoring.compute_sub_scores(avg_face_result, avg_speech_result, avg_audio_result)
+        sub_scores = upload_scoring.compute_sub_scores(
+            avg_face_result, avg_speech_result, avg_audio_result,
+            trembling=session_trembling,
+        )
 
         # Fix 4: when no face was detected anywhere in the clip, the
         # face_result we built was None already so eye_contact and
@@ -2203,8 +2249,46 @@ def _run_upload_pipeline_sync(
         # the short-circuit above this block — if we got here, the
         # input was English and we proceed to score normally.
 
-        final_scores = upload_scoring.update(sub_scores)
+        # Pass the session-level trembling block so update() applies
+        # the −10/−20 penalty to the session headline (matching what
+        # the per-chunk path already does).
+        final_scores = upload_scoring.update(sub_scores, trembling=session_trembling)
         overall_score = final_scores['total']
+
+        # Session-level emotion mix. report_generator does the same
+        # via aggregate_emotion_mixes(...) — we call it directly here
+        # because upload_video bypasses generate_post_session_report.
+        try:
+            from emotion_detector import aggregate_emotion_mixes
+            emotion_summary = aggregate_emotion_mixes(
+                [s.get("emotion") for s in snapshots if s.get("emotion")]
+            )
+        except Exception:
+            emotion_summary = {"mix": None, "dominant": None, "dominant_pct": None}
+        emotion_timeline = [
+            {
+                "t_s": i * 3,
+                "mix": (snap.get("emotion") or {}).get("mix"),
+                "dominant": (snap.get("emotion") or {}).get("dominant"),
+                "dominant_pct": (snap.get("emotion") or {}).get("dominant_pct"),
+            }
+            for i, snap in enumerate(snapshots)
+        ]
+
+        # Voice-trembling summary block (matches the shape produced
+        # by report_generator so the frontend's SessionReport "How
+        # you sounded" card renders identically across all four
+        # pipelines).
+        voice_trembling_summary = {
+            "avg_jitter_pct": round(_avg_jitter, 2),
+            "avg_shimmer_pct": round(_avg_shimmer, 2),
+            "avg_instability": round(_avg_inst, 3),
+            "trembling_chunk_count": _trembling_flag_count,
+            "trembling_chunk_pct": round(
+                _trembling_flag_count / max(len(snapshots), 1) * 100, 1
+            ),
+            "is_trembling_session": _is_trembling_session,
+        }
 
         # Item 3 (uncertainty band): per-chunk variance of the headline.
         # ScoringEngine.update is called once over session-averaged
@@ -2373,7 +2457,15 @@ def _run_upload_pipeline_sync(
                 'fillerWords': final_scores['fillerWords'],
                 'vocalVariety': final_scores['vocalVariety'],
                 'expression': final_scores['expression'],
+                'voiceTrembling': final_scores.get('voiceTrembling'),
             },
+            # Session-level voice-trembling + emotion blocks. Same
+            # shape generate_post_session_report produces for the
+            # other three pipelines, so SessionReport.jsx renders the
+            # "How you sounded" card identically here.
+            'voice_trembling': voice_trembling_summary,
+            'emotion': emotion_summary,
+            'emotion_timeline': emotion_timeline,
             'tips': generate_tips(final_scores),
             'speech_summary': speech_summary,
             'face_timeline': face_results_by_time,
@@ -2393,6 +2485,7 @@ def _run_upload_pipeline_sync(
                 'filler_words': final_scores.get('fillerWords'),
                 'vocal_variety': final_scores.get('vocalVariety'),
                 'expression': final_scores.get('expression'),
+                'voice_trembling': final_scores.get('voiceTrembling'),
                 'blink_rate': (avg_face_result or {}).get('blink_rate'),
                 'tension_score': (avg_face_result or {}).get('tension_score'),
                 'posture': (avg_face_result or {}).get('posture'),
@@ -2996,7 +3089,10 @@ async def session_ws(ws: WebSocket, session_id: str):
                 "tension_score": latest_browser_face.get("tension"),
                 "expression_label": latest_browser_face.get("expression_label"),
             }
-            result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
+            result["scores"]["total"] = SignalScorer.aggregate(
+                result["scores"],
+                trembling=result.get("raw", {}).get("trembling"),
+            )
 
         # English-only enforcement (Batch 2). See top of session_ws
         # for the rationale; here we just react to the field set by
@@ -3397,7 +3493,10 @@ def _run_analyzer_pipeline_sync(
                     # audio-only clip.
                     result["scores"]["eye_contact"] = None
                     result["scores"]["expression"] = None
-                    result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
+                    result["scores"]["total"] = SignalScorer.aggregate(
+                        result["scores"],
+                        trembling=result.get("raw", {}).get("trembling"),
+                    )
                     # Same overlay-status block the live + upload paths
                     # produce. Audio-only flow has no face data so the
                     # builder's `detection` slot will read "poor" for
@@ -3415,7 +3514,10 @@ def _run_analyzer_pipeline_sync(
                 result = pipeline.process_chunk(arr, sr=16000)
                 result["scores"]["eye_contact"] = None
                 result["scores"]["expression"] = None
-                result["scores"]["total"] = SignalScorer.aggregate(result["scores"])
+                result["scores"]["total"] = SignalScorer.aggregate(
+                    result["scores"],
+                    trembling=result.get("raw", {}).get("trembling"),
+                )
                 result["live_hud"] = _build_live_hud(
                     result, {}, 0.0, hud_total_history,
                 )

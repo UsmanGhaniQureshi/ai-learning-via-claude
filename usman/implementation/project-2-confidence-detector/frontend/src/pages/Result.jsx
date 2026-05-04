@@ -18,6 +18,7 @@ import CommentsThread from '../components/CommentsThread'
 import ShareModal from '../components/ShareModal'
 import ScoreBreakdownPanel from '../components/ScoreBreakdownPanel'
 import ResultHUD from '../components/ResultHUD'
+import EmotionMix from '../components/EmotionMix'
 
 export default function Result() {
   const { id } = useParams()
@@ -577,6 +578,61 @@ function UploadedMediaResult({
             )}
           </section>
 
+          {/* "How you sounded" card — emotion mix + voice trembling
+              callout. Matches the live SessionReport layout so the
+              upload-video / upload-audio flows render the same shape. */}
+          {(data.emotion?.mix || data.voice_trembling) && (
+            <section className="glass-card p-5 space-y-5">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <h3 className="m-0">How you sounded</h3>
+                <span className="text-xs text-text-muted">
+                  Emotion mix combines transcript wording with pitch / energy / rate.
+                </span>
+              </div>
+
+              {data.emotion?.mix ? (
+                <EmotionMix emotion={data.emotion} />
+              ) : (
+                <p className="text-sm text-text-muted italic">
+                  Emotion mix unavailable — no audio captured.
+                </p>
+              )}
+
+              {data.voice_trembling && (
+                <div
+                  className={
+                    data.voice_trembling.is_trembling_session
+                      ? 'rounded-md p-3 bg-[rgba(239,68,68,0.08)] border border-[rgba(239,68,68,0.3)]'
+                      : 'rounded-md p-3 bg-elevated border border-border'
+                  }
+                >
+                  <div className="flex items-baseline justify-between gap-3 flex-wrap">
+                    <span className="text-sm font-semibold text-text-primary">
+                      Voice Trembling
+                    </span>
+                    <span className={
+                      data.voice_trembling.is_trembling_session
+                        ? 'text-sm font-bold text-danger'
+                        : 'text-sm font-bold text-success'
+                    }>
+                      {data.voice_trembling.is_trembling_session
+                        ? `Detected — ${data.voice_trembling.trembling_chunk_pct}% of session`
+                        : 'Steady'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-text-muted mt-1">
+                    Jitter {data.voice_trembling.avg_jitter_pct}% · Shimmer{' '}
+                    {data.voice_trembling.avg_shimmer_pct}% · Instability{' '}
+                    {Math.round((data.voice_trembling.avg_instability || 0) * 100)}/100
+                    {data.voice_trembling.is_trembling_session && (
+                      <>{' '}· Penalty applied to confidence score.</>
+                    )}
+                  </p>
+                </div>
+              )}
+            </section>
+          )}
+
           <details className="details-section">
             <summary>Detailed Breakdown</summary>
             <div className="mt-5 space-y-6">
@@ -601,6 +657,8 @@ function UploadedMediaResult({
                   baselineNote={data.baseline_note}
                   hiddenSignals={mode === 'audio' ? ['eye_contact', 'expression'] : []}
                   transcriptConfidence={data.transcript_confidence}
+                  voiceTrembling={data.voice_trembling}
+                  emotion={data.emotion}
                 />
               )}
 

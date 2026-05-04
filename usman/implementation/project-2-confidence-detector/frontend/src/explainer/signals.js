@@ -85,6 +85,20 @@ export const SIGNAL_DEFS = {
     weight_pct: 12,
   },
 
+  voice_trembling: {
+    key: 'voice_trembling',
+    label: 'Voice Trembling',
+    short:
+      'Detects when your voice is shivering or wavering — period-to-period jitter and amplitude shimmer over short rolling windows.',
+    detail:
+      'Splits each 3-second chunk into rolling 200ms windows and measures jitter (cycle-to-cycle pitch period instability, %) and shimmer (cycle-to-cycle amplitude instability, %). Praat\'s "outside normal" thresholds are 1.04% jitter / 3.81% shimmer — when either is exceeded AND the combined instability score is above 0.35, the chunk is flagged as trembling. A trembling chunk costs the headline confidence score 10–20 points depending on severity.',
+    good: '90–100 = rock-steady voice. Below 60 = audible shivering / wavering, the strongest acoustic nervousness signal we measure.',
+    limits:
+      'Microphone noise can inflate shimmer slightly on cheap headsets. The penalty is only applied when BOTH jitter/shimmer exceed Praat thresholds and the combined instability score is above 0.35, which keeps single-window glitches from dragging the score down.',
+    anchor: 'voice-trembling',
+    weight_pct: 0,
+  },
+
   expression: {
     key: 'expression',
     label: 'Expression',
@@ -155,5 +169,17 @@ export const FAQ = [
   {
     q: 'Why did my filler count include "so" / "right" / "well"?',
     a: 'It shouldn\'t — we removed those from the filler list because they\'re legitimate discourse markers. If you see one in your filler list, that\'s a bug worth reporting.',
+  },
+  {
+    q: 'My headline score is lower than the per-signal sum. Why?',
+    a: 'When voice trembling is detected, a fixed 10–20 point penalty is subtracted AFTER the weighted average is computed. The Score Breakdown panel shows this as a separate "Voice Trembling penalty" row so the gap is explicit. If your voice was steady the entire session, the penalty is 0 and the rounded headline matches the row sum to within ±1 point of rounding noise.',
+  },
+  {
+    q: 'My emotion mix says 55% nervous + 20% confident + 15% hesitant. Which one am I?',
+    a: 'All three, weighted. The mix is a probability distribution that always sums to 100% — there is no single "winning" label. Read it as "the dominant tone was nervous, but you also showed real confident moments and some hesitancy". Use it diagnostically: a teacher should land near engaged + calm; an apology should read sad-not-angry; a sales pitch can use some excited.',
+  },
+  {
+    q: 'How is the emotion mix different from the face Expression signal?',
+    a: 'Expression looks at your face (MediaPipe blendshapes — happy, sad, neutral, focused, etc.) and is shown for awareness only. Emotion Mix looks at your VOICE and WORDS — pitch, energy, rate, jitter, shimmer, plus filler / hedge / assertive / excited / angry / sad token density. They\'re separate because the face and the voice often disagree (a smiling speaker can sound nervous, a deadpan one can sound confident).',
   },
 ]

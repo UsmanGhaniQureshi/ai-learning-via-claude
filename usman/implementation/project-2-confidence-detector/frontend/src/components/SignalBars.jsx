@@ -6,6 +6,12 @@ const SIGNALS = [
   { key: 'speechPace',     signalDef: 'speech_pace',      label: 'Speech Pace',      weight: '20%', face: false },
   { key: 'fillerWords',    signalDef: 'filler_words',     label: 'Filler Words',     weight: '20%', face: false },
   { key: 'vocalVariety',   signalDef: 'vocal_variety',    label: 'Vocal Variety',    weight: '12%', face: false },
+  // Voice trembling: jitter + shimmer detector. Weight tag reads
+  // "−10 to −20" because it isn't part of the weighted average — it
+  // applies a fixed penalty to the headline number when the speaker's
+  // voice is actively shivering. Renders alongside the other audio
+  // bars so the user can see WHY the headline dropped.
+  { key: 'voiceTrembling', signalDef: 'voice_trembling',  label: 'Voice Trembling',  weight: '−10 to −20', face: false },
   { key: 'expression',     signalDef: 'expression',       label: 'Expression',       weight: 'display', face: true },
 ]
 

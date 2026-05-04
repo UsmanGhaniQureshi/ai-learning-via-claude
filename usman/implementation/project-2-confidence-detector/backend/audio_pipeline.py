@@ -243,6 +243,157 @@ def detect_filler_sounds_acoustic(audio, sr=16000):
     return segments
 
 
+# ── Voice trembling: jitter + shimmer over rolling windows ─────────
+def compute_voice_trembling(audio, sr=16000, window_ms=200, hop_ms=100):
+    """Detect voice trembling/shivering via period-to-period jitter
+    (pitch instability) and amplitude shimmer (loudness instability)
+    over short rolling windows.
+
+    Spec: 100-300ms windows. We use 200 ms windows hopped by 100 ms,
+    which gives a smooth instability curve while keeping the per-window
+    pitch estimate stable enough for short utterances.
+
+    Definitions (Praat-style, "local"):
+      jitter (local)  = mean(|T_i - T_{i-1}|) / mean(T)            [%]
+      shimmer (local) = mean(|A_i - A_{i-1}|) / mean(A)            [%]
+
+    where T_i is the i-th glottal period (1 / F0_i) and A_i is the
+    peak amplitude of the i-th cycle. Both are computed inside each
+    rolling window, then averaged across windows that contained
+    enough voiced cycles to be reliable.
+
+    Threshold (Praat reference):
+      jitter (local) > 1.040%  → outside normal range
+      shimmer (local) > 3.810% → outside normal range
+    We flag `is_trembling=True` when EITHER metric exceeds its
+    threshold AND a derived `instability` score (combined, normalised
+    to 0-1) is above 0.35. The threshold-pair gate removes false
+    positives from a single noisy window.
+
+    Returns:
+        {
+          "jitter_pct":   float,   # 0-30 typical, normal speech 0.5-1.5
+          "shimmer_pct":  float,   # 0-30 typical, normal speech 1-4
+          "instability":  float,   # 0-1 combined score
+          "is_trembling": bool,
+          "windows":      int,     # number of windows that contributed
+        }
+    """
+    import librosa
+
+    if audio is None or len(audio) < int(0.2 * sr):
+        return {
+            "jitter_pct": 0.0,
+            "shimmer_pct": 0.0,
+            "instability": 0.0,
+            "is_trembling": False,
+            "windows": 0,
+        }
+
+    win = int(window_ms / 1000 * sr)
+    hop = int(hop_ms / 1000 * sr)
+    win = max(win, int(0.1 * sr))
+    hop = max(hop, int(0.05 * sr))
+
+    jitters: list[float] = []
+    shimmers: list[float] = []
+    valid_windows = 0
+
+    for start in range(0, len(audio) - win + 1, hop):
+        seg = audio[start:start + win]
+        seg_rms = float(np.sqrt(np.mean(seg ** 2)))
+        if seg_rms < 0.005:
+            continue  # skip silent windows
+
+        # --- Pitch periods via PYIN inside this window ---
+        try:
+            f0, voiced_flag, _ = librosa.pyin(
+                seg,
+                fmin=librosa.note_to_hz('C2'),
+                fmax=librosa.note_to_hz('C7'),
+                sr=sr,
+                frame_length=min(1024, max(256, win // 2)),
+                hop_length=max(64, win // 16),
+            )
+        except Exception:
+            continue
+        f0 = f0[voiced_flag] if f0 is not None else None
+        if f0 is None or len(f0) < 4:
+            continue
+
+        periods = 1.0 / f0  # seconds
+        # Drop NaNs / infs introduced by pyin on edge frames.
+        periods = periods[np.isfinite(periods)]
+        if len(periods) < 4:
+            continue
+
+        mean_T = float(np.mean(periods))
+        if mean_T <= 0:
+            continue
+        # Local jitter (%): mean(|T_i - T_{i-1}|) / mean(T) * 100.
+        jitter_local = float(np.mean(np.abs(np.diff(periods)))) / mean_T * 100.0
+
+        # --- Cycle-peak amplitudes for shimmer ---
+        # Approximate per-cycle peak: split the window into len(periods)
+        # equal sub-segments and take the absolute peak of each. Crude
+        # but stable when F0 is ~constant inside one window.
+        n_cycles = len(periods)
+        seg_per_cycle = len(seg) // max(n_cycles, 1)
+        if seg_per_cycle < 4:
+            continue
+        peaks = np.array([
+            float(np.max(np.abs(seg[i * seg_per_cycle:(i + 1) * seg_per_cycle])))
+            for i in range(n_cycles)
+            if (i + 1) * seg_per_cycle <= len(seg)
+        ])
+        peaks = peaks[peaks > 0]
+        if len(peaks) < 4:
+            continue
+        mean_A = float(np.mean(peaks))
+        shimmer_local = float(np.mean(np.abs(np.diff(peaks)))) / mean_A * 100.0
+
+        jitters.append(jitter_local)
+        shimmers.append(shimmer_local)
+        valid_windows += 1
+
+    if valid_windows == 0:
+        return {
+            "jitter_pct": 0.0,
+            "shimmer_pct": 0.0,
+            "instability": 0.0,
+            "is_trembling": False,
+            "windows": 0,
+        }
+
+    jitter_avg = float(np.mean(jitters))
+    shimmer_avg = float(np.mean(shimmers))
+
+    # Combined instability score, 0-1. We anchor 1.0 at "clearly
+    # outside normal" (jitter ~3%, shimmer ~10%) and 0.0 at the Praat
+    # normal-speech band. The square-root keeps the curve responsive
+    # at low values rather than flat-zero up to threshold.
+    j_norm = max(0.0, (jitter_avg - 0.5) / 2.5)   # 0.5%→0, 3%→1
+    s_norm = max(0.0, (shimmer_avg - 2.0) / 8.0)  # 2%→0, 10%→1
+    instability = float(np.clip(0.6 * min(j_norm, 1.5) + 0.4 * min(s_norm, 1.5), 0.0, 1.0))
+
+    # Praat thresholds with a small margin so single-window noise
+    # doesn't trip the flag.
+    PRAAT_JITTER = 1.04
+    PRAAT_SHIMMER = 3.81
+    is_trembling = (
+        (jitter_avg > PRAAT_JITTER or shimmer_avg > PRAAT_SHIMMER)
+        and instability > 0.35
+    )
+
+    return {
+        "jitter_pct": round(jitter_avg, 3),
+        "shimmer_pct": round(shimmer_avg, 3),
+        "instability": round(instability, 3),
+        "is_trembling": bool(is_trembling),
+        "windows": int(valid_windows),
+    }
+
+
 # ── Pitch extraction via PYIN ────────────────────────────────────────
 def extract_pitch_features(audio, sr=16000):
     """
@@ -559,6 +710,17 @@ class AudioPipeline:
         except Exception:
             pitch = {"mean_hz": 0, "std_hz": 0, "range_hz": 0, "tremor_score": 0}
 
+        # 3b. Voice trembling — jitter + shimmer over rolling 200ms windows.
+        # Surfaced as both a confidence-score penalty and a UI-visible
+        # signal alongside fillers / repetition / pace.
+        try:
+            trembling = compute_voice_trembling(audio, sr)
+        except Exception:
+            trembling = {
+                "jitter_pct": 0.0, "shimmer_pct": 0.0,
+                "instability": 0.0, "is_trembling": False, "windows": 0,
+            }
+
         # 4. Acoustic filler detection (from raw audio, not text)
         acoustic_fillers = detect_filler_sounds_acoustic(audio, sr)
         self.total_acoustic_fillers.extend(acoustic_fillers)
@@ -675,6 +837,30 @@ class AudioPipeline:
             acoustic_filler_segments=acoustic_fillers,
         )
 
+        # 7b. Multi-label emotion mix — combines lexical (fillers,
+        # hedges, repetitions, assertive/excited tokens) with prosodic
+        # signals (pitch mean/std, rms, wpm, tremor, jitter, shimmer).
+        # Sums to 1.0 by construction; never binary.
+        try:
+            from emotion_detector import detect_emotion_mix
+            emotion = detect_emotion_mix(
+                words=words,
+                pitch=pitch,
+                rms=features['rms'],
+                rms_std=rms_std,
+                voiced_s=voiced_s,
+                wpm=wpm,
+                lexical_filler_count=len(lexical_fillers),
+                acoustic_filler_count=len(acoustic_fillers),
+                word_count=word_count,
+                trembling=trembling,
+            )
+        except Exception:
+            emotion = {
+                "mix": None, "dominant": None, "dominant_pct": None,
+                "evidence": {}, "available_signals": [],
+            }
+
         # 8. Compile raw signals for scorer
         raw = {
             "rms": features['rms'],
@@ -689,6 +875,12 @@ class AudioPipeline:
                 round(silence_rms, 6) if silence_rms is not None else None
             ),
             "pitch": pitch,
+            # Voice trembling — separate from `pitch.tremor_score` (which
+            # is a low-frequency F0 modulation index). This block is the
+            # period-to-period jitter+shimmer pair, on rolling 200ms
+            # windows, that gets the dedicated UI signal + confidence
+            # penalty.
+            "trembling": trembling,
             "vad_segments": vad_segments,
             "voiced_s": round(voiced_s, 2),
             "acoustic_fillers": acoustic_fillers,
@@ -741,12 +933,22 @@ class AudioPipeline:
             # which now renormalizes around any None signals).
             "eye_contact": 50,
             "expression": 50,
+            # Voice-trembling score (0-100). Pure UI signal — the
+            # confidence-score penalty is applied separately inside
+            # SignalScorer.aggregate based on `raw.trembling`.
+            "voice_trembling": SignalScorer.voice_trembling(
+                trembling, voiced_s=voiced_s,
+            ),
         }
-        scores["total"] = SignalScorer.aggregate(scores)
+        scores["total"] = SignalScorer.aggregate(scores, trembling=trembling)
 
         return {
             "scores": scores,
             "raw": raw,
+            # Multi-label emotion mix (sums to 1.0). Top-level so the
+            # WS broadcaster, report_generator, and frontend SignalBars
+            # can read it without digging through `raw`.
+            "emotion": emotion,
             "transcript_words": words,
             "transcript_text": " ".join(w['word'] for w in words),
             "chunk_index": self.chunk_count,

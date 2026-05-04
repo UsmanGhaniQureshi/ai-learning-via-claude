@@ -10,6 +10,8 @@ export default function ScoreBreakdownPanel({
   baselineNote,
   hiddenSignals = [],
   transcriptConfidence = null,
+  voiceTrembling = null,
+  emotion = null,
 }) {
   if (!signalAverages) return null
 
@@ -54,10 +56,28 @@ export default function ScoreBreakdownPanel({
     ? Math.round((weightedSum / weightTotal) * 10) / 10
     : null
   const headline = avgScore == null ? null : Math.round(Number(avgScore))
+
+  // Voice-trembling penalty estimate. We don't get the exact integer
+  // back from the backend, so we reproduce the same `instability →
+  // penalty` mapping used by SignalScorer.trembling_penalty:
+  //   instability ≥ 0.35 → 10 points, scaling linearly up to 20 at 1.0.
+  // Only shown when the session was flagged as trembling; otherwise
+  // there is nothing to subtract and the row is hidden.
+  const isTrembling = !!voiceTrembling?.is_trembling_session
+  const tremblingInstability = Number(voiceTrembling?.avg_instability ?? 0)
+  const tremblingPenalty = isTrembling
+    ? Math.max(10, Math.min(20, Math.round(
+        10 + (Math.max(tremblingInstability, 0.35) - 0.35) / 0.65 * 10
+      )))
+    : 0
+
+  const adjustedTotal = computedTotal != null
+    ? Math.max(0, Math.round((computedTotal - tremblingPenalty) * 10) / 10)
+    : null
   const gap = (
-    computedTotal != null &&
+    adjustedTotal != null &&
     headline != null
-  ) ? Math.abs(headline - computedTotal) : 0
+  ) ? Math.abs(headline - adjustedTotal) : 0
 
   return (
     <div className="glass-card p-5">
@@ -68,8 +88,11 @@ export default function ScoreBreakdownPanel({
 
         <div className="mt-4 space-y-3 text-sm text-text-secondary">
           <p>
-            Your overall score is a weighted blend of the measured signals.
-            Expression is shown for awareness but <strong className="text-text-primary">does not count toward the total</strong>.
+            Your overall score is a weighted blend of the measured signals,
+            with a fixed Voice Trembling penalty subtracted afterwards when
+            the speaker&apos;s voice is flagged as shivering. Expression and
+            Emotion Mix are shown for awareness but{' '}
+            <strong className="text-text-primary">do not count toward the total</strong>.
           </p>
 
           <div className="overflow-x-auto">
@@ -108,6 +131,20 @@ export default function ScoreBreakdownPanel({
                     {computedTotal != null ? computedTotal.toFixed(1) : 'N/A'}
                   </td>
                 </tr>
+                {/* Voice-trembling penalty — only shown when the
+                    session was flagged. Renders as a subtraction row
+                    so the math from "Sum" → "Headline" reconciles
+                    explicitly. */}
+                {isTrembling && (
+                  <tr>
+                    <td colSpan={3} className="px-2 py-2 text-danger">
+                      Voice Trembling penalty (instability {tremblingInstability.toFixed(2)})
+                    </td>
+                    <td className="px-2 py-2 text-right font-semibold text-danger">
+                      −{tremblingPenalty}
+                    </td>
+                  </tr>
+                )}
                 <tr>
                   <td colSpan={3} className="px-2 py-2 font-semibold text-text-primary">
                     Headline score (rounded)
@@ -142,8 +179,32 @@ export default function ScoreBreakdownPanel({
 
           {gap > 1.5 && (
             <p className="text-xs italic opacity-75">
-              The {gap.toFixed(1)} point gap between the row sum and the headline comes from per-chunk averaging.
+              The {gap.toFixed(1)} point gap between the adjusted sum and the headline comes from per-chunk averaging — the headline is the average of every chunk&apos;s individual total, while this table runs the formula once on session-averaged signals.
             </p>
+          )}
+
+          {/* Emotion mix summary — diagnostic complement to the score.
+              Exists alongside the breakdown rather than inside it
+              because emotion is multi-label, not a 0-100 number. */}
+          {emotion?.mix && emotion?.dominant && (
+            <div className="mt-4 border-t border-border pt-3">
+              <h4 className="mb-1 text-base font-semibold text-text-primary">Emotion mix</h4>
+              <p className="text-text-secondary">
+                Dominant tone:{' '}
+                <strong className="text-text-primary">
+                  {emotion.dominant} ({emotion.dominant_pct ?? '?'}%)
+                </strong>
+                . The mix is a probability distribution over 10 labels;
+                see the{' '}
+                <Link to="/how-it-works#emotion-mix" className="text-text-accent hover:underline">
+                  Emotion mix section
+                </Link>{' '}
+                for what each label is fed by.
+              </p>
+              <p className="text-xs text-text-muted mt-1">
+                This signal is diagnostic only — it does NOT contribute to the headline score.
+              </p>
+            </div>
           )}
 
           {signalReasons && (

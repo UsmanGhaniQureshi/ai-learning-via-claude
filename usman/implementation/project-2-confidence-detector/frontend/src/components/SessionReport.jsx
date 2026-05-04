@@ -8,6 +8,7 @@ import ProgressChart from './ProgressChart'
 import ScoreBreakdownPanel from './ScoreBreakdownPanel'
 import CoachingPanel from './CoachingPanel'
 import ResultHUD from './ResultHUD'
+import EmotionMix from './EmotionMix'
 import { API_BASE, apiFetch, mediaUrl } from '../config'
 
 export default function SessionReport({
@@ -105,6 +106,8 @@ export default function SessionReport({
     wins: reportWins, improvements: reportImprovements,
     transcript_confidence,
     live_hud_timeline: liveHudTimeline,
+    voice_trembling: voiceTrembling,
+    emotion: emotionSummary,
   } = report
 
   // Title-vs-transcript mismatch banner. The llm_coach module flags
@@ -298,6 +301,64 @@ export default function SessionReport({
         </div>
       )}
 
+      {/* Emotion mix + voice-trembling callout. Surfaced ABOVE the
+          signal-breakdown drawer because they answer "how did the
+          speaker actually sound?" — the question users open the
+          report to answer first. */}
+      {(emotionSummary?.mix || voiceTrembling) && (
+        <div className="glass-card p-5 space-y-5">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <h3 className="m-0">How you sounded</h3>
+            <span className="text-xs text-text-muted">
+              Emotion mix combines transcript wording with pitch / energy / rate.
+            </span>
+          </div>
+
+          {emotionSummary?.mix ? (
+            <EmotionMix emotion={emotionSummary} />
+          ) : (
+            <p className="text-sm text-text-muted italic">
+              Emotion mix unavailable — no audio captured.
+            </p>
+          )}
+
+          {voiceTrembling && (
+            <div
+              className={
+                voiceTrembling.is_trembling_session
+                  ? 'rounded-md p-3 bg-[rgba(239,68,68,0.08)] border border-[rgba(239,68,68,0.3)]'
+                  : 'rounded-md p-3 bg-elevated border border-border'
+              }
+            >
+              <div className="flex items-baseline justify-between gap-3 flex-wrap">
+                <span className="text-sm font-semibold text-text-primary">
+                  Voice Trembling
+                </span>
+                <span className={
+                  voiceTrembling.is_trembling_session
+                    ? 'text-sm font-bold text-danger'
+                    : 'text-sm font-bold text-success'
+                }>
+                  {voiceTrembling.is_trembling_session
+                    ? `Detected — ${voiceTrembling.trembling_chunk_pct}% of session`
+                    : 'Steady'}
+                </span>
+              </div>
+              <p className="text-xs text-text-muted mt-1">
+                Jitter {voiceTrembling.avg_jitter_pct}% · Shimmer{' '}
+                {voiceTrembling.avg_shimmer_pct}% · Instability{' '}
+                {Math.round((voiceTrembling.avg_instability || 0) * 100)}/100
+                {voiceTrembling.is_trembling_session && (
+                  <>
+                    {' '}· Penalty applied to confidence score.
+                  </>
+                )}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Signal Breakdown moved into a collapsed drawer — the HUD
           overlay above carries the per-moment status at-a-glance, so
           this card no longer needs to take prime real estate beside
@@ -325,6 +386,8 @@ export default function SessionReport({
         userBaseline={user_baseline}
         baselineNote={baseline_note}
         transcriptConfidence={transcript_confidence}
+        voiceTrembling={voiceTrembling}
+        emotion={emotionSummary}
       />
 
       {/* Score timeline */}
