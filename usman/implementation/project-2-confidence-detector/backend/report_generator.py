@@ -286,6 +286,100 @@ def generate_post_session_report(
     except Exception:
         emotion_summary = {"mix": None, "dominant": None, "dominant_pct": None}
 
+    # ── Quiet-recording flag (Audit Fix 7) ──────────────────────────
+    # The audit highlighted that `dynaudnorm=p=0.9:m=8` in the upload
+    # ffmpeg pipeline can boost quiet recordings by up to 8x, so the
+    # voice_steadiness and trembling numbers reflect post-AGC
+    # artefacts rather than the speaker's real delivery. We do NOT
+    # remove dynaudnorm (without it, every soft chunk would lose
+    # against the 0.012 RMS gate downstream). Instead we surface a
+    # boolean the UI can render as a "Low mic volume — steadiness
+    # reflects normalised audio" badge.
+    #
+    # For live WS the chunk RMS arrives un-normalised, so 0.02 is the
+    # right pre-norm cutoff. Upload paths see post-norm RMS; the
+    # caller (main.py upload_video) overrides the threshold to 0.04
+    # there. Both surface the same field shape.
+    chunk_rms_vals = [
+        r.get("rms") for r in all_raw
+        if isinstance(r.get("rms"), (int, float))
+    ]
+    median_chunk_rms = (
+        sorted(chunk_rms_vals)[len(chunk_rms_vals) // 2]
+        if chunk_rms_vals else None
+    )
+    quiet_recording = (
+        median_chunk_rms is not None and median_chunk_rms < 0.02
+    )
+
+    # ── Session pitch-std median + naturally-narrow-pitch disclosure ──
+    # Structural Fix 1: a speaker with a naturally narrow pitch range
+    # gets penalised by the absolute pitch_std-based vocal_variety
+    # scorer and the "monotone" emotion label. We don't re-score
+    # per-chunk (would require plumbing per-user baselines through
+    # all four pipelines); instead we surface:
+    #   * `session_pitch_std_median` — this session's median chunk
+    #     pitch_std in Hz, available as an input to the user
+    #     baseline computed by main.py:_fetch_user_baseline.
+    #   * `naturally_narrow_pitch` — True when a returning user has a
+    #     historical pitch_std median below 8 Hz across their last
+    #     ≥3 sessions (Praat's "narrow pitch" tier). The frontend
+    #     renders an explainer so the user understands their
+    #     monotone / vocal_variety reading is calibrated information,
+    #     not a value judgement.
+    chunk_pitch_stds = [
+        float(r.get("pitch", {}).get("std_hz") or 0.0)
+        for r in all_raw
+        if r.get("pitch") and (r["pitch"].get("std_hz") or 0) > 0
+    ]
+    if chunk_pitch_stds:
+        _sorted_p = sorted(chunk_pitch_stds)
+        session_pitch_std_median = round(_sorted_p[len(_sorted_p) // 2], 2)
+    else:
+        session_pitch_std_median = None
+
+    naturally_narrow_pitch = False
+    if isinstance(user_baseline, dict) and user_baseline.get("ready"):
+        ub_pitch = user_baseline.get("pitch_std_median")
+        if (
+            isinstance(ub_pitch, dict)
+            and ub_pitch.get("n", 0) >= 3
+            and isinstance(ub_pitch.get("mean"), (int, float))
+            and ub_pitch["mean"] < 8.0
+        ):
+            naturally_narrow_pitch = True
+
+    # ── Multi-speaker heuristic (Structural Fix 2) ──────────────────
+    # Concatenate per-VAD-segment pitch means across the session in
+    # time order, count consecutive jumps > 80 Hz. The 80 Hz
+    # threshold approximates the gap between adult-male and
+    # adult-female pitch anchors; consecutive voiced segments from a
+    # single speaker rarely jump that much. We require BOTH a high
+    # absolute jump count (≥4) AND a high jump rate per voiced
+    # minute (>6) so a 2-segment recording with one outlier doesn't
+    # trigger. This is NOT diarisation — it's a "the audio looks
+    # like more than one person" heuristic. The frontend renders a
+    # disclosure, never gates scoring.
+    _MULTISPEAKER_JUMP_HZ = 80.0
+    _MULTISPEAKER_MIN_JUMPS = 4
+    _MULTISPEAKER_MIN_RATE_PER_MIN = 6.0
+    _all_segment_means: list[float] = []
+    for r in all_raw:
+        seg_means = (r.get("pitch") or {}).get("segment_pitch_means") or []
+        for v in seg_means:
+            if isinstance(v, (int, float)) and v > 0:
+                _all_segment_means.append(float(v))
+    multi_speaker_jump_count = 0
+    for i in range(1, len(_all_segment_means)):
+        if abs(_all_segment_means[i] - _all_segment_means[i - 1]) > _MULTISPEAKER_JUMP_HZ:
+            multi_speaker_jump_count += 1
+    voiced_minutes = max(total_voiced_s / 60.0, 1e-3)
+    multi_speaker_jump_rate = multi_speaker_jump_count / voiced_minutes
+    multiple_speakers_suspected = (
+        multi_speaker_jump_count >= _MULTISPEAKER_MIN_JUMPS
+        and multi_speaker_jump_rate > _MULTISPEAKER_MIN_RATE_PER_MIN
+    )
+
     # ── Filler word breakdown ────────────────────────────────────────
     filler_counts = {}
     for w in all_words:
@@ -686,6 +780,32 @@ def generate_post_session_report(
         # the timeline for the result-screen tooltip on the score chart.
         "emotion": emotion_summary,
         "emotion_timeline": emotion_timeline,
+        # Audit Fix 7: surface a boolean for the UI to render a
+        # "Low mic volume detected — steadiness score reflects
+        # normalised audio" badge. Median pre-normalisation RMS
+        # below 0.02 triggers the flag for the live + audio-upload
+        # paths that go through report_generator. Upload Video
+        # produces its own version in main.py with a different
+        # threshold to account for ffmpeg dynaudnorm boosting.
+        "quiet_recording": quiet_recording,
+        "median_chunk_rms": (
+            round(median_chunk_rms, 4) if median_chunk_rms is not None else None
+        ),
+        # Structural Fix 1: per-session median raw pitch std (Hz). Fed
+        # into the per-user baseline by main.py:_fetch_user_baseline,
+        # which then drives the disclosure flag below on subsequent
+        # sessions. Always emitted, even on first sessions where
+        # `naturally_narrow_pitch` will be False because the baseline
+        # isn't ready yet.
+        "session_pitch_std_median": session_pitch_std_median,
+        "naturally_narrow_pitch": naturally_narrow_pitch,
+        # Structural Fix 2: multi-speaker heuristic. UI renders an
+        # advisory ("Multiple voices detected — score may not reflect
+        # a single speaker") when this is True. Score is NOT gated;
+        # disclosure only.
+        "multiple_speakers_suspected": multiple_speakers_suspected,
+        "multi_speaker_jump_count": multi_speaker_jump_count,
+        "multi_speaker_jump_rate_per_min": round(multi_speaker_jump_rate, 2),
     }
 
     # ── LLM coaching (Gemini Flash-Lite) ─────────────────────────────

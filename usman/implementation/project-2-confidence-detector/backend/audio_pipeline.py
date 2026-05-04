@@ -154,9 +154,43 @@ def get_language_detector():
 # padding ("like", "you know", "i mean"). Everything else is the user's
 # style, not a problem to solve.
 LEXICAL_FILLERS = {
-    "um", "uh", "erm", "ah", "er", "uhm", "hmm", "mm",
+    "um", "uh", "uhh", "erm", "ah", "er", "uhm", "hmm", "mm",
     "like", "you know", "i mean",
 }
+
+# Audit Fix 3: multi-word filler phrases. LEXICAL_FILLERS contains
+# "you know" / "i mean" but Whisper outputs single tokens, so the
+# `word in LEXICAL_FILLERS` check at the per-word stage never matched
+# — these phrases were silently undercounted in the score's filler
+# signal. This helper post-processes the words list and tags adjacent
+# pairs as fillers. The emotion mixer also catches them via its own
+# regex (in emotion_detector._count_phrase_hits), but the score's
+# filler_words signal needs the per-word `is_filler` flag set.
+_MULTIWORD_FILLER_PAIRS = (
+    ("you", "know"),
+    ("i", "mean"),
+)
+
+
+def _tag_multiword_fillers(words):
+    """Mark `is_filler=True` on adjacent token pairs that form a
+    multi-word filler phrase (e.g. "you know", "i mean"). Mutates the
+    dicts in `words` in place AND returns the list so callers can use
+    either style. Tokens are matched after lowercasing the `word`
+    field; transcribe_chunk has already lowercased its outputs.
+    """
+    if not words:
+        return words
+    n = len(words)
+    for i in range(n - 1):
+        first = (words[i].get("word") or "").lower()
+        second = (words[i + 1].get("word") or "").lower()
+        for a, b in _MULTIWORD_FILLER_PAIRS:
+            if first == a and second == b:
+                words[i]["is_filler"] = True
+                words[i + 1]["is_filler"] = True
+                break
+    return words
 
 # ── Hallucination phrases that Whisper emits on silence/noise ───────
 # Whisper's training set is heavy with YouTube captioning, so given
@@ -244,7 +278,8 @@ def detect_filler_sounds_acoustic(audio, sr=16000):
 
 
 # ── Voice trembling: jitter + shimmer over rolling windows ─────────
-def compute_voice_trembling(audio, sr=16000, window_ms=200, hop_ms=100):
+def compute_voice_trembling(audio, sr=16000, vad_segments=None,
+                            window_ms=200, hop_ms=100):
     """Detect voice trembling/shivering via period-to-period jitter
     (pitch instability) and amplitude shimmer (loudness instability)
     over short rolling windows.
@@ -252,6 +287,19 @@ def compute_voice_trembling(audio, sr=16000, window_ms=200, hop_ms=100):
     Spec: 100-300ms windows. We use 200 ms windows hopped by 100 ms,
     which gives a smooth instability curve while keeping the per-window
     pitch estimate stable enough for short utterances.
+
+    Audit Fix 3: rolling windows are now optionally VAD-gated.
+    `vad_segments` is the list of `(start_ms, end_ms)` voiced
+    intervals returned by `detect_speech_boundaries`. When supplied,
+    a window is only processed if it overlaps a voiced segment by at
+    least 50% of its length. Without this gate, fan / HVAC / cyclic
+    background noise that clears the 0.005 RMS floor was being fed
+    into PYIN, which would lock onto its pseudo-periodicity and
+    return unstable F0 — producing false trembling flags. Empty
+    `vad_segments == []` means "no voiced regions in this chunk"
+    and skips ALL windows, returning a clean no-measurement result.
+    Passing `None` (the default) preserves the pre-fix behaviour
+    for any caller that doesn't have VAD output available.
 
     Definitions (Praat-style, "local"):
       jitter (local)  = mean(|T_i - T_{i-1}|) / mean(T)            [%]
@@ -304,6 +352,24 @@ def compute_voice_trembling(audio, sr=16000, window_ms=200, hop_ms=100):
         seg_rms = float(np.sqrt(np.mean(seg ** 2)))
         if seg_rms < 0.005:
             continue  # skip silent windows
+
+        # Audit Fix 3: VAD overlap gate. The 0.005 RMS floor lets
+        # quiet cyclic noise (fans, HVAC) through, which PYIN then
+        # treats as voice. If the caller supplied vad_segments, only
+        # process windows that genuinely overlap voiced speech by
+        # ≥50% of their duration.
+        if vad_segments is not None:
+            win_start_ms = (start / sr) * 1000.0
+            win_end_ms = win_start_ms + window_ms
+            overlap_ms = 0.0
+            for seg_start_ms, seg_end_ms in vad_segments:
+                overlap_ms += max(
+                    0.0,
+                    min(seg_end_ms, win_end_ms)
+                    - max(seg_start_ms, win_start_ms),
+                )
+            if overlap_ms < 0.5 * window_ms:
+                continue  # window sits in silence/noise, not speech
 
         # --- Pitch periods via PYIN inside this window ---
         try:
@@ -395,26 +461,46 @@ def compute_voice_trembling(audio, sr=16000, window_ms=200, hop_ms=100):
 
 
 # ── Pitch extraction via PYIN ────────────────────────────────────────
-def extract_pitch_features(audio, sr=16000):
+def extract_pitch_features(audio, sr=16000, vad_segments=None):
     """
     Uses PYIN (librosa) — far more accurate than naive FFT for speech F0.
     Also measures voice tremor (4-12 Hz modulation of pitch).
+
+    Structural Fix 2: when `vad_segments` is supplied we additionally
+    return `segment_pitch_means` — one entry per voiced segment,
+    holding the mean F0 across the frames that fall inside that
+    segment. The downstream report builder uses these values to
+    detect inter-segment pitch jumps consistent with multiple
+    speakers (heuristic, not real diarisation). PYIN runs once for
+    everything; the per-segment slicing is pure numpy indexing.
     """
     import librosa
     from scipy.signal import butter, filtfilt
 
+    PYIN_HOP = 512
     f0, voiced_flag, _ = librosa.pyin(
         audio,
         fmin=librosa.note_to_hz('C2'),
         fmax=librosa.note_to_hz('C7'),
         sr=sr,
         frame_length=2048,
-        hop_length=512,
+        hop_length=PYIN_HOP,
     )
 
     voiced_f0 = f0[voiced_flag]
-    if len(voiced_f0) < 5:
-        return {"mean_hz": 0, "std_hz": 0, "range_hz": 0, "tremor_score": 0}
+    # Audit Fix 8: minimum voiced-frame count for a stable pitch std
+    # estimate is 15 frames (~150ms at the default PYIN frame rate),
+    # not 5. Five frames is roughly 50ms — far too little to compute
+    # a meaningful standard deviation; brief vocalisations were
+    # producing noisy vocal_variety scores instead of "no data".
+    if len(voiced_f0) < 15:
+        return {
+            "mean_hz": 0,
+            "std_hz": 0,
+            "range_hz": 0,
+            "tremor_score": 0,
+            "segment_pitch_means": [],
+        }
 
     def measure_tremor(f0c):
         if len(f0c) < 20:
@@ -430,11 +516,37 @@ def extract_pitch_features(audio, sr=16000):
             np.sqrt(np.mean(filtered ** 2)) / (np.std(f0c) + 1e-6), 0, 1
         ))
 
+    # Structural Fix 2: per-VAD-segment pitch means. Each PYIN frame
+    # i covers approximately [i * PYIN_HOP / sr, (i+1) * PYIN_HOP / sr]
+    # seconds. We walk vad_segments and average voiced F0 inside
+    # each. Skipped if vad_segments is None (callers that don't
+    # provide it just don't get the field). At least 5 voiced frames
+    # are required per segment for a stable mean, otherwise the
+    # segment is omitted.
+    segment_pitch_means: list[float] = []
+    if vad_segments:
+        frame_dur_s = PYIN_HOP / sr
+        for seg_start_ms, seg_end_ms in vad_segments:
+            f0_lo = int((seg_start_ms / 1000.0) / frame_dur_s)
+            f0_hi = int(np.ceil((seg_end_ms / 1000.0) / frame_dur_s))
+            f0_lo = max(0, f0_lo)
+            f0_hi = min(len(f0), f0_hi)
+            if f0_hi <= f0_lo:
+                continue
+            seg_f0 = f0[f0_lo:f0_hi]
+            seg_voiced = voiced_flag[f0_lo:f0_hi]
+            seg_f0_voiced = seg_f0[seg_voiced]
+            seg_f0_voiced = seg_f0_voiced[np.isfinite(seg_f0_voiced)]
+            if len(seg_f0_voiced) < 5:
+                continue
+            segment_pitch_means.append(float(np.mean(seg_f0_voiced)))
+
     return {
         "mean_hz": float(np.mean(voiced_f0)),
         "std_hz": float(np.std(voiced_f0)),
         "range_hz": float(np.ptp(voiced_f0)),
         "tremor_score": measure_tremor(voiced_f0),
+        "segment_pitch_means": segment_pitch_means,
     }
 
 
@@ -443,10 +555,22 @@ def detect_speech_boundaries(audio, sr=16000):
     """
     Uses Silero VAD to find speech vs silence segments.
     Returns list of (start_ms, end_ms) tuples for speech segments.
+
+    Audit Fix 10: the VAD threshold is now overridable via the
+    `VAD_THRESHOLD` environment variable (default 0.5). Operators
+    deploying in noisy environments (open offices, outdoor capture)
+    can raise it to reduce false-voiced detections without a code
+    change.
     """
+    import os
     import torch
     tensor = torch.FloatTensor(audio)
     vad = get_vad()
+
+    try:
+        vad_threshold = float(os.environ.get("VAD_THRESHOLD", "0.5"))
+    except ValueError:
+        vad_threshold = 0.5
 
     # Try silero-vad package first, then torch.hub fallback
     try:
@@ -461,7 +585,7 @@ def detect_speech_boundaries(audio, sr=16000):
     if get_speech_timestamps is not None:
         ts = get_speech_timestamps(
             tensor, vad,
-            threshold=0.5,
+            threshold=vad_threshold,
             sampling_rate=sr,
             min_speech_duration_ms=250,
             min_silence_duration_ms=100,
@@ -578,6 +702,13 @@ def transcribe_chunk(audio, sr=16000):
                 "is_filler": word in LEXICAL_FILLERS,
             })
 
+    # Audit Fix 3: tag adjacent ("you","know") and ("i","mean") pairs
+    # as fillers so the score's filler_words signal counts them.
+    # Without this the per-word `is_filler` flag never fires for
+    # multi-word entries in LEXICAL_FILLERS, even though the emotion
+    # mixer detects them via regex.
+    _tag_multiword_fillers(words)
+
     # If detection says non-English with high confidence, drop the
     # transcript: the English-only heuristics (filler set, hedges, WPM
     # tiers) are meaningless against another language and shipping
@@ -661,14 +792,19 @@ class AudioPipeline:
         self.total_acoustic_fillers = []
         self.start_time = time.time()
 
-        # English-only product gate. We probe the FIRST voiced chunk of
-        # each session with the multilingual `tiny` whisper model. If
-        # the result is non-English with confidence > 0.6, every
-        # subsequent chunk emits `unsupported_language` so callers can
-        # short-circuit scoring. The probe runs at most once per
-        # session (instance-level cache) to keep CPU cost down.
-        self._language_probed = False
-        self._unsupported_language = None  # None = English (or not yet probed)
+        # English-only product gate. Multi-strike confirmation: we
+        # probe each `has_meaningful_speech` chunk with the
+        # multilingual `tiny` whisper model until we either confirm
+        # English (one English detection) or rack up TWO CONSECUTIVE
+        # non-English detections at high confidence. Audit Fix 5
+        # raised the per-strike threshold from 0.6 → 0.85 and added
+        # the consecutive-strike requirement so heavily-accented
+        # English speakers — who occasionally probe as Hindi/Spanish
+        # at 0.65-0.80 confidence on a single chunk — are not
+        # falsely refused.
+        self._lang_probe_strikes = 0   # consecutive non-English detections
+        self._lang_probe_done = False  # True = English confirmed OR rejected
+        self._unsupported_language = None  # None = English (or not yet decided)
 
         # Last good measurement of silence-window RMS (background
         # noise estimator). Carried across chunks so a chunk where
@@ -704,17 +840,28 @@ class AudioPipeline:
         else:
             silence_rms = self._last_silence_rms
 
-        # 3. Pitch analysis via PYIN
+        # 3. Pitch analysis via PYIN. Pass vad_segments through so
+        # extract_pitch_features can also produce per-segment pitch
+        # means (Structural Fix 2 — feeds the multi-speaker heuristic
+        # in report_generator). PYIN runs once; segment slicing is
+        # pure numpy indexing so the cost is negligible.
         try:
-            pitch = extract_pitch_features(audio, sr)
+            pitch = extract_pitch_features(audio, sr, vad_segments=vad_segments)
         except Exception:
-            pitch = {"mean_hz": 0, "std_hz": 0, "range_hz": 0, "tremor_score": 0}
+            pitch = {
+                "mean_hz": 0, "std_hz": 0, "range_hz": 0,
+                "tremor_score": 0, "segment_pitch_means": [],
+            }
 
         # 3b. Voice trembling — jitter + shimmer over rolling 200ms windows.
         # Surfaced as both a confidence-score penalty and a UI-visible
         # signal alongside fillers / repetition / pace.
+        # Audit Fix 3: pass the already-computed vad_segments so the
+        # detector only processes windows that overlap real voiced
+        # speech by ≥50%. Stops fan/HVAC noise from triggering false
+        # trembling flags.
         try:
-            trembling = compute_voice_trembling(audio, sr)
+            trembling = compute_voice_trembling(audio, sr, vad_segments=vad_segments)
         except Exception:
             trembling = {
                 "jitter_pct": 0.0, "shimmer_pct": 0.0,
@@ -751,15 +898,18 @@ class AudioPipeline:
         rms_energy = features['rms']
         has_meaningful_speech = voiced_s >= 1.2 and rms_energy > 0.012
 
-        # English-only language gate (Batch 2). Run the multilingual
-        # detector ONCE per session on the first chunk that has real
-        # speech. The production transcription model is .en (no
-        # detection head), so we route through `tiny` multilingual
-        # just for this probe. If non-English with confidence > 0.6,
-        # mark the session unsupported and every downstream caller
-        # bails out (WS stops broadcasting scores, upload + analyzer
-        # short-circuit at finalize).
-        if not self._language_probed and has_meaningful_speech:
+        # English-only language gate. Multi-strike probe: keep
+        # probing each `has_meaningful_speech` chunk until we either
+        # confirm English (any English detection) or accumulate TWO
+        # CONSECUTIVE non-English detections at confidence > 0.85.
+        # Audit Fix 5 raised the threshold from 0.6 → 0.85 and added
+        # the strike requirement so accented English speakers, who
+        # occasionally probe as Hindi/Spanish at 0.65-0.80 on a
+        # single chunk, are not refused on a single false positive.
+        # The production transcription model is .en (no detection
+        # head), so we route through `tiny` multilingual just for
+        # this probe.
+        if not self._lang_probe_done and has_meaningful_speech:
             try:
                 detector = get_language_detector()
                 # Item 8 fix: `WhisperModel` has no `detect_language()`
@@ -781,15 +931,26 @@ class AudioPipeline:
                 )
                 lang = getattr(info, "language", None)
                 prob = float(getattr(info, "language_probability", 0.0) or 0.0)
-                if lang and lang != "en" and prob > 0.6:
-                    self._unsupported_language = lang
+                if lang and lang != "en" and prob > 0.85:
+                    # Strike. Two in a row → reject the session.
+                    self._lang_probe_strikes += 1
+                    if self._lang_probe_strikes >= 2:
+                        self._unsupported_language = lang
+                        self._lang_probe_done = True
+                else:
+                    # English (or low-confidence non-English) — confirm
+                    # English and stop probing. A single confident
+                    # English read is enough; we don't keep probing
+                    # native speakers.
+                    self._lang_probe_strikes = 0
+                    self._lang_probe_done = True
             except Exception as e:
                 # Detector failure shouldn't kill the session — log and
                 # carry on as if English. The transcript will still be
                 # garbage if it's actually non-English, but that's no
                 # worse than the pre-Batch-2 status quo.
                 print(f"[LangDetect] probe failed: {e}")
-            self._language_probed = True
+                self._lang_probe_done = True
 
         if has_meaningful_speech:
             try:
@@ -850,8 +1011,16 @@ class AudioPipeline:
                 rms_std=rms_std,
                 voiced_s=voiced_s,
                 wpm=wpm,
-                lexical_filler_count=len(lexical_fillers),
-                acoustic_filler_count=len(acoustic_fillers),
+                # Use the dedup-aware counts from `dedup_filler_counts`
+                # above. Lexical and acoustic detectors regularly
+                # double-fire on the same filler ("um" transcribed by
+                # Whisper + same hump caught spectrally); without this
+                # the emotion mixer over-counts fillers and biases
+                # `nervous` / `hesitant` upwards. SignalScorer.filler_words
+                # already uses these deduped counts — emotion_detector
+                # was the last consumer still on the raw lengths.
+                lexical_filler_count=lex_count,
+                acoustic_filler_count=acu_count_deduped,
                 word_count=word_count,
                 trembling=trembling,
             )
@@ -975,6 +1144,8 @@ class AudioPipeline:
         self.total_words = []
         self.total_acoustic_fillers = []
         self.start_time = time.time()
-        self._language_probed = False
+        # Audit Fix 5: matching reset for the multi-strike probe state.
+        self._lang_probe_strikes = 0
+        self._lang_probe_done = False
         self._unsupported_language = None
         self._last_silence_rms = None

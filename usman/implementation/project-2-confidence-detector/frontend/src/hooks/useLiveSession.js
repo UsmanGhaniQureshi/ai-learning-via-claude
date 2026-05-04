@@ -159,6 +159,11 @@ export default function useLiveSession() {
   const audioCtxRef = useRef(null)
   const audioProcessorRef = useRef(null)
   const audioBufferRef = useRef([])
+  // Audit Fix 7: monotonic per-session chunk index. Prepended as a
+  // 4-byte little-endian uint32 to every audio binary message so the
+  // server can detect out-of-order or duplicate chunks. Resets on
+  // session start / stop / reset.
+  const chunkIndexRef = useRef(0)
   const recorderRef = useRef(null)
   const sessionIdRef = useRef(null)
   const sessionStartRef = useRef(null)
@@ -358,7 +363,16 @@ export default function useLiveSession() {
       }
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         try {
-          wsRef.current.send(chunk16k.buffer)
+          // Audit Fix 7: prepend a 4-byte little-endian uint32
+          // chunk index so the server can detect out-of-order or
+          // duplicate chunks on flaky links. Index resets per
+          // session.
+          const idx = chunkIndexRef.current++
+          const audioBytes = new Uint8Array(chunk16k.buffer)
+          const merged = new Uint8Array(4 + audioBytes.byteLength)
+          new DataView(merged.buffer).setUint32(0, idx, true)
+          merged.set(audioBytes, 4)
+          wsRef.current.send(merged.buffer)
         } catch (e) { /* ignore */ }
       }
     }
@@ -400,6 +414,7 @@ export default function useLiveSession() {
     setVideoUrl(null)
     setRemoteVideoUrl(null)
     audioBufferRef.current = []
+    chunkIndexRef.current = 0
     lastTranscriptAppendRef.current = ''
 
     try {
@@ -587,32 +602,71 @@ export default function useLiveSession() {
         setError('WebSocket connection failed')
       }
 
-      // Handle unexpected disconnect (Wi-Fi blip, tab suspended, server
-      // restart). We DON'T attempt a live reconnect with the same
-      // session_id because the backend pipeline's in-memory snapshots
-      // are lost the moment its WS handler exits — a silent resume
-      // would splice a new pipeline's output into the user's report
-      // timeline in confusing ways. Instead: tell the user clearly,
-      // stop local capture, and fall back to fetching whatever the
-      // backend already persisted via HTTP — the stopSession() flow
-      // already handles that HTTP fallback.
-      ws.onclose = () => {
-        if (userStopRef.current) return // normal termination
-        // Unexpected: mark the UI and short-circuit into the normal
-        // stop path so the user lands on /result with whatever data
-        // got saved before the drop.
-        setConnectionStatus('lost')
-        setError(
-          'Connection lost during the session. Saving what was captured up to that point…'
-        )
-        // Defer the stop slightly so React gets to paint the banner
-        // before the HTTP fallback begins — otherwise the user sees
-        // the UI freeze for a second with no explanation.
-        setTimeout(() => {
-          const stop = stopSessionRef.current
-          if (stop) stop().catch(() => {})
-        }, 50)
+      // Structural Fix 3: live reconnect with exponential backoff.
+      // The backend now persists per-chunk snapshots to disk and
+      // replays them on reconnect with the same session_id, so a
+      // brief WS drop no longer loses accumulated state. We try up
+      // to 3 reconnect attempts (1s, 3s, 6s) before falling back to
+      // the original "save what we have via HTTP" graceful stop.
+      const RECONNECT_DELAYS_MS = [1000, 3000, 6000]
+      let reconnectAttempts = 0
+
+      const attachHandlers = (sock) => {
+        sock.binaryType = 'arraybuffer'
+        sock.onmessage = ws.onmessage
+        sock.onerror = ws.onerror
+        sock.onclose = onUnexpectedClose
       }
+
+      const tryReconnect = () => {
+        if (userStopRef.current) return
+        if (reconnectAttempts >= RECONNECT_DELAYS_MS.length) {
+          // Give up — fall back to graceful stop.
+          setConnectionStatus('lost')
+          setError(
+            'Connection lost during the session. Saving what was captured up to that point…',
+          )
+          setTimeout(() => {
+            const stop = stopSessionRef.current
+            if (stop) stop().catch(() => {})
+          }, 50)
+          return
+        }
+        const delay = RECONNECT_DELAYS_MS[reconnectAttempts]
+        reconnectAttempts += 1
+        setConnectionStatus('reconnecting')
+        setTimeout(() => {
+          if (userStopRef.current) return
+          try {
+            const next = new WebSocket(wsUrl(`/ws/session/${sessionId}`))
+            wsRef.current = next
+            next.addEventListener('open', () => {
+              // Server detects existing snapshots.jsonl by session_id
+              // and replays automatically; client just resumes
+              // streaming. Re-send session_meta so the server has the
+              // sample_rate handshake on the new socket too.
+              try {
+                next.send(JSON.stringify({
+                  type: 'session_meta',
+                  sample_rate: 16000,
+                }))
+              } catch (e) { /* ignore */ }
+              setConnectionStatus('connected')
+              reconnectAttempts = 0  // reset window on successful reopen
+            }, { once: true })
+            attachHandlers(next)
+          } catch (e) {
+            tryReconnect()  // immediately escalate to next attempt
+          }
+        }, delay)
+      }
+
+      const onUnexpectedClose = () => {
+        if (userStopRef.current) return  // normal termination
+        tryReconnect()
+      }
+
+      ws.onclose = onUnexpectedClose
 
       // Wait for WS to open
       await new Promise((resolve, reject) => {
@@ -626,15 +680,22 @@ export default function useLiveSession() {
       // subsequent messages would just overwrite (no-op in normal
       // flow). Free-practice sessions skip this and the coaching
       // path short-circuits to "skipped".
-      if (setupMeta?.promptTitle) {
-        try {
-          ws.send(JSON.stringify({
-            type: 'session_meta',
+      // Audit Fix 2: always send a session_meta with sample_rate=16000
+      // so the server-side handshake validation can run. Previously
+      // session_meta was only sent when promptTitle was set, leaving
+      // the server unable to confirm the client's audio rate. We
+      // always emit at least the sample_rate; prompt fields are
+      // included when present.
+      try {
+        ws.send(JSON.stringify({
+          type: 'session_meta',
+          sample_rate: 16000,
+          ...(setupMeta?.promptTitle ? {
             prompt_title: setupMeta.promptTitle,
             prompt_body: setupMeta.promptBody || '',
-          }))
-        } catch (e) { /* ignore — coaching just won't fire */ }
-      }
+          } : {}),
+        }))
+      } catch (e) { /* ignore — coaching just won't fire */ }
 
       // 4. Start video recorder.
       //
@@ -809,6 +870,34 @@ export default function useLiveSession() {
       }
       if (faceIntervalRef.current) clearInterval(faceIntervalRef.current)
       if (durationIntervalRef.current) clearInterval(durationIntervalRef.current)
+    }
+  }, [])
+
+  // Audit Fix 1: stop the session if the tab is hidden mid-recording.
+  // Browsers throttle AudioContext to ~1 Hz on a backgrounded tab —
+  // chunks arrive late, lag face data, and Whisper sees fragmented
+  // audio while the score gauge keeps updating with plausible-looking
+  // numbers based on a fraction of the user's speech. Safer to halt
+  // capture and surface a clear banner than silently produce wrong
+  // scores. Uses refs so the listener doesn't re-bind on every state
+  // change.
+  const sessionStateRef = useRef(sessionState)
+  useEffect(() => { sessionStateRef.current = sessionState }, [sessionState])
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.hidden && sessionStateRef.current === 'active') {
+        setError(
+          'Session stopped — tab was hidden. Recording requires an active tab.',
+        )
+        const stop = stopSessionRef.current
+        if (stop) {
+          try { stop() } catch (e) { /* ignore */ }
+        }
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange)
     }
   }, [])
 

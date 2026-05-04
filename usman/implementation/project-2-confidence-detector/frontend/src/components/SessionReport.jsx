@@ -108,6 +108,9 @@ export default function SessionReport({
     live_hud_timeline: liveHudTimeline,
     voice_trembling: voiceTrembling,
     emotion: emotionSummary,
+    quiet_recording: quietRecording,
+    naturally_narrow_pitch: naturallyNarrowPitch,
+    multiple_speakers_suspected: multipleSpeakers,
   } = report
 
   // Title-vs-transcript mismatch banner. The llm_coach module flags
@@ -305,7 +308,13 @@ export default function SessionReport({
           signal-breakdown drawer because they answer "how did the
           speaker actually sound?" — the question users open the
           report to answer first. */}
-      {(emotionSummary?.mix || voiceTrembling) && (
+      {(
+        emotionSummary?.mix
+        || voiceTrembling
+        || quietRecording
+        || naturallyNarrowPitch
+        || multipleSpeakers
+      ) && (
         <div className="glass-card p-5 space-y-5">
           <div className="flex items-center justify-between flex-wrap gap-2">
             <h3 className="m-0">How you sounded</h3>
@@ -353,6 +362,77 @@ export default function SessionReport({
                     {' '}· Penalty applied to confidence score.
                   </>
                 )}
+              </p>
+            </div>
+          )}
+
+          {/* Structural Fix 1: naturally-narrow-pitch disclosure.
+              Fires only for repeat users (≥3 prior sessions) whose
+              historical median pitch_std is below 8 Hz. Amber-yellow
+              border to match the family of advisory badges; the
+              copy is explicit that this is a calibration note, not
+              a fault. */}
+          {naturallyNarrowPitch && (
+            <div className="rounded-md p-3 bg-[rgba(251,191,36,0.08)] border border-[rgba(251,191,36,0.4)]">
+              <div className="flex items-baseline justify-between gap-3 flex-wrap">
+                <span className="text-sm font-semibold text-text-primary">
+                  Naturally Narrow Pitch Range
+                </span>
+                <span className="text-sm font-bold text-warning">
+                  Calibrated
+                </span>
+              </div>
+              <p className="text-xs text-text-muted mt-1">
+                Your natural pitch range is narrower than typical. The
+                Vocal Variety score and any "monotone" emotion reading
+                reflect that personal pattern rather than today's
+                delivery. Detected from your prior sessions.
+              </p>
+            </div>
+          )}
+
+          {/* Structural Fix 2: multi-speaker heuristic. Triggers when
+              consecutive voiced segments show large pitch jumps
+              consistent with more than one speaker. Slate-blue
+              border to distinguish from the trembling/quiet bands. */}
+          {multipleSpeakers && (
+            <div className="rounded-md p-3 bg-[rgba(99,102,241,0.08)] border border-[rgba(99,102,241,0.4)]">
+              <div className="flex items-baseline justify-between gap-3 flex-wrap">
+                <span className="text-sm font-semibold text-text-primary">
+                  Multiple Voices Detected
+                </span>
+                <span className="text-sm font-bold text-text-accent">
+                  Heuristic
+                </span>
+              </div>
+              <p className="text-xs text-text-muted mt-1">
+                Pitch jumps between speech segments suggest more than
+                one speaker. The score may not reflect a single
+                speaker — re-record solo for a cleaner reading.
+              </p>
+            </div>
+          )}
+
+          {/* Audit Fix 6: low-volume warning. The backend sets
+              quiet_recording=true when median chunk RMS is below
+              0.02 (live / audio upload) or 0.04 (video upload, post
+              dynaudnorm). Yellow/amber border to distinguish from
+              the red trembling banner above. */}
+          {quietRecording && (
+            <div className="rounded-md p-3 bg-[rgba(245,158,11,0.08)] border border-[rgba(245,158,11,0.4)]">
+              <div className="flex items-baseline justify-between gap-3 flex-wrap">
+                <span className="text-sm font-semibold text-text-primary">
+                  Low Mic Volume
+                </span>
+                <span className="text-sm font-bold text-warning">
+                  Detected
+                </span>
+              </div>
+              <p className="text-xs text-text-muted mt-1">
+                ⚠ Low mic volume detected — voice steadiness reflects
+                normalised audio, not your raw delivery. Move closer
+                to the mic or raise input gain for a more accurate
+                reading next time.
               </p>
             </div>
           )}

@@ -262,12 +262,21 @@ def _fetch_user_baseline(
         return {"ready": False, "n_sessions": n}
 
     per_signal: dict[str, list[float]] = {s: [] for s in SIGNALS}
+    # Structural Fix 1: also collect the per-session raw pitch_std
+    # median (Hz) — emitted by report_generator as
+    # `session_pitch_std_median`. Drives the naturally_narrow_pitch
+    # disclosure for repeat users.
+    pitch_std_vals: list[float] = []
     for r in rows:
-        avgs = (r.report_json or {}).get("signal_averages") or {}
+        rj = r.report_json or {}
+        avgs = rj.get("signal_averages") or {}
         for s in SIGNALS:
             v = avgs.get(s)
             if isinstance(v, (int, float)):
                 per_signal[s].append(float(v))
+        ps = rj.get("session_pitch_std_median")
+        if isinstance(ps, (int, float)) and ps > 0:
+            pitch_std_vals.append(float(ps))
 
     out: dict = {"ready": True, "n_sessions": n}
     for s in SIGNALS:
@@ -282,6 +291,19 @@ def _fetch_user_baseline(
         var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
         std = var ** 0.5
         out[s] = {"mean": round(mean, 1), "std": round(std, 2), "n": len(vals)}
+
+    # Structural Fix 1: pitch_std baseline. Mirrors the per-signal
+    # shape so report_generator can `.get("pitch_std_median")` and
+    # check `.n >= 3` and `.mean < 8.0` to disclose a naturally
+    # narrow pitch range.
+    if len(pitch_std_vals) >= 3:
+        ps_mean = sum(pitch_std_vals) / len(pitch_std_vals)
+        ps_var = sum((v - ps_mean) ** 2 for v in pitch_std_vals) / (len(pitch_std_vals) - 1)
+        out["pitch_std_median"] = {
+            "mean": round(ps_mean, 2),
+            "std": round(ps_var ** 0.5, 2),
+            "n": len(pitch_std_vals),
+        }
     return out
 
 
@@ -993,6 +1015,211 @@ try:
 except ImportError:
     FFMPEG = 'ffmpeg'
 
+# ffprobe path. imageio_ffmpeg only ships ffmpeg; ffprobe is usually
+# installed alongside system ffmpeg. We fall back to "ffprobe" on PATH
+# and let callers handle missing-binary errors.
+FFPROBE = os.environ.get('FFPROBE_BIN', 'ffprobe')
+
+# Audit Fix 5: hard duration cap for uploads (60 minutes). 500 MB is
+# already enforced as a size cap, but low-bitrate ogg-opus / m4a can
+# encode many hours within that envelope and Whisper would run for
+# an hour with no client feedback. Operators can override via env.
+MAX_UPLOAD_DURATION_S = float(os.environ.get('MAX_UPLOAD_DURATION_S', '3600'))
+
+
+def _probe_media_duration(path: str) -> float | None:
+    """Return media duration in seconds, or None on failure.
+
+    Uses ffprobe (preferred — matches the audit spec). Returns None if
+    ffprobe is missing or output is unparseable; callers treat that as
+    "could not determine, allow through" rather than a hard reject so a
+    missing binary doesn't block all uploads.
+    """
+    try:
+        result = subprocess.run(
+            [FFPROBE,
+             '-v', 'error',
+             '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1',
+             path],
+            capture_output=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        return float(result.stdout.decode('utf-8', errors='ignore').strip())
+    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+# ── Structural Fix 3: WS reconnect via on-disk snapshot persistence ──
+# Each per-chunk snapshot is appended to a JSONL file as it is
+# produced by the live WS pipeline. If the WS drops mid-session and
+# the same `session_id` reconnects, the server replays the JSONL into
+# the in-memory snapshots list so accumulated state survives the gap.
+# Numpy arrays and other non-JSON-serialisable fields are stripped
+# before writing — the trembling / pitch / emotion blocks are pure
+# Python primitives by construction.
+#
+# TODO: a daily startup sweep that prunes jsonl files older than
+# 24 h. Out of scope for this patch; uploaded sessions self-clean
+# on stop_session.
+
+def _session_snapshots_path(session_id: str):
+    """Return the path of the per-session snapshots JSONL file.
+
+    `_safe_media_id` already validates that `session_id` is alphanum/_/.
+    so it cannot escape RECORDINGS_DIR.
+    """
+    return RECORDINGS_DIR / f"{session_id}.snapshots.jsonl"
+
+
+def _serialise_snapshot_for_jsonl(snap: dict) -> dict:
+    """Strip non-JSON fields before persisting. Returns a NEW dict —
+    the in-memory snapshot is not mutated. The audio_pipeline output
+    is mostly Python primitives already; this helper is defensive
+    against numpy arrays leaking from raw features (none today, but
+    cheap insurance).
+    """
+    def _clean(v):
+        if isinstance(v, dict):
+            return {k: _clean(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_clean(x) for x in v]
+        if isinstance(v, (str, bool, int, float)) or v is None:
+            return v
+        # numpy scalar / array fallback
+        try:
+            import numpy as _np
+            if isinstance(v, _np.ndarray):
+                return v.tolist()
+            if hasattr(v, 'item'):
+                return v.item()
+        except Exception:
+            pass
+        return None  # drop anything we can't safely serialise
+    return _clean(snap)
+
+
+def _append_snapshot_jsonl(path, snap: dict) -> None:
+    """Append one JSON-serialised snapshot line. Failure is logged
+    but never propagates — the in-memory snapshots list is the
+    source of truth for the active session; persistence is a
+    reconnect aid, not a scoring dependency.
+    """
+    try:
+        clean = _serialise_snapshot_for_jsonl(snap)
+        with open(path, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(clean, separators=(',', ':')) + '\n')
+    except Exception as e:
+        log.warning(
+            "ws.snapshot_jsonl_write_failed",
+            extra={"path": str(path), "error": str(e)},
+        )
+
+
+def _load_snapshots_jsonl(path) -> list[dict]:
+    """Replay a session's JSONL into a list of snapshot dicts.
+    Lines that fail to parse are skipped — partial replay beats
+    full data loss on a corrupt write.
+    """
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        log.warning(
+            "ws.snapshot_jsonl_read_failed",
+            extra={"path": str(path), "error": str(e)},
+        )
+    return out
+
+
+def _delete_snapshots_jsonl(path) -> None:
+    """Remove the per-session snapshots file after a clean stop.
+    Idempotent — missing file is fine."""
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        log.warning(
+            "ws.snapshot_jsonl_delete_failed",
+            extra={"path": str(path), "error": str(e)},
+        )
+
+
+# Default 24h window for abandoned-session cleanup. After 24h the
+# user has long since closed the browser tab and will not reconnect
+# to that session. Configurable via JSONL_CLEANUP_HOURS env var.
+JSONL_CLEANUP_HOURS = float(os.environ.get("JSONL_CLEANUP_HOURS", "24"))
+
+
+def sweep_orphaned_snapshot_jsonl(max_age_hours: float = JSONL_CLEANUP_HOURS) -> dict:
+    """Delete *.snapshots.jsonl files older than max_age_hours.
+
+    These are mid-session recovery files for the live WS reconnect
+    path. A clean session-end deletes its own JSONL via
+    `_delete_snapshots_jsonl`; this sweep only picks up ORPHANS from
+    crashed / abandoned sessions where stop_session was never called.
+
+    The sweep does NOT touch any other file in RECORDINGS_DIR — video
+    recordings, audio recordings, and DB-persisted reports are
+    completely untouched. The user's saved data is safe.
+
+    Returns a dict with `deleted_count`, `bytes_freed`, `errors` so
+    the caller can log a summary line.
+    """
+    import time as _time
+    deleted = 0
+    bytes_freed = 0
+    errors = 0
+    cutoff = _time.time() - max_age_hours * 3600
+    try:
+        candidates = list(RECORDINGS_DIR.glob("*.snapshots.jsonl"))
+    except Exception as e:
+        log.warning("snapshots.sweep.glob_failed", extra={"error": str(e)})
+        return {"deleted_count": 0, "bytes_freed": 0, "errors": 1}
+    for p in candidates:
+        try:
+            mtime = p.stat().st_mtime
+            if mtime < cutoff:
+                size = p.stat().st_size
+                p.unlink()
+                deleted += 1
+                bytes_freed += size
+                log.info(
+                    "snapshots.sweep.deleted_orphan",
+                    extra={
+                        "path": str(p.name),
+                        "age_hours": round((_time.time() - mtime) / 3600, 1),
+                        "bytes": size,
+                    },
+                )
+        except Exception as e:
+            errors += 1
+            log.warning(
+                "snapshots.sweep.delete_failed",
+                extra={"path": str(p), "error": str(e)},
+            )
+    log.info(
+        "snapshots.sweep.completed",
+        extra={
+            "deleted_count": deleted,
+            "bytes_freed": bytes_freed,
+            "errors": errors,
+            "max_age_hours": max_age_hours,
+        },
+    )
+    return {"deleted_count": deleted, "bytes_freed": bytes_freed, "errors": errors}
+
 # Configuration from environment
 PORT = int(os.environ.get('PORT', 8000))
 
@@ -1206,6 +1433,50 @@ async def warmup_models():
     # until models are ready. Clients will see 503 until then.
     ok = await loop.run_in_executor(None, preload)
     _models_ready = bool(ok)
+
+
+@app.on_event("startup")
+async def schedule_jsonl_cleanup():
+    """Sweep orphaned mid-session snapshot files at startup, then once
+    every 24 h thereafter.
+
+    SAFETY NOTE: this ONLY touches `*.snapshots.jsonl` files —
+    transient mid-session recovery state for the live WS reconnect
+    path. Final reports, video recordings, audio recordings, and DB
+    rows are completely untouched. A user opening a 3-week-old
+    session reads from `Media.report_json` (DB) and the recording
+    files in RECORDINGS_DIR — both of which this sweep never goes
+    near.
+
+    Run on startup AND on a 24 h timer because long-running
+    deployments don't restart often enough to rely on startup
+    cleanup alone.
+    """
+    # 1. One-shot sweep at startup — catches accumulated orphans
+    # from prior process runs.
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, sweep_orphaned_snapshot_jsonl,
+        )
+    except Exception as e:
+        log.warning("snapshots.sweep.startup_failed", extra={"error": str(e)})
+
+    # 2. Background loop for long-running deployments. Daily cadence
+    # is enough — the JSONLs are tiny and the cost of running them
+    # an extra day or two is zero compared to losing a reconnect.
+    async def _periodic_sweep():
+        while True:
+            try:
+                await asyncio.sleep(24 * 3600)
+                await asyncio.get_event_loop().run_in_executor(
+                    None, sweep_orphaned_snapshot_jsonl,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.warning("snapshots.sweep.periodic_failed", extra={"error": str(e)})
+
+    asyncio.create_task(_periodic_sweep())
 
 
 @app.get("/")
@@ -1478,6 +1749,21 @@ def _run_upload_pipeline_sync(
     _set_media_status(upload_id, "processing")
     audio_extraction_error = None
     video_encode_error = None
+
+    # Audit Fix 5: reject uploads longer than MAX_UPLOAD_DURATION_S
+    # (default 60 minutes). 500 MB is already enforced as a size cap
+    # but low-bitrate codecs can pack hours into that envelope and
+    # Whisper would otherwise tie up the worker for an hour. Probing
+    # uses ffprobe; on probe failure we let the upload through rather
+    # than blocking everyone behind a missing-binary.
+    _duration_s = _probe_media_duration(filepath)
+    if _duration_s is not None and _duration_s > MAX_UPLOAD_DURATION_S:
+        _max_min = int(MAX_UPLOAD_DURATION_S // 60)
+        _set_media_status(
+            upload_id, "failed",
+            error=f"Upload rejected: maximum supported duration is {_max_min} minutes.",
+        )
+        return
 
     try:
         # Pre-analysis trim/concat. Failure here is fatal (we mark the
@@ -2249,11 +2535,31 @@ def _run_upload_pipeline_sync(
         # the short-circuit above this block — if we got here, the
         # input was English and we proceed to score normally.
 
-        # Pass the session-level trembling block so update() applies
-        # the −10/−20 penalty to the session headline (matching what
-        # the per-chunk path already does).
-        final_scores = upload_scoring.update(sub_scores, trembling=session_trembling)
-        overall_score = final_scores['total']
+        # Audit Fix 2: drop trembling=session_trembling from the
+        # update() call below. The per-chunk path inside
+        # AudioPipeline.process_chunk already applied the −10/−20
+        # penalty to each snapshot["scores"]["total"]; if we let
+        # update() apply it AGAIN on session-averaged sub-scores we
+        # get two different headline numbers (per-chunk-avg vs
+        # session-aggregate) that disagree on trembling sessions.
+        # update() still needs sub_scores for the per-signal display
+        # rows, but the headline number we surface is the average of
+        # the per-chunk totals (penalty already baked in).
+        final_scores = upload_scoring.update(sub_scores)
+
+        # Single source of truth for the headline: average of the
+        # per-chunk totals. Computed once here and reused below for
+        # both the canonical `overall_score` and the existing stderr
+        # band. Both numbers now derive from the same list so the UI
+        # cannot show drift between them.
+        _per_chunk_totals = [
+            s["scores"].get("total") for s in snapshots
+            if s.get("scores", {}).get("total") is not None
+        ]
+        if _per_chunk_totals:
+            overall_score = int(round(sum(_per_chunk_totals) / len(_per_chunk_totals)))
+        else:
+            overall_score = final_scores['total']
 
         # Session-level emotion mix. report_generator does the same
         # via aggregate_emotion_mixes(...) — we call it directly here
@@ -2290,17 +2596,68 @@ def _run_upload_pipeline_sync(
             "is_trembling_session": _is_trembling_session,
         }
 
-        # Item 3 (uncertainty band): per-chunk variance of the headline.
-        # ScoringEngine.update is called once over session-averaged
-        # inputs in this path, so its rolling-window doesn't capture the
-        # session-wide variance we want. Compute it directly from the
-        # per-chunk SignalScorer.aggregate results that AudioPipeline
-        # already attached to each snapshot. None entries (silent
-        # chunks) are skipped — variance over real measurements only.
-        _per_chunk_totals = [
-            s["scores"].get("total") for s in snapshots
-            if s.get("scores", {}).get("total") is not None
+        # Audit Fix 7: quiet_recording flag. Upload Video bytes have
+        # already been pumped through ffmpeg's `dynaudnorm` filter
+        # (see line ~1593) so the chunk RMS we have here is
+        # POST-normalisation. We bump the threshold to 0.04 (vs the
+        # 0.02 used by the live / audio-upload paths) because
+        # dynaudnorm can boost up to 8x — anything still under 0.04
+        # post-norm started genuinely quiet. A future improvement
+        # would run a one-shot `ffmpeg -af volumedetect` pre-pass to
+        # measure the true input level; not worth the extra ffmpeg
+        # invocation today.
+        _upload_chunk_rms = [
+            s["raw"].get("rms") for s in snapshots
+            if isinstance(s.get("raw", {}).get("rms"), (int, float))
         ]
+        if _upload_chunk_rms:
+            _upload_median_rms = sorted(_upload_chunk_rms)[len(_upload_chunk_rms) // 2]
+        else:
+            _upload_median_rms = None
+        quiet_recording = (
+            _upload_median_rms is not None and _upload_median_rms < 0.04
+        )
+
+        # Structural Fixes 1 + 2: pitch std median + multi-speaker
+        # heuristic for upload_video parity with the live / audio
+        # paths that go through report_generator. report_generator
+        # is bypassed by upload_video so we recompute the same
+        # fields here using the snapshots.
+        _upload_pitch_stds = [
+            float((s.get("raw") or {}).get("pitch", {}).get("std_hz") or 0.0)
+            for s in snapshots
+            if (s.get("raw") or {}).get("pitch")
+            and ((s["raw"]["pitch"].get("std_hz") or 0) > 0)
+        ]
+        if _upload_pitch_stds:
+            _ps = sorted(_upload_pitch_stds)
+            _upload_pitch_std_median = round(_ps[len(_ps) // 2], 2)
+        else:
+            _upload_pitch_std_median = None
+
+        _upload_segment_means: list[float] = []
+        for s in snapshots:
+            _ms = ((s.get("raw") or {}).get("pitch") or {}).get("segment_pitch_means") or []
+            for v in _ms:
+                if isinstance(v, (int, float)) and v > 0:
+                    _upload_segment_means.append(float(v))
+        _upload_jump_count = sum(
+            1 for i in range(1, len(_upload_segment_means))
+            if abs(_upload_segment_means[i] - _upload_segment_means[i - 1]) > 80.0
+        )
+        _upload_voiced_total_s = sum(
+            float((s.get("raw") or {}).get("voiced_s") or 0) for s in snapshots
+        )
+        _upload_voiced_min = max(_upload_voiced_total_s / 60.0, 1e-3)
+        _upload_jump_rate = _upload_jump_count / _upload_voiced_min
+        _upload_multispeaker = (
+            _upload_jump_count >= 4 and _upload_jump_rate > 6.0
+        )
+
+        # Item 3 (uncertainty band): per-chunk variance of the headline.
+        # Reuses the same _per_chunk_totals list computed above for
+        # the canonical overall_score so the headline and the ± band
+        # stay derived from one set of numbers.
         if len(_per_chunk_totals) >= 2:
             _mean = sum(_per_chunk_totals) / len(_per_chunk_totals)
             _var = sum((t - _mean) ** 2 for t in _per_chunk_totals) / (len(_per_chunk_totals) - 1)
@@ -2466,6 +2823,22 @@ def _run_upload_pipeline_sync(
             'voice_trembling': voice_trembling_summary,
             'emotion': emotion_summary,
             'emotion_timeline': emotion_timeline,
+            # Audit Fix 7: low-volume warning. UI can render a
+            # "Low mic volume detected — steadiness reflects
+            # normalised audio" badge when this is True.
+            'quiet_recording': quiet_recording,
+            'median_chunk_rms': (
+                round(_upload_median_rms, 4)
+                if _upload_median_rms is not None else None
+            ),
+            # Structural Fixes 1 + 2: pitch std median + multi-speaker
+            # heuristic. Same shape report_generator uses on the live
+            # / audio paths, mirrored here for upload_video parity.
+            'session_pitch_std_median': _upload_pitch_std_median,
+            'naturally_narrow_pitch': False,  # baseline not consulted in this path
+            'multiple_speakers_suspected': _upload_multispeaker,
+            'multi_speaker_jump_count': _upload_jump_count,
+            'multi_speaker_jump_rate_per_min': round(_upload_jump_rate, 2),
             'tips': generate_tips(final_scores),
             'speech_summary': speech_summary,
             'face_timeline': face_results_by_time,
@@ -2861,6 +3234,34 @@ async def session_ws(ws: WebSocket, session_id: str):
     _calibration_announced = False
     _calibration_done_announced = False
     snapshots = []
+    # Structural Fix 3: per-session snapshot persistence. If the WS
+    # drops mid-session, the browser can reconnect with the same
+    # session_id (URL path param). We replay any existing JSONL on
+    # connect so accumulated per-chunk state survives the gap. The
+    # in-memory `snapshots` list stays the source of truth for the
+    # active session; the file is a reconnect aid only.
+    _snapshots_jsonl_path = (
+        _session_snapshots_path(session_id)
+        if _safe_media_id(session_id) else None
+    )
+    if _snapshots_jsonl_path is not None:
+        _replayed = _load_snapshots_jsonl(_snapshots_jsonl_path)
+        if _replayed:
+            snapshots.extend(_replayed)
+            # AudioPipeline keeps `chunk_count` for things like
+            # downstream timestamping. Bring it forward so a
+            # reconnect doesn't restart at chunk 1.
+            try:
+                pipeline.chunk_count = len(_replayed)
+            except Exception:
+                pass
+            try:
+                await ws.send_json({
+                    "type": "session_resumed",
+                    "snapshots_replayed": len(_replayed),
+                })
+            except Exception:
+                pass
     latest_browser_face = {}  # Face scores from browser MediaPipe
     # Step 3 (Live HUD): rolling deque of the last 4 per-chunk total
     # scores. Drives the headline number in the HUD overlay. Skips
@@ -2874,6 +3275,13 @@ async def session_ws(ws: WebSocket, session_id: str):
     # browser stops sending face data (user stepped away from the
     # camera, lid closed, MediaPipe failure). Reset every face msg.
     last_face_msg_at = 0.0
+    # Audit Fix 7: monotonic chunk index validation. Frontend prepends
+    # a 4-byte little-endian uint32 chunk_index to every audio binary
+    # message. We track the highest received index per session and
+    # drop any chunk whose index is not strictly greater than the
+    # last (out-of-order or duplicate). Initial -1 so the first chunk
+    # at index 0 is accepted.
+    last_chunk_index = -1
     # Practice topic + brief, populated by the client's first
     # `session_meta` WS message (see useLiveSession.js). Empty dict
     # means free practice / no topic — coaching short-circuits to
@@ -3059,6 +3467,13 @@ async def session_ws(ws: WebSocket, session_id: str):
         except Exception:
             pass
 
+        # Structural Fix 3: clean up the per-session snapshots JSONL
+        # on a clean session end. Abnormal disconnects (no
+        # finalize_and_send_report) leave the file in place so the
+        # next reconnect can replay it.
+        if _snapshots_jsonl_path is not None:
+            _delete_snapshots_jsonl(_snapshots_jsonl_path)
+
     # Bounded producer/consumer: WS receives queue audio chunks; a
     # separate worker pulls and processes them. When the queue is
     # full (Whisper inference falling behind on a slow CPU) the
@@ -3078,7 +3493,20 @@ async def session_ws(ws: WebSocket, session_id: str):
             result = await asyncio.get_event_loop().run_in_executor(
                 None, pipeline.process_chunk, audio
             )
-        if latest_browser_face:
+        # Audit Fix 4: gate the face-merge branch on face message
+        # freshness. If the browser stopped sending face data
+        # (MediaPipe crashed, face went off-screen, tab lost focus)
+        # the LAST received `latest_browser_face` would otherwise be
+        # used indefinitely — silently scoring eye_contact off stale
+        # values until the next message arrives. Treat anything older
+        # than 1.5 s as absent and fall through to the audio-only
+        # else-branch which nulls the face signals and renormalises.
+        _face_msg_age_s = (
+            max(0.0, time.time() - last_face_msg_at)
+            if last_face_msg_at else 999.0
+        )
+        _face_is_fresh = bool(latest_browser_face) and _face_msg_age_s <= 1.5
+        if _face_is_fresh:
             result["scores"]["eye_contact"] = latest_browser_face.get("eye_contact", 50)
             result["scores"]["expression"] = latest_browser_face.get("expression", 50)
             result["face"] = {
@@ -3089,6 +3517,21 @@ async def session_ws(ws: WebSocket, session_id: str):
                 "tension_score": latest_browser_face.get("tension"),
                 "expression_label": latest_browser_face.get("expression_label"),
             }
+            result["scores"]["total"] = SignalScorer.aggregate(
+                result["scores"],
+                trembling=result.get("raw", {}).get("trembling"),
+            )
+        else:
+            # Audio-only Live Practice (kind=analyzer_audio, or any
+            # kind=session that hasn't received face data yet). Without
+            # this, the placeholder eye_contact=50 / expression=50 set
+            # by audio_pipeline.process_chunk would contribute a fake
+            # ~12-point eye_contact term to the chunk's `total`, making
+            # Live Audio score ~12 points higher than the same audio
+            # uploaded. Mirror the Upload Audio path: null face signals
+            # so SignalScorer.aggregate renormalises the audio weights.
+            result["scores"]["eye_contact"] = None
+            result["scores"]["expression"] = None
             result["scores"]["total"] = SignalScorer.aggregate(
                 result["scores"],
                 trembling=result.get("raw", {}).get("trembling"),
@@ -3121,6 +3564,12 @@ async def session_ws(ws: WebSocket, session_id: str):
         )
 
         snapshots.append(result)
+        # Structural Fix 3: also persist this snapshot to the
+        # per-session JSONL file. Failure is logged inside the helper
+        # but never raises — disk persistence is a reconnect aid, not
+        # a scoring dependency.
+        if _snapshots_jsonl_path is not None:
+            _append_snapshot_jsonl(_snapshots_jsonl_path, result)
         # Suppress live score broadcasts once the language gate fires
         # — per-chunk numbers from English-trained scorers running on
         # non-English audio would be misleading. The persisted report
@@ -3152,7 +3601,46 @@ async def session_ws(ws: WebSocket, session_id: str):
                 break
 
             if message.get('bytes') is not None:
-                audio = np.frombuffer(message['bytes'], dtype=np.float32)
+                raw = message['bytes']
+                # Audit Fix 7: every audio binary now starts with a
+                # 4-byte little-endian uint32 chunk_index. Reject
+                # messages too short to contain the header, and drop
+                # chunks whose index is not strictly greater than the
+                # last (out-of-order / duplicate). The remaining
+                # bytes are the Float32 PCM audio.
+                if len(raw) < 4:
+                    log.warning(
+                        "ws.audio_missing_header",
+                        extra={"len": len(raw), "session_id": session_id},
+                    )
+                    continue
+                chunk_index = int.from_bytes(raw[:4], 'little')
+                audio_bytes = raw[4:]
+                if chunk_index <= last_chunk_index:
+                    log.warning(
+                        "ws.audio_chunk_regression",
+                        extra={
+                            "session_id": session_id,
+                            "chunk_index": chunk_index,
+                            "last_chunk_index": last_chunk_index,
+                        },
+                    )
+                    continue
+                last_chunk_index = chunk_index
+                # Audit Fix 4: validate the byte length before
+                # interpreting as Float32 PCM. np.frombuffer silently
+                # truncates a buffer whose length isn't a multiple of
+                # the dtype size — 4 bytes per float32 — which would
+                # silently corrupt the audio. Discard mis-aligned
+                # chunks and warn so the misbehaving client is loud
+                # in the logs.
+                if len(audio_bytes) % 4 != 0:
+                    log.warning(
+                        "ws.audio_misaligned",
+                        extra={"len": len(audio_bytes), "session_id": session_id},
+                    )
+                    continue
+                audio = np.frombuffer(audio_bytes, dtype=np.float32)
                 if audio_queue.full():
                     # Drop the oldest unprocessed chunk and warn the
                     # client. Better to lose 3 s of audio than block
@@ -3261,6 +3749,36 @@ async def session_ws(ws: WebSocket, session_id: str):
                         body = data.get('prompt_body')
                         if isinstance(body, str):
                             session_meta['prompt_body'] = body.strip()[:1000]
+                        # Audit Fix 4: optional sample_rate handshake.
+                        # The whole pipeline (Silero VAD, PYIN,
+                        # Whisper, compute_voice_trembling) is wired
+                        # to 16000 Hz. If a future client streams at
+                        # any other rate every signal silently
+                        # produces wrong numbers. Reject loudly with
+                        # a clear error code and close. Missing field
+                        # → assume 16000 (back-compat for current
+                        # clients which already stream at 16k).
+                        sr_field = data.get('sample_rate')
+                        if sr_field is not None:
+                            try:
+                                sr_int = int(sr_field)
+                            except (TypeError, ValueError):
+                                sr_int = -1
+                            if sr_int != 16000:
+                                try:
+                                    await ws.send_json({
+                                        "type": "error",
+                                        "code": "unsupported_sample_rate",
+                                        "expected": 16000,
+                                        "got": sr_int,
+                                    })
+                                except Exception:
+                                    pass
+                                try:
+                                    await ws.close()
+                                except Exception:
+                                    pass
+                                return
                     elif data.get('type') == 'stop_session':
                         # Drain the queue before finalize so every
                         # chunk the user spoke is in `snapshots`
@@ -3411,6 +3929,17 @@ def _run_analyzer_pipeline_sync(
     `saved_path` / `saved_name` to whatever it returns.
     """
     _set_media_status(media_id, "processing")
+
+    # Audit Fix 5: same 60-minute cap on the audio-upload pipeline.
+    _duration_s = _probe_media_duration(str(saved_path))
+    if _duration_s is not None and _duration_s > MAX_UPLOAD_DURATION_S:
+        _max_min = int(MAX_UPLOAD_DURATION_S // 60)
+        _set_media_status(
+            media_id, "failed",
+            error=f"Upload rejected: maximum supported duration is {_max_min} minutes.",
+        )
+        return
+
     chunk_samples = 16000 * 3
     chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
     pipeline = AudioPipeline()

@@ -154,7 +154,18 @@ def _pitch_arousal(pitch_mean_hz: float) -> float:
 
 
 def _wpm_arousal(wpm: float) -> float:
-    """0-1 arousal index from speech rate. Peaks above 200 WPM."""
+    """0-1 arousal index from speech rate. Peaks above 200 WPM.
+
+    Audit Fix 4 (doc-only): the original spec phrased pace as
+    "fast = >170 WPM, slow = <110 WPM". This linear ramp anchors
+    100 WPM → 0.0 and 200 WPM → 0.67, so a speaker at the spec's
+    "fast" boundary (170) lands at ~0.47 arousal — measurable but
+    not dominant. Only sustained > 220 WPM pushes the excited
+    label to dominate. The ramp is intentionally smooth so a
+    speaker at the spec's "slow" boundary (110) still produces
+    a small but non-zero arousal (~0.07), reflecting that 110 is
+    deliberate pacing rather than passive disengagement.
+    """
     if wpm <= 0:
         return 0.0
     # Linear ramp: 100 WPM → 0.0, 200 WPM → 0.7, 250+ → 1.0

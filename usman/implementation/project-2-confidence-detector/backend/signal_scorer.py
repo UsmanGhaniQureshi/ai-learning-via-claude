@@ -75,19 +75,26 @@ class SignalScorer:
 
     @staticmethod
     def voice_steadiness(pitch, rms_std, voiced_s=None):
-        """Score voice steadiness from pitch tremor and volume consistency.
-        pitch: dict with tremor_score (0-1).
-        rms_std: standard deviation of RMS energy over time.
+        """Score voice steadiness from RMS volume consistency only.
+
+        pitch:    dict (kept in the signature for back-compat; the
+                  body no longer reads any pitch field).
+        rms_std:  standard deviation of RMS energy over time.
         voiced_s: total voiced seconds in the source chunk. When < 0.5
-            we return None (no voice = nothing to score). The old
-            "treat tremor=0 + rms_std=0 as a perfect 100" was the
-            silent-speaker bug — silence was being rewarded.
+                  we return None (no voice = nothing to score).
+
+        Audit Fix 1: the previous formula subtracted a pitch-derived
+        instability term that overlapped with the dedicated trembling
+        penalty applied in `aggregate()`. The two together produced
+        ~25-35 effective points of penalty, double the spec range of
+        10-20. Removing the pitch term leaves this signal as a pure
+        loudness-consistency measure; pitch instability is now only
+        penalised once, by the trembling logic in `aggregate()`.
         """
         if voiced_s is not None and voiced_s < 0.5:
             return None
-        tremor_penalty = pitch.get("tremor_score", 0) * 70
         volume_penalty = min(30, (rms_std / 0.06) * 30)
-        return max(0, round(100 - tremor_penalty - volume_penalty))
+        return max(0, round(100 - volume_penalty))
 
     @staticmethod
     def speech_pace(words, vad_segments):

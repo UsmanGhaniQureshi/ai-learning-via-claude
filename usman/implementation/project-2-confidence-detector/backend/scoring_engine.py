@@ -261,6 +261,14 @@ def _wpm_to_score(wpm):
     naturally run 170-190 WPM no longer get capped at 60-75.
 
     Anchors: wpm=100 → ~82, wpm=150 → 100, wpm=190 → ~88, wpm=240 → ~72.
+
+    Audit Fix 4 (doc-only): the original spec phrased pace as
+    "fast = >170 WPM, slow = <110 WPM". This curve maps those bands
+    to scores roughly: wpm=110 → ~85 (good), wpm=170 → ~94 (still
+    great), wpm=200 → ~85 (a touch fast), wpm=240 → ~72 (clearly
+    fast). The tent is intentionally gentle around 110-170 because
+    natural conversational pace varies widely; only the extremes
+    pull the score down significantly.
     """
     if wpm <= 0:
         return 20
