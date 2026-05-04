@@ -1,7 +1,14 @@
 /**
  * SVG circular gauge displaying confidence score (0-100).
  * Animated arc with gradient stroke + soft glow.
+ *
+ * Performance: wrapped in React.memo so a sibling re-render in
+ * LiveSession (e.g. transcript text update every chunk) doesn't
+ * re-render the gauge with the same props. The gauge has no
+ * internal state and renders a 5-element SVG; React.memo's shallow
+ * prop equality eliminates the redundant work entirely.
  */
+import { memo } from 'react'
 
 // Mirrors backend/report_generator.py:GRADE_TABLE so a gauge rendered
 // without an explicit grade prop can still announce one consistent
@@ -24,7 +31,7 @@ function deriveGrade(score) {
   return null
 }
 
-export default function ScoreGauge({ score = 0, label = '', size = 200, grade }) {
+function ScoreGauge({ score = 0, label = '', size = 200, grade }) {
   const radius = (size - 20) / 2
   const circumference = 2 * Math.PI * radius
   const safe = Math.max(0, Math.min(100, Number(score) || 0))
@@ -88,3 +95,5 @@ export default function ScoreGauge({ score = 0, label = '', size = 200, grade })
     </div>
   )
 }
+
+export default memo(ScoreGauge)

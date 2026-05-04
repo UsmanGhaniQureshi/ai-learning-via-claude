@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import SignalInfoTooltip from './SignalInfoTooltip'
 
 const SIGNALS = [
@@ -21,7 +22,11 @@ function fillClass(v) {
   return 'bg-gradient-to-r from-danger to-orange-500'
 }
 
-export default function SignalBars({
+// Performance: memoised so transcript / emotion state updates in
+// LiveSession don't force every score row to re-render. Score
+// values themselves change at most once per 3-second WS chunk, so
+// React.memo's shallow prop equality is the correct optimisation.
+function SignalBars({
   scores = {},
   faceUnavailable = false,
   omitFaceSignals = false,
@@ -69,3 +74,5 @@ export default function SignalBars({
     </div>
   )
 }
+
+export default memo(SignalBars)

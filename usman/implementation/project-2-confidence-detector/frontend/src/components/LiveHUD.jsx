@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import {
   STATUS_BADGE,
   STATUS_DOT_BG,
@@ -99,7 +99,13 @@ function SignalCard({ label, status, accentSubLabel }) {
   )
 }
 
-export default function LiveHUD({
+// Performance: memoised so the HUD only re-renders when its own
+// props change — most importantly liveHud (per WS chunk, ~3 s) and
+// elapsedSeconds (per second, for the timer pill). Without memo,
+// LiveSession's setScores / setEmotion / setTranscript / setScoreHistory
+// each force the whole HUD to re-paint even though none of those
+// values feed it.
+function LiveHUD({
   liveHud,
   elapsedSeconds = 0,
   cameraLabel = '',
@@ -257,3 +263,5 @@ export default function LiveHUD({
     </div>
   )
 }
+
+export default memo(LiveHUD)

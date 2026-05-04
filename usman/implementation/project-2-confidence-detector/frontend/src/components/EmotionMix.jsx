@@ -1,3 +1,5 @@
+import { memo } from 'react'
+
 /**
  * EmotionMix — multi-label emotion result rendered as a stacked bar
  * + legend.
@@ -82,7 +84,12 @@ function largestRemainderPercents(items) {
   return result
 }
 
-export default function EmotionMix({ emotion, compact = false }) {
+// Performance: memoised so a sibling state update (transcript,
+// score) in LiveSession doesn't redraw the 11-segment stacked bar
+// unnecessarily. The emotion mix only changes per 3-second WS chunk;
+// shallow prop equality is enough — `emotion` is a stable reference
+// from the hook between mixes.
+function EmotionMix({ emotion, compact = false }) {
   if (!emotion || !emotion.mix) {
     return (
       <div className="text-sm text-text-muted italic">
@@ -158,3 +165,5 @@ export default function EmotionMix({ emotion, compact = false }) {
     </div>
   )
 }
+
+export default memo(EmotionMix)

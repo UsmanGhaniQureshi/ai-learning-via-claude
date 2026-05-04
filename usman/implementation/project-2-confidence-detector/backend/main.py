@@ -1051,6 +1051,58 @@ def _probe_media_duration(path: str) -> float | None:
         return None
 
 
+def _probe_mean_volume_db(path: str) -> float | None:
+    """Return the mean audio volume of the input in dBFS, or None on
+    failure. Used as a fail-fast guard before the full upload pipeline.
+
+    A silent recording — mic muted, mic disconnected, video with no
+    audio track — registers below -50 dBFS. Real speech sits in the
+    -25 to -15 dBFS band even from a poor laptop microphone. Bailing
+    out before running ffmpeg again, cv2, MediaPipe, Whisper, and PYIN
+    saves 30-90 seconds of compute and gives the user feedback in
+    seconds rather than minutes.
+
+    Implementation: ffmpeg's `volumedetect` filter analyses the entire
+    audio track and prints a `mean_volume: -X dB` line to stderr.
+    Cheap — single pass, no decoded output.
+
+    Returns None on probe failure (missing ffmpeg, no audio track,
+    parse error). Callers treat None as "could not determine, allow
+    through" so a missing binary doesn't block all uploads.
+    """
+    try:
+        result = subprocess.run(
+            [FFMPEG, '-i', path, '-af', 'volumedetect',
+             '-f', 'null', '-', '-hide_banner', '-loglevel', 'info'],
+            capture_output=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    stderr = result.stderr.decode('utf-8', errors='ignore')
+    m = re.search(r'mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB', stderr)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+# Silent-input threshold. Anything below this on the volumedetect
+# pre-pass is treated as "no speech possible" and rejected upfront.
+# -50 dBFS is well below any speech captured on any reasonable mic;
+# room noise + mic self-noise typically sits in the -45 to -35 band.
+SILENT_INPUT_THRESHOLD_DB = float(os.environ.get('SILENT_INPUT_THRESHOLD_DB', '-50'))
+
+
+# Streaming early-bail thresholds for the chunk loop. After this many
+# chunks (≈30 s at 3-second cadence) with cumulative voiced_s below
+# `_EARLY_BAIL_VOICED_S`, abort the rest of the upload to avoid
+# running Whisper / cv2 / MediaPipe over silent or near-silent audio.
+_EARLY_BAIL_AFTER_CHUNKS = 10
+_EARLY_BAIL_VOICED_S = 1.5
+
+
 # ── Structural Fix 3: WS reconnect via on-disk snapshot persistence ──
 # Each per-chunk snapshot is appended to a JSONL file as it is
 # produced by the live WS pipeline. If the WS drops mid-session and
@@ -1765,6 +1817,28 @@ def _run_upload_pipeline_sync(
         )
         return
 
+    # Fail-fast on silent input. The user reported: "I uploaded a
+    # 4-minute silent video and got 'Not enough speech to score' AFTER
+    # 4 minutes of processing". The full pipeline (cv2 + MediaPipe +
+    # Whisper + PYIN per 3-s chunk) is the slow part; an upfront
+    # ffmpeg volumedetect pass takes ~1 s and detects truly-silent
+    # input (mic muted, no audio track, mic disconnected) before any
+    # of that work begins.
+    _mean_db = _probe_mean_volume_db(filepath)
+    if _mean_db is not None and _mean_db < SILENT_INPUT_THRESHOLD_DB:
+        log.info(
+            "upload.silent_input_rejected_upfront",
+            extra={"upload_id": upload_id, "mean_volume_db": _mean_db},
+        )
+        _set_media_status(
+            upload_id, "failed",
+            error=(
+                "We didn't pick up any audio in this recording. "
+                "Make sure your microphone was on and try again."
+            ),
+        )
+        return
+
     try:
         # Pre-analysis trim/concat. Failure here is fatal (we mark the
         # row failed) because the user explicitly asked for a specific
@@ -1889,8 +1963,19 @@ def _run_upload_pipeline_sync(
             chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
             pipeline = AudioPipeline()
 
+            # Streaming early-bail state — see _EARLY_BAIL_AFTER_CHUNKS /
+            # _EARLY_BAIL_VOICED_S constants for thresholds. If the
+            # first ~30 s of audio yields effectively zero voiced
+            # speech, abort the rest of the pipeline. The volumedetect
+            # pre-pass earlier in this function catches truly silent
+            # files; this catches "audio is present but nobody is
+            # speaking" (background music, ambient noise) before
+            # Whisper / cv2 / MediaPipe burn through 3+ minutes of
+            # remaining content.
+            early_bail = False
+
             def _stream_and_process_sync():
-                nonlocal has_audio
+                nonlocal has_audio, early_bail
                 total_bytes = 0
                 leftover = b""
                 try:
@@ -1916,6 +2001,35 @@ def _run_upload_pipeline_sync(
                                 chunk_result, {}, 0.0, hud_total_history,
                             )
                             snapshots.append(chunk_result)
+
+                            # Streaming early-bail: after the first
+                            # _EARLY_BAIL_AFTER_CHUNKS chunks, if total
+                            # voiced speech is below
+                            # _EARLY_BAIL_VOICED_S, stop processing.
+                            if len(snapshots) == _EARLY_BAIL_AFTER_CHUNKS:
+                                cum_voiced = sum(
+                                    float((s.get("raw") or {}).get("voiced_s") or 0)
+                                    for s in snapshots
+                                )
+                                if cum_voiced < _EARLY_BAIL_VOICED_S:
+                                    log.info(
+                                        "upload.early_bail_no_speech",
+                                        extra={
+                                            "upload_id": upload_id,
+                                            "chunks_seen": len(snapshots),
+                                            "cum_voiced_s": round(cum_voiced, 2),
+                                        },
+                                    )
+                                    early_bail = True
+                                    # Drain ffmpeg so it exits cleanly
+                                    # rather than blocking on a full
+                                    # stdout pipe; we don't actually
+                                    # need its remaining bytes.
+                                    try:
+                                        proc.kill()
+                                    except Exception:
+                                        pass
+                                    return None
                         leftover = buf
                     if leftover:
                         arr = np.frombuffer(leftover, dtype=np.int16).astype(np.float32) / 32768.0
@@ -1949,6 +2063,24 @@ def _run_upload_pipeline_sync(
                     except Exception: pass
 
             audio_extraction_error = _stream_and_process_sync()
+
+        # Streaming early-bail: the audio loop saw silent / near-silent
+        # input across the first 30 s. Don't proceed to cv2 + face
+        # engine + Whisper aggregation — surface the rejection now so
+        # the user gets feedback in seconds rather than minutes.
+        if early_bail:
+            cap.release()
+            try: os.unlink(filepath)
+            except OSError: pass
+            _set_media_status(
+                upload_id, "failed",
+                error=(
+                    "We didn't detect enough speech in this recording. "
+                    "Make sure your microphone was on and you spoke "
+                    "clearly, then try again."
+                ),
+            )
+            return
 
         # Process video frames with face engine
         output_name = f"processed_{upload_id}.mp4"
@@ -2635,6 +2767,33 @@ def _run_upload_pipeline_sync(
         else:
             _upload_pitch_std_median = None
 
+        # Cross-pipeline parity: upload_video used to skip
+        # _fetch_user_baseline entirely, which meant
+        # `naturally_narrow_pitch` could never fire here even on
+        # repeat users with a confirmed narrow-pitch baseline. The
+        # other three pipelines all consult the baseline; this
+        # restores parity.
+        _upload_user_baseline = None
+        try:
+            _upload_user_baseline = _fetch_user_baseline(
+                user_id, exclude_media_id=upload_id,
+            )
+        except Exception as e:
+            log.warning(
+                "upload.user_baseline_fetch_failed",
+                extra={"upload_id": upload_id, "error": str(e)},
+            )
+        _upload_naturally_narrow = False
+        if isinstance(_upload_user_baseline, dict) and _upload_user_baseline.get("ready"):
+            _ub_pitch = _upload_user_baseline.get("pitch_std_median")
+            if (
+                isinstance(_ub_pitch, dict)
+                and _ub_pitch.get("n", 0) >= 3
+                and isinstance(_ub_pitch.get("mean"), (int, float))
+                and _ub_pitch["mean"] < 8.0
+            ):
+                _upload_naturally_narrow = True
+
         _upload_segment_means: list[float] = []
         for s in snapshots:
             _ms = ((s.get("raw") or {}).get("pitch") or {}).get("segment_pitch_means") or []
@@ -2834,8 +2993,12 @@ def _run_upload_pipeline_sync(
             # Structural Fixes 1 + 2: pitch std median + multi-speaker
             # heuristic. Same shape report_generator uses on the live
             # / audio paths, mirrored here for upload_video parity.
+            # `naturally_narrow_pitch` is now driven by the same
+            # _fetch_user_baseline call the other pipelines use —
+            # was previously hardcoded False on this path, which was
+            # a cross-pipeline consistency gap.
             'session_pitch_std_median': _upload_pitch_std_median,
-            'naturally_narrow_pitch': False,  # baseline not consulted in this path
+            'naturally_narrow_pitch': _upload_naturally_narrow,
             'multiple_speakers_suspected': _upload_multispeaker,
             'multi_speaker_jump_count': _upload_jump_count,
             'multi_speaker_jump_rate_per_min': round(_upload_jump_rate, 2),
@@ -3940,6 +4103,24 @@ def _run_analyzer_pipeline_sync(
         )
         return
 
+    # Fail-fast on silent audio uploads — same logic as upload_video.
+    # Catches "I forgot to enable my mic" within ~1 s instead of after
+    # the full Whisper + PYIN pipeline runs over silence.
+    _mean_db = _probe_mean_volume_db(str(saved_path))
+    if _mean_db is not None and _mean_db < SILENT_INPUT_THRESHOLD_DB:
+        log.info(
+            "analyzer.silent_input_rejected_upfront",
+            extra={"media_id": media_id, "mean_volume_db": _mean_db},
+        )
+        _set_media_status(
+            media_id, "failed",
+            error=(
+                "We didn't pick up any audio in this recording. "
+                "Make sure your microphone was on and try again."
+            ),
+        )
+        return
+
     chunk_samples = 16000 * 3
     chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
     pipeline = AudioPipeline()
@@ -3998,6 +4179,8 @@ def _run_analyzer_pipeline_sync(
         )
         return
 
+    early_bail_audio = {"hit": False}
+
     def _stream_and_process_sync():
         total_bytes = 0
         leftover = b""
@@ -4035,6 +4218,31 @@ def _run_analyzer_pipeline_sync(
                         result, {}, 0.0, hud_total_history,
                     )
                     snapshots.append(result)
+
+                    # Streaming early-bail (mirrors upload_video). After
+                    # _EARLY_BAIL_AFTER_CHUNKS chunks (~30 s) of
+                    # cumulative voiced_s below _EARLY_BAIL_VOICED_S,
+                    # stop processing — the audio is silent or near so.
+                    if len(snapshots) == _EARLY_BAIL_AFTER_CHUNKS:
+                        cum_voiced = sum(
+                            float((s.get("raw") or {}).get("voiced_s") or 0)
+                            for s in snapshots
+                        )
+                        if cum_voiced < _EARLY_BAIL_VOICED_S:
+                            log.info(
+                                "analyzer.early_bail_no_speech",
+                                extra={
+                                    "media_id": media_id,
+                                    "chunks_seen": len(snapshots),
+                                    "cum_voiced_s": round(cum_voiced, 2),
+                                },
+                            )
+                            early_bail_audio["hit"] = True
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            return None
                 leftover = buf
             if leftover:
                 arr = np.frombuffer(leftover, dtype=np.int16).astype(np.float32) / 32768.0
@@ -4083,6 +4291,22 @@ def _run_analyzer_pipeline_sync(
             try: saved_path.unlink()
             except OSError: pass
             _set_media_status(media_id, "failed", error=decode_error)
+            return
+
+        # Streaming early-bail: 30 s of audio with effectively no
+        # voiced speech. Surface a clear rejection now rather than
+        # spinning Whisper / PYIN over the rest of the file.
+        if early_bail_audio["hit"]:
+            try: saved_path.unlink()
+            except OSError: pass
+            _set_media_status(
+                media_id, "failed",
+                error=(
+                    "We didn't detect enough speech in this recording. "
+                    "Make sure your microphone was on and you spoke "
+                    "clearly, then try again."
+                ),
+            )
             return
 
         # English-only enforcement is centralised in
