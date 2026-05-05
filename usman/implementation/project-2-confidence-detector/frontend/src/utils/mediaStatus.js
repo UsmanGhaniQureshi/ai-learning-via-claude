@@ -4,10 +4,14 @@ import { API_BASE, apiFetch } from '../config'
  * Poll GET /api/media/{id}/status until the row reaches a terminal state
  * (`completed` or `failed`). Resolves with the final status payload.
  *
- * Backoff: 1.2s for the first 6 polls (~7s — covers most short clips),
- * then 3s thereafter. We don't poll faster than 1s because the backend
- * reads from Postgres on every request and there's no value in burning
- * a CPU to learn the row is still "processing".
+ * Fix 7: poll every 500 ms so the frames_processed / total_frames
+ * progress bar updates smoothly. Previously we backed off to 1.2 s for
+ * the first 6 polls then 3 s — which left the user staring at a static
+ * spinner for several seconds even when the backend was making
+ * visible progress. The status endpoint reads one row from Postgres
+ * (and an in-memory dict) per call, so 2 polls/s is well within
+ * budget. `onProgress` now fires on EVERY poll (not just status
+ * transitions) so the bar can re-render with the latest counters.
  *
  * Hard timeout: 12 minutes — long enough for an hour-scale upload but
  * a safety net so a stuck job doesn't pin the spinner forever.
@@ -15,8 +19,7 @@ import { API_BASE, apiFetch } from '../config'
 export async function pollMediaStatus(mediaId, { onProgress } = {}) {
   const start = Date.now()
   const HARD_TIMEOUT_MS = 12 * 60 * 1000
-  let polls = 0
-  let lastStatus = null
+  const POLL_INTERVAL_MS = 500
 
   while (true) {
     if (Date.now() - start > HARD_TIMEOUT_MS) {
@@ -34,15 +37,11 @@ export async function pollMediaStatus(mediaId, { onProgress } = {}) {
       return { status: 'failed', error: `Status check failed (HTTP ${res.status})` }
     }
     const data = await res.json()
-    if (data.status !== lastStatus) {
-      lastStatus = data.status
-      onProgress?.(data.status, data)
-    }
+    onProgress?.(data.status, data)
     if (data.status === 'completed' || data.status === 'failed') {
       return data
     }
-    polls += 1
-    await sleep(polls < 6 ? 1200 : 3000)
+    await sleep(POLL_INTERVAL_MS)
   }
 }
 

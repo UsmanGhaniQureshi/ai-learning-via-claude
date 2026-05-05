@@ -44,33 +44,48 @@ class _BlendshapeShim:
         self.score = float(d.get('score', 0.0) or 0.0)
 
 
-_shared_face_lm = None
-_shared_pose_lm = None
-_shared_models_lock = __import__('threading').Lock()
-_face_lm_call_lock = __import__('threading').Lock()
-_pose_lm_call_lock = __import__('threading').Lock()
+def _create_video_mode_models():
+    """Fix 4: per-instance FaceLandmarker + PoseLandmarker in VIDEO
+    running mode.
 
+    `RunningMode.VIDEO` lets MediaPipe reuse landmarks from the
+    previous frame instead of re-detecting from scratch — typically
+    30–40% faster per call than `RunningMode.IMAGE`. The catch is
+    that VIDEO mode is STATEFUL: the landmarker keeps an internal
+    tracker fed by monotonically-increasing timestamps. Sharing one
+    landmarker across concurrent uploads would corrupt that tracker
+    (each upload's timeline would be interleaved). So we abandon the
+    old global singleton pattern (`_get_shared_models`) and create a
+    fresh pair per FaceEngine instance — costs ~1–2 s of model load
+    per upload, recovered many times over by the VIDEO-mode
+    speedup.
 
-def _get_shared_models():
-    global _shared_face_lm, _shared_pose_lm
-    if _shared_face_lm is None:
-        with _shared_models_lock:
-            if _shared_face_lm is None:
-                _shared_face_lm = vision.FaceLandmarker.create_from_options(
-                    vision.FaceLandmarkerOptions(
-                        base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-                        num_faces=2,
-                        output_face_blendshapes=True,
-                        min_face_detection_confidence=0.4,
-                        min_face_presence_confidence=0.4,
-                        running_mode=vision.RunningMode.IMAGE))
-                _shared_pose_lm = vision.PoseLandmarker.create_from_options(
-                    vision.PoseLandmarkerOptions(
-                        base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
-                        num_poses=1,
-                        min_pose_detection_confidence=0.4,
-                        running_mode=vision.RunningMode.IMAGE))
-    return _shared_face_lm, _shared_pose_lm
+    Concurrent face + pose calls are safe across these two
+    landmarkers because they are independent objects; the previous
+    `_face_lm_call_lock` / `_pose_lm_call_lock` are no longer
+    needed and have been removed.
+    """
+    face_lm = vision.FaceLandmarker.create_from_options(
+        vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
+            num_faces=2,
+            output_face_blendshapes=True,
+            min_face_detection_confidence=0.4,
+            min_face_presence_confidence=0.4,
+            min_tracking_confidence=0.4,
+            running_mode=vision.RunningMode.VIDEO,
+        )
+    )
+    pose_lm = vision.PoseLandmarker.create_from_options(
+        vision.PoseLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
+            num_poses=1,
+            min_pose_detection_confidence=0.4,
+            min_tracking_confidence=0.4,
+            running_mode=vision.RunningMode.VIDEO,
+        )
+    )
+    return face_lm, pose_lm
 
 
 class FaceEngine:
@@ -90,10 +105,31 @@ class FaceEngine:
         live session.
         """
         if load_mp_models:
-            self.face_lm, self.pose_lm = _get_shared_models()
+            # Fix 4: per-instance VIDEO-mode landmarkers (see
+            # `_create_video_mode_models`). Concurrent calls to
+            # `face_lm.detect_for_video` and `pose_lm.detect_for_video`
+            # run safely in parallel — they are different objects with
+            # independent state — so no per-model lock is needed.
+            self.face_lm, self.pose_lm = _create_video_mode_models()
+            # Two-worker pool: one slot for face, one for pose.
+            # Lazily created on first `process_frame` call so the
+            # construction cost is paid only when MediaPipe is
+            # actually invoked.
+            from concurrent.futures import ThreadPoolExecutor
+            self._mp_executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="mp-face-pose",
+            )
+            # VIDEO mode requires strictly-monotonically-increasing
+            # timestamps per landmarker. The frame loop hands us
+            # ts = fc / fps in seconds; we round to int ms and bump
+            # by 1 ms whenever the next sample would not strictly
+            # increase (defensive — fc and fps are well-behaved).
+            self._last_mp_ts_ms = -1
         else:
             self.face_lm = None
             self.pose_lm = None
+            self._mp_executor = None
+            self._last_mp_ts_ms = -1
 
         # Accumulated counters for the session-level report. `frames_processed`
         # denominates everything so ratios are meaningful. `frames_multi_face`
@@ -576,16 +612,59 @@ class FaceEngine:
     def process_frame(self, frame, timestamp):
         """Process one frame. Returns complete analysis dict."""
         h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Performance: downscale large frames before MediaPipe. Both
+        # face_lm and pose_lm work fine at 480 px wide (face mesh
+        # internally normalises landmark coords to [0, 1] anyway), so
+        # passing them a 1080p phone frame is wasted work. The
+        # downscale is purely an inference cost optimisation; the
+        # ORIGINAL `(w, h)` is still passed to `_compute_signals`
+        # below so any downstream logic that maps landmarks back to
+        # source-pixel coordinates uses the right scale.
+        if w > 480:
+            scale = 480.0 / w
+            frame_for_mp = cv2.resize(
+                frame,
+                (480, max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            frame_for_mp = frame
+        rgb = cv2.cvtColor(frame_for_mp, cv2.COLOR_BGR2RGB)
         mi = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
 
-        # Face detection + blendshapes (wrapped in try/except for robustness)
+        # Fix 4: VIDEO mode requires int-millisecond timestamps that
+        # strictly increase per landmarker. The caller hands us
+        # `timestamp` in seconds; we round and bump if the float
+        # rounded down to the same int as the previous call.
+        ts_ms = int(round(timestamp * 1000))
+        if ts_ms <= self._last_mp_ts_ms:
+            ts_ms = self._last_mp_ts_ms + 1
+        self._last_mp_ts_ms = ts_ms
+
+        # Fix 4: dispatch face + pose detect_for_video calls
+        # concurrently to a 2-worker pool. The two landmarkers are
+        # independent per-instance objects so this is safe — no
+        # per-model lock needed (the old `_face_lm_call_lock` /
+        # `_pose_lm_call_lock` are gone). On a multi-core CPU this
+        # halves the per-frame inference wall time.
+        face_future = self._mp_executor.submit(
+            self.face_lm.detect_for_video, mi, ts_ms,
+        )
+        pose_future = self._mp_executor.submit(
+            self.pose_lm.detect_for_video, mi, ts_ms,
+        )
+
         try:
-            with _face_lm_call_lock:
-                face_r = self.face_lm.detect(mi)
+            face_r = face_future.result()
         except Exception:
+            # Drain pose so its thread finishes cleanly before we
+            # return.
+            try: pose_future.result()
+            except Exception: pass
             return None
         if not face_r.face_landmarks:
+            try: pose_future.result()
+            except Exception: pass
             return None
         self.frames_processed += 1
         if len(face_r.face_landmarks) > 1:
@@ -594,15 +673,26 @@ class FaceEngine:
         fl = face_r.face_landmarks[0]
         blendshapes = face_r.face_blendshapes[0] if face_r.face_blendshapes else []
 
-        # Pose detection (wrapped in try/except for robustness)
         try:
-            with _pose_lm_call_lock:
-                pose_r = self.pose_lm.detect(mi)
+            pose_r = pose_future.result()
             pose_landmarks = pose_r.pose_landmarks if pose_r.pose_landmarks else None
         except Exception:
             pose_landmarks = None
 
         return self._compute_signals(fl, blendshapes, pose_landmarks, w, h, timestamp)
+
+    def close(self):
+        """Shut down the MediaPipe-call thread pool. Safe to call
+        more than once. The frame loop in main.py invokes this after
+        the cv2 read loop ends so the worker threads do not linger
+        between uploads."""
+        ex = getattr(self, "_mp_executor", None)
+        if ex is not None:
+            try:
+                ex.shutdown(wait=False)
+            except Exception:
+                pass
+            self._mp_executor = None
 
     def process_landmarks_from_browser(
         self, face_landmarks, face_blendshapes, timestamp,

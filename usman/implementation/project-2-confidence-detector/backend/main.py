@@ -37,7 +37,9 @@ from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Res
 from fastapi.middleware.cors import CORSMiddleware
 from face_engine import FaceEngine
 from scoring_engine import ScoringEngine, generate_tips
-from audio_pipeline import AudioPipeline, get_whisper, get_vad
+from audio_pipeline import (
+    AudioPipeline, get_whisper, get_vad, detect_speech_boundaries,
+)
 from signal_scorer import SignalScorer
 from session_recorder import list_recordings as _list_session_recordings, RECORDINGS_DIR
 from report_generator import generate_post_session_report
@@ -699,6 +701,56 @@ def _parse_trim_segments(raw: str | None):
     return out
 
 
+def _source_is_cfr(filepath: str) -> bool:
+    """Return True when ffprobe reports a constant frame rate for the
+    source's first video stream — i.e. r_frame_rate ≈ avg_frame_rate.
+
+    Mobile cameras and most desktop screen recorders write CFR mp4. The
+    common VFR offender is Chrome's `MediaRecorder` + `canvas.captureStream`
+    webm pipeline used by the in-browser session recorder. CFR sources
+    can skip `_normalize_to_cfr_mp4` entirely (saves 30–60 s per upload),
+    while VFR sources still get the re-encode for cv2 timing safety.
+
+    On any probe failure we err on the side of "not CFR" so the
+    normalize runs — silently producing the wrong duration is far
+    worse than spending 30 s on a re-encode we didn't strictly need.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=r_frame_rate,avg_frame_rate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    if proc.returncode != 0:
+        return False
+    lines = (proc.stdout or b"").decode("utf-8", errors="ignore").strip().splitlines()
+    if len(lines) < 2:
+        return False
+
+    def _parse_rate(rate: str) -> float:
+        try:
+            num, _, den = rate.partition("/")
+            n = float(num)
+            d = float(den) if den else 1.0
+            return n / d if d > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    r = _parse_rate(lines[0])
+    a = _parse_rate(lines[1])
+    if r <= 0 or a <= 0:
+        return False
+    # 1% tolerance: rates within 1 fps of each other at 30 fps count as CFR.
+    return abs(r - a) / max(r, a) < 0.01
+
+
 def _normalize_to_cfr_mp4(filepath: str) -> str | None:
     """Re-encode a (possibly VFR) source into a constant-frame-rate
     mp4 at 30 fps. Returns the new path, or None on failure.
@@ -720,11 +772,17 @@ def _normalize_to_cfr_mp4(filepath: str) -> str | None:
     fall back to reading the source directly.
     """
     out_path = filepath + ".cfr.mp4"
+    # Performance: this intermediate file is consumed by cv2.VideoCapture
+    # and then deleted. Visual quality of the intermediate doesn't
+    # matter — we only care that frame timestamps are constant. Switch
+    # from `-preset fast -crf 23` to `-preset ultrafast -crf 30` cuts
+    # encoding time 3-5× on a typical CPU. The intermediate file is
+    # ~2-3× larger but it lives for seconds, then unlinked.
     cmd = [
         FFMPEG, "-y", "-i", filepath,
         "-r", "30",
         "-vsync", "cfr",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
         "-an",  # video only — audio is muxed in later from the original
         "-movflags", "+faststart",
         out_path,
@@ -1817,6 +1875,26 @@ def _run_upload_pipeline_sync(
         )
         return
 
+    # Fix 3: ffprobe-based < 3 s reject. Moved earlier (was a cv2-based
+    # check after CFR normalize at ~line 1899) so we can bail before
+    # spawning the audio thread on a clip too short to score. cv2's
+    # duration is unreliable on raw VFR webm; ffprobe reads the
+    # container header and is exact to ±1 frame on every supported
+    # source. The cv2 check downstream stays as belt-and-braces for
+    # the rare case where ffprobe is unavailable.
+    if _duration_s is not None and _duration_s < 3.0:
+        _set_media_status(
+            upload_id,
+            "failed",
+            error=(
+                f"Recording too short ({_duration_s:.1f} s). "
+                "Please upload at least 3 s of footage so the "
+                "speech and face analysis have enough signal to "
+                "produce meaningful scores."
+            ),
+        )
+        return
+
     # Fail-fast on silent input. The user reported: "I uploaded a
     # 4-minute silent video and got 'Not enough speech to score' AFTER
     # 4 minutes of processing". The full pipeline (cv2 + MediaPipe +
@@ -1851,75 +1929,24 @@ def _run_upload_pipeline_sync(
                 raise RuntimeError("ffmpeg binary not found on the server.")
             except subprocess.TimeoutExpired:
                 raise RuntimeError("ffmpeg trim timed out after 600 s.")
-        # CFR normalisation. The recorder hands us a VFR webm (canvas
-        # captureStream + opus audio); cv2's frame count and fps
-        # reading are unreliable on those, AND ffprobe's
-        # avg_frame_rate metadata is sometimes wrong (Chrome over-
-        # reports the rate, so the output mp4 plays too fast). The
-        # cheapest reliable fix is to re-encode the source to a
-        # 30 fps CFR mp4 before cv2 ever opens it. The intermediate
-        # mp4 has consistent frame timing → cv2 reads N frames over
-        # exactly N/30 seconds → output duration matches input. The
-        # original filepath is preserved for audio extraction later.
-        cv2_input_path = filepath
-        normalised_path = _normalize_to_cfr_mp4(filepath)
-        if normalised_path:
-            cv2_input_path = normalised_path
-
-        cap = cv2.VideoCapture(cv2_input_path)
-        # After CFR normalisation we know the rate is 30; otherwise
-        # we fall back to ffprobe (which now also counts frames as a
-        # second-tier probe so VFR sources still produce correct
-        # numbers).
-        if normalised_path:
-            fps = 30.0
-        else:
-            probed_fps = _probe_video_fps(cv2_input_path)
-            fps = probed_fps or cap.get(cv2.CAP_PROP_FPS) or 30
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = total_frames / fps if fps > 0 else 0
-        # Fix 7: register total so the polled status endpoint can show
-        # a real percentage instead of a categorical spinner.
-        if total_frames > 0:
-            _set_progress_total(upload_id, total_frames)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        # Reject clips shorter than 3 seconds with a clean 400 rather
-        # than processing them. Below 3 s: a single chunk is zero-padded
-        # to fill AudioPipeline's window, which skews pitch / WPM stats
-        # by ~2× (denominator is padded silence). We'd rather tell the
-        # user to re-record than silently publish garbage numbers.
-        if duration > 0 and duration < 3.0:
-            cap.release()
-            try: os.unlink(filepath)
-            except OSError: pass
-            _set_media_status(
-                upload_id,
-                "failed",
-                error=(
-                    f"Recording too short ({duration:.1f} s). "
-                    "Please upload at least 3 s of footage so the "
-                    "speech and face analysis have enough signal to "
-                    "produce meaningful scores."
-                ),
-            )
-            return
-
-        # Stream audio through ffmpeg's stdout in 3-second windows and
-        # process each window through AudioPipeline as it arrives, so the
-        # full waveform is never resident in RAM. For a 3-hour upload the
-        # old capture_output=True path peaked at ~1 GB (int16 bytes + the
-        # float32 view). This path never holds more than a single chunk
-        # at a time.
+        # Fix 3: start audio extraction BEFORE the optional CFR
+        # normalize. The audio pipeline reads its own ffmpeg pipe
+        # straight from the source — it does not need the CFR-
+        # normalised video at all. Only the cv2 frame loop does.
+        # Moving the audio worker ahead of CFR lets the two run
+        # concurrently; on VFR sources that's a 30-60 s saving, on
+        # CFR sources we skip the re-encode entirely below.
+        #
+        # snapshots / hud_total_history must exist before the worker
+        # is started because the worker writes into them.
         has_audio = False
         snapshots: list[dict] = []
-        # Rolling 4-chunk total used by _build_live_hud. Same buffer the
-        # live WS path keeps; instantiated locally here so the upload
-        # pipeline produces an equivalent live_hud_timeline that the
-        # result-screen overlay can replay back to the user.
         from collections import deque as _hud_deque
         hud_total_history = _hud_deque(maxlen=4)
+        early_bail = False
+        audio_thread = None
+        _audio_err_box: list[str | None] = [None]
+
         try:
             # Hardening against malformed / malicious media files:
             #   -err_detect crccheck+bitstream  — bail on structural errors
@@ -1963,21 +1990,31 @@ def _run_upload_pipeline_sync(
             chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
             pipeline = AudioPipeline()
 
-            # Streaming early-bail state — see _EARLY_BAIL_AFTER_CHUNKS /
-            # _EARLY_BAIL_VOICED_S constants for thresholds. If the
-            # first ~30 s of audio yields effectively zero voiced
-            # speech, abort the rest of the pipeline. The volumedetect
-            # pre-pass earlier in this function catches truly silent
+            # Streaming early-bail: see _EARLY_BAIL_AFTER_CHUNKS /
+            # _EARLY_BAIL_VOICED_S. If the first ~30 s of audio yields
+            # effectively zero voiced speech, abort the rest of the
+            # pipeline. The volumedetect pre-pass catches truly silent
             # files; this catches "audio is present but nobody is
             # speaking" (background music, ambient noise) before
             # Whisper / cv2 / MediaPipe burn through 3+ minutes of
             # remaining content.
-            early_bail = False
 
             def _stream_and_process_sync():
                 nonlocal has_audio, early_bail
                 total_bytes = 0
                 leftover = b""
+                chunks_audio: list = []
+                rc = -1
+                err_tail = ""
+                early_bail_decided = False
+
+                # Phase 1: read every chunk from ffmpeg's stdout into
+                # memory before any heavy compute. For a 60-minute
+                # upload at 16 kHz mono int16 the buffer peaks at
+                # ~115 MB — well under a typical worker's headroom.
+                # This change unlocks chunk-level parallelism in
+                # Phase 2; previously each chunk was processed inline
+                # so Whisper / PYIN / fillers ran strictly serially.
                 try:
                     while True:
                         need = chunk_bytes - len(leftover)
@@ -1990,41 +2027,40 @@ def _run_upload_pipeline_sync(
                             piece = buf[:chunk_bytes]
                             buf = buf[chunk_bytes:]
                             arr = np.frombuffer(piece, dtype=np.int16).astype(np.float32) / 32768.0
-                            chunk_result = pipeline.process_chunk(arr, sr=16000)
-                            # Attach the same overlay-friendly status
-                            # block the live WS path produces so the
-                            # result-screen HUD can show it later.
-                            # `face_msg_age_s=0.0` is a sentinel meaning
-                            # "no face stream"; the builder treats
-                            # missing browser_face as detection: poor.
-                            chunk_result["live_hud"] = _build_live_hud(
-                                chunk_result, {}, 0.0, hud_total_history,
-                            )
-                            snapshots.append(chunk_result)
+                            chunks_audio.append(arr)
 
-                            # Streaming early-bail: after the first
-                            # _EARLY_BAIL_AFTER_CHUNKS chunks, if total
-                            # voiced speech is below
-                            # _EARLY_BAIL_VOICED_S, stop processing.
-                            if len(snapshots) == _EARLY_BAIL_AFTER_CHUNKS:
-                                cum_voiced = sum(
-                                    float((s.get("raw") or {}).get("voiced_s") or 0)
-                                    for s in snapshots
-                                )
+                            # Streaming early-bail. Once we've
+                            # buffered _EARLY_BAIL_AFTER_CHUNKS chunks,
+                            # do a quick VAD-only sweep — VAD is
+                            # ~20 ms per chunk on CPU so the whole
+                            # sweep adds <250 ms even at the limit.
+                            # If cumulative voiced time across the
+                            # window is below _EARLY_BAIL_VOICED_S,
+                            # kill ffmpeg and return — no PYIN /
+                            # Whisper / fillers will ever run on the
+                            # remaining audio.
+                            if (
+                                not early_bail_decided
+                                and len(chunks_audio) == _EARLY_BAIL_AFTER_CHUNKS
+                            ):
+                                early_bail_decided = True
+                                cum_voiced = 0.0
+                                for a in chunks_audio:
+                                    try:
+                                        for sp_start, sp_end in detect_speech_boundaries(a, 16000):
+                                            cum_voiced += (sp_end - sp_start) / 1000.0
+                                    except Exception:
+                                        pass
                                 if cum_voiced < _EARLY_BAIL_VOICED_S:
                                     log.info(
                                         "upload.early_bail_no_speech",
                                         extra={
                                             "upload_id": upload_id,
-                                            "chunks_seen": len(snapshots),
+                                            "chunks_seen": len(chunks_audio),
                                             "cum_voiced_s": round(cum_voiced, 2),
                                         },
                                     )
                                     early_bail = True
-                                    # Drain ffmpeg so it exits cleanly
-                                    # rather than blocking on a full
-                                    # stdout pipe; we don't actually
-                                    # need its remaining bytes.
                                     try:
                                         proc.kill()
                                     except Exception:
@@ -2035,49 +2071,168 @@ def _run_upload_pipeline_sync(
                         arr = np.frombuffer(leftover, dtype=np.int16).astype(np.float32) / 32768.0
                         if len(arr) < chunk_samples:
                             arr = np.pad(arr, (0, chunk_samples - len(arr)))
-                        chunk_result = pipeline.process_chunk(arr, sr=16000)
-                        chunk_result["live_hud"] = _build_live_hud(
-                            chunk_result, {}, 0.0, hud_total_history,
-                        )
-                        snapshots.append(chunk_result)
+                        chunks_audio.append(arr)
                     try:
                         rc = proc.wait(timeout=30)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         rc = -1
-                    err_tail = ""
                     if proc.stderr:
                         err_tail = proc.stderr.read().decode("utf-8", errors="ignore")
-                    # Minimum ~1000 samples ≈ 62 ms = 2000 bytes.
-                    if rc == 0 and total_bytes > 2000:
-                        has_audio = True
-                        return None
-                    tail_lines = err_tail.splitlines()[-3:]
-                    return (
-                        "ffmpeg produced no usable audio. " + " | ".join(tail_lines)
-                    ).strip()
                 finally:
                     try: proc.stdout.close()
                     except Exception: pass
                     try: proc.stderr.close()
                     except Exception: pass
 
-            audio_extraction_error = _stream_and_process_sync()
+                # Minimum ~1000 samples ≈ 62 ms = 2000 bytes.
+                if rc != 0 or total_bytes <= 2000:
+                    tail_lines = err_tail.splitlines()[-3:]
+                    return (
+                        "ffmpeg produced no usable audio. " + " | ".join(tail_lines)
+                    ).strip()
+                has_audio = True
 
-        # Streaming early-bail: the audio loop saw silent / near-silent
-        # input across the first 30 s. Don't proceed to cv2 + face
-        # engine + Whisper aggregation — surface the rejection now so
-        # the user gets feedback in seconds rather than minutes.
-        if early_bail:
+                if not chunks_audio:
+                    return None
+
+                # Phase 2: process every chunk in parallel through
+                # AudioPipeline. ThreadPoolExecutor(max_workers=4) lets
+                # VAD / PYIN / acoustic-fillers / trembling on
+                # different chunks run concurrently across cores;
+                # Whisper inside transcribe_chunk is gated to one
+                # concurrent call by the module-level
+                # _whisper_call_lock so its memory footprint stays
+                # bounded. AudioPipeline._state_lock and
+                # _lang_probe_lock keep the rolling history /
+                # language-probe state safe across workers.
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                n_chunks = len(chunks_audio)
+                results: list = [None] * n_chunks
+                with ThreadPoolExecutor(
+                    max_workers=4,
+                    thread_name_prefix=f"audio-{upload_id[:8]}",
+                ) as ex:
+                    futures = {
+                        ex.submit(pipeline.process_chunk, arr, 16000): idx
+                        for idx, arr in enumerate(chunks_audio)
+                    }
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            results[idx] = future.result()
+                        except Exception as e:
+                            log.warning(
+                                "upload.chunk_process_failed",
+                                extra={
+                                    "upload_id": upload_id,
+                                    "chunk_idx": idx,
+                                    "err": str(e),
+                                },
+                            )
+                            results[idx] = None
+
+                # Phase 3: assemble snapshots in chunk-index order.
+                # `live_hud` depends on the rolling `hud_total_history`
+                # deque so it MUST be built sequentially — Fix 1's
+                # "update ScoringEngine in order, never inside a
+                # parallel worker". The chunk_index stored in each
+                # result dict by the worker reflects its completion
+                # rank, not its position in the timeline; re-stamp it
+                # here so per-chunk timestamps in the report match
+                # the snapshot index.
+                for i, chunk_result in enumerate(results):
+                    if chunk_result is None:
+                        continue
+                    chunk_result["chunk_index"] = i + 1
+                    chunk_result["live_hud"] = _build_live_hud(
+                        chunk_result, {}, 0.0, hud_total_history,
+                    )
+                    snapshots.append(chunk_result)
+                return None
+
+            # Performance Fix 3: run audio + video pipelines in
+            # parallel via threading. Whisper (ctranslate2 C++) and
+            # MediaPipe (C++ inference) both release the GIL during
+            # their hot paths, so we get genuine wall-time
+            # parallelism — wall_time = max(audio, video) instead of
+            # audio + video. Saves ~30-50% on a typical upload.
+            #
+            # The thread mutates `has_audio`, `early_bail`, and
+            # `snapshots` in the enclosing scope. We do NOT read any
+            # of those from the main thread until `audio_thread.join()`
+            # below, so no synchronisation primitive is needed.
+            import threading as _threading
+
+            def _audio_worker():
+                try:
+                    _audio_err_box[0] = _stream_and_process_sync()
+                except Exception as _e:
+                    _audio_err_box[0] = f"audio worker crashed: {_e}"
+
+            audio_thread = _threading.Thread(
+                target=_audio_worker, name=f"audio-{upload_id}", daemon=True,
+            )
+            audio_thread.start()
+
+        # Fix 3: CFR normalisation runs ONLY for the cv2 frame loop —
+        # the audio worker spawned above is already streaming audio
+        # from the source in parallel. Probe the source: a CFR mp4
+        # (camera, screen recorder, well-formed mp4) skips the
+        # re-encode entirely. A VFR webm (Chrome canvas.captureStream)
+        # still gets the re-encode, but it now runs in parallel with
+        # the audio pipeline, so the wall-clock cost is hidden behind
+        # whichever thread takes longest.
+        cv2_input_path = filepath
+        if _source_is_cfr(filepath):
+            normalised_path = None
+        else:
+            normalised_path = _normalize_to_cfr_mp4(filepath)
+            if normalised_path:
+                cv2_input_path = normalised_path
+
+        cap = cv2.VideoCapture(cv2_input_path)
+        # After CFR normalisation we know the rate is 30; otherwise
+        # fall back to ffprobe (which counts frames as a second-tier
+        # probe so VFR sources still produce correct numbers).
+        if normalised_path:
+            fps = 30.0
+        else:
+            probed_fps = _probe_video_fps(cv2_input_path)
+            fps = probed_fps or cap.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps if fps > 0 else 0
+        # Fix 7: register total so the polled status endpoint can show
+        # a real percentage instead of a categorical spinner.
+        if total_frames > 0:
+            _set_progress_total(upload_id, total_frames)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Belt-and-braces < 3 s reject. The ffprobe-based check at the
+        # top of this function catches almost every case before we
+        # spawn the audio thread; this fires only when ffprobe was
+        # unavailable / unreliable but cv2 sees a valid duration < 3 s.
+        if duration > 0 and duration < 3.0:
             cap.release()
+            # Stop the audio worker and ffmpeg pipe so they don't leak.
+            if audio_thread is not None:
+                try:
+                    if 'proc' in locals() and proc is not None:
+                        proc.kill()
+                except Exception:
+                    pass
+                audio_thread.join(timeout=5)
             try: os.unlink(filepath)
             except OSError: pass
             _set_media_status(
-                upload_id, "failed",
+                upload_id,
+                "failed",
                 error=(
-                    "We didn't detect enough speech in this recording. "
-                    "Make sure your microphone was on and you spoke "
-                    "clearly, then try again."
+                    f"Recording too short ({duration:.1f} s). "
+                    "Please upload at least 3 s of footage so the "
+                    "speech and face analysis have enough signal to "
+                    "produce meaningful scores."
                 ),
             )
             return
@@ -2104,9 +2259,24 @@ def _run_upload_pipeline_sync(
         def _frame_loop_sync():
             face_results_by_time = []
             all_face_scores = []
-            process_every = max(1, round((fps or 30) / 30))
+            # Fix 4: face/pose inference cadence is 5 fps (every 6th
+            # frame at 30 fps source). 5 fps is sufficient to capture
+            # gaze and expression changes in a presentation; sampling
+            # finer just multiplies inference work without changing
+            # the signal. The overlay still uses `last_result`
+            # between processed frames so the rendered playback video
+            # is unchanged.
+            process_every = max(1, round((fps or 30) / 5))
             fc = 0
             last_result = None
+            # Fix 4: invalidate `last_result` after 30 consecutive
+            # SELECTED frames (≈ 6 s of video at 5 fps) without a
+            # face. Keeps a brief turn-of-the-head from blanking the
+            # overlay, while preventing a face that left the frame
+            # 30 s ago from continuing to feed stale eye-contact
+            # numbers into the rolling histogram.
+            consecutive_no_face_selected = 0
+            NO_FACE_INVALIDATE_AFTER = 30
 
             while True:
                 ok, frame = cap.read()
@@ -2116,7 +2286,14 @@ def _run_upload_pipeline_sync(
                 ts = fc / fps
 
                 if fc % process_every == 0:
-                    last_result = face_engine.process_frame(frame, ts)
+                    new_result = face_engine.process_frame(frame, ts)
+                    if new_result is None:
+                        consecutive_no_face_selected += 1
+                        if consecutive_no_face_selected >= NO_FACE_INVALIDATE_AFTER:
+                            last_result = None
+                    else:
+                        consecutive_no_face_selected = 0
+                        last_result = new_result
 
                 if last_result:
                     all_face_scores.append(last_result['confidence_score'])
@@ -2182,6 +2359,45 @@ def _run_upload_pipeline_sync(
             return face_results_by_time, all_face_scores
 
         face_results_by_time, all_face_scores = _frame_loop_sync()
+        # Fix 4: shut down the face_engine's MediaPipe-call thread
+        # pool now that the loop is done — otherwise its 2 worker
+        # threads would linger past the request and accumulate
+        # across uploads.
+        try:
+            face_engine.close()
+        except Exception:
+            pass
+
+        # Performance Fix 3: wait for the audio worker to finish.
+        # Wall time so far = max(audio_pipeline, video_frame_loop)
+        # — both ran in parallel. If audio is still running at this
+        # point we block until it catches up.
+        if audio_thread is not None:
+            audio_thread.join()
+            if _audio_err_box[0] is not None:
+                audio_extraction_error = _audio_err_box[0]
+
+        # Streaming early-bail: the audio loop saw silent / near-silent
+        # input across the first 30 s. Surface the rejection now,
+        # AFTER the parallel video work has also wrapped (so we don't
+        # leak open file handles or cv2 writer state). The wasted
+        # video work is acceptable — the upfront volumedetect probe
+        # catches truly silent files in <1 s; this streaming bail is
+        # only for the rare "audio present but no speech" case.
+        if early_bail:
+            try: writer.release()
+            except Exception: pass
+            try: os.unlink(filepath)
+            except OSError: pass
+            _set_media_status(
+                upload_id, "failed",
+                error=(
+                    "We didn't detect enough speech in this recording. "
+                    "Make sure your microphone was on and you spoke "
+                    "clearly, then try again."
+                ),
+            )
+            return
 
         # Snapshots were already produced during streaming audio extraction
         # above — AudioPipeline processed each 3s window as it came off
@@ -2352,15 +2568,17 @@ def _run_upload_pipeline_sync(
                         'words': words_abs,
                     })
 
-        # Convert to browser-compatible video.
-        # cv2.VideoWriter writes video only — no audio — so the overlay
-        # file has a silent video track. Splice the SOURCE video's audio
-        # back in here with -map, otherwise the preview plays silent.
+        # Fix 2: defer the libx264 mux until AFTER the report is written.
+        # Previously this re-encode (30-80 s on a 130 s clip) ran
+        # synchronously here, blocking the user's report from appearing
+        # until the playable overlay mp4 was ready. The mux produces
+        # zero analytical signal — it only makes the overlay video
+        # web-playable — so it does not belong on the user-visible
+        # critical path. We build the command here while the locals
+        # are in scope, then run it in a daemon thread spawned after
+        # _complete_media_processing(...) below.
         web_name = f"web_{output_name}"
         web_path = os.path.join(UPLOAD_DIR, web_name)
-        # Same hardening flags as the audio-extract Popen above. The
-        # re-encode touches user-controlled bytes again (second pass
-        # over the source-plus-overlay), so apply the same guards.
         reencode_cmd = [
             FFMPEG,
             '-err_detect', 'crccheck+bitstream',
@@ -2382,41 +2600,17 @@ def _run_upload_pipeline_sync(
             '-movflags', '+faststart',
             web_path,
         ])
-        # ffmpeg re-encode is a subprocess.run that can take 30-90s on long
-        # clips — another event-loop blocker. Dispatch to a worker thread.
-        def _reencode_sync():
-            try:
-                proc = subprocess.run(
-                    reencode_cmd,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=300)
-                ok = os.path.exists(web_path) and os.path.getsize(web_path) > 0
-                if not ok:
-                    tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
-                    err = (
-                        "ffmpeg re-encode failed; serving raw output. "
-                        + " | ".join(tail)
-                    ).strip()
-                    return False, err
-                return True, None
-            except FileNotFoundError:
-                return False, "ffmpeg binary not found for re-encode."
-            except subprocess.TimeoutExpired:
-                return False, "ffmpeg re-encode timed out after 300s."
 
-        ffmpeg_ok, _ffmpeg_err = _reencode_sync()
-        if _ffmpeg_err is not None:
-            video_encode_error = _ffmpeg_err
-        video_serve = web_name if ffmpeg_ok else output_name
-
-        # The mp4v overlay file is only useful as a libx264 fallback.
-        # On the happy path it's already been re-encoded — delete it to save
-        # ~100-200 MB per upload. On failure, keep it; video_serve still points
-        # at it and the frontend gets a video_encode_error banner.
-        if ffmpeg_ok:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+        # Initial playback path = the original uploaded file. It is
+        # already on disk at UPLOAD_DIR/{upload_id}{safe_ext} from the
+        # upload handler and is browser-playable for every supported
+        # source format (mp4 / webm / mov in the modern browsers we
+        # target). The deferred mux below swaps in the overlay-
+        # rendered web mp4 once it is ready, by updating
+        # m.playback_path and m.report_json["recording"]["video_url"]
+        # in place.
+        original_source_name = f"{upload_id}{safe_ext}"
+        video_serve = original_source_name
 
         # Calculate overall scores using the new ScoringEngine
         avg_face_confidence = 0
@@ -3161,6 +3355,70 @@ def _run_upload_pipeline_sync(
             speech_timeline=speech_timeline,
             report_json=response_payload,
         )
+
+        # Fix 2: kick off the libx264 mux as a daemon thread now that
+        # the user has their report. When the mux finishes we swap
+        # the row's playback_path to the overlay-rendered web mp4
+        # and update report_json so the next /api/report fetch hands
+        # back a signed URL pointing at the overlay version. While
+        # the mux is running the user sees their original upload —
+        # no overlay graphics, but the score / timelines / coaching
+        # are all already visible.
+        def _deferred_mux():
+            try:
+                proc = subprocess.run(
+                    reencode_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=300,
+                )
+                ok = (
+                    proc.returncode == 0
+                    and os.path.exists(web_path)
+                    and os.path.getsize(web_path) > 0
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+                log.warning(
+                    "upload.deferred_mux_failed",
+                    extra={"upload_id": upload_id, "err": str(e)},
+                )
+                ok = False
+            if not ok:
+                # Leave playback_path pointing at the original source.
+                # Drop the unplayable mp4v intermediate.
+                try: os.unlink(output_path)
+                except OSError: pass
+                return
+            try:
+                with SessionLocal() as db:
+                    m = db.get(Media, upload_id)
+                    if m is None:
+                        return
+                    m.playback_path = web_name
+                    rj = dict(m.report_json or {})
+                    rec = dict(rj.get("recording") or {})
+                    rec["video_url"] = sign_media_url(
+                        f"/api/video/{web_name}", user_id,
+                    )
+                    rj["recording"] = rec
+                    rj["processed_video"] = web_name
+                    m.report_json = rj
+                    db.commit()
+            except Exception as e:
+                log.warning(
+                    "upload.mux_swap_failed",
+                    extra={"upload_id": upload_id, "err": str(e)},
+                )
+                return
+            try: os.unlink(output_path)
+            except OSError: pass
+
+        import threading as _mux_threading
+        _mux_threading.Thread(
+            target=_deferred_mux,
+            name=f"mux-{upload_id}",
+            daemon=True,
+        ).start()
     except Exception as e:
         # Processing failed mid-way — delete the orphaned source file
         # and mark the row failed so the polling client surfaces the
