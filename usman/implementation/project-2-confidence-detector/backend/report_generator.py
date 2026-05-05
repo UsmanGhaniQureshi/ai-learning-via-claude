@@ -710,6 +710,100 @@ def generate_post_session_report(
                 f"(you have {n_seen})."
             )
 
+    # ── Calibration-adjusted block (Phase 6) ───────────────────────
+    # Per-signal comparison of THIS session against the user's
+    # personal calibration baseline + tolerance bands. Surfaced
+    # alongside (not replacing) `signal_baseline_adjusted` above —
+    # the z-score-against-history view stays valuable even when a
+    # calibration profile exists. Only built when the caller's
+    # `user_baseline` carries a `calibration` block (set by
+    # main.py:_fetch_user_baseline when a complete profile exists).
+    calibration_adjusted = None
+    if isinstance(user_baseline, dict) and user_baseline.get("calibration"):
+        cal = user_baseline["calibration"]
+        bands = cal.get("tolerance_bands") or {}
+        rolling = cal.get("rolling_baseline") or {}
+        raw_baselines = cal.get("raw_baselines") or {}
+
+        # Map session-side signal name → calibration-side raw signal
+        # name + value. Some calibration baselines are RAW measurements
+        # (WPM, filler_rate %) while session_averages holds the 0-100
+        # SCORE; we report both.
+        per_signal_view: dict = {}
+        for raw_sig in (
+            "wpm", "pitch_mean", "pitch_std", "rms",
+            "filler_rate", "jitter_pct", "shimmer_pct",
+            "voice_steadiness", "vocal_variety",
+        ):
+            base_value = (
+                rolling.get(raw_sig)
+                if raw_sig in rolling else raw_baselines.get(raw_sig)
+            )
+            band = bands.get(raw_sig) or {}
+            # Try to find the session value for this raw signal.
+            # WPM, filler_rate, jitter, shimmer come straight from
+            # `pace`/`trembling_summary`/aggregated raw stats; the
+            # 0-100 scores live in signal_avgs.
+            sess_value = None
+            if raw_sig == "wpm":
+                sess_value = pace.get("avg_wpm")
+            elif raw_sig == "filler_rate":
+                sess_value = filler_rate_pct
+            elif raw_sig == "pitch_mean":
+                sess_value = (
+                    sum(p for p in (
+                        r.get("pitch", {}).get("mean_hz") or 0
+                        for r in all_raw
+                    ) if p > 0)
+                    / max(1, sum(1 for r in all_raw if (r.get("pitch") or {}).get("mean_hz")))
+                    if any((r.get("pitch") or {}).get("mean_hz") for r in all_raw) else None
+                )
+            elif raw_sig == "pitch_std":
+                sess_value = session_pitch_std_median
+            elif raw_sig == "rms":
+                sess_value = median_chunk_rms
+            elif raw_sig == "jitter_pct":
+                sess_value = trembling_summary.get("avg_jitter_pct")
+            elif raw_sig == "shimmer_pct":
+                sess_value = trembling_summary.get("avg_shimmer_pct")
+            elif raw_sig == "voice_steadiness":
+                sess_value = signal_avgs.get("voice_steadiness")
+            elif raw_sig == "vocal_variety":
+                sess_value = signal_avgs.get("vocal_variety")
+
+            if base_value is None or sess_value is None:
+                continue
+
+            delta = float(sess_value) - float(base_value)
+            within_band = None
+            if band:
+                within_band = bool(
+                    band.get("lower", float("-inf")) <= sess_value <= band.get("upper", float("inf"))
+                )
+            direction = "above" if delta > 0 else "below" if delta < 0 else "equal"
+            per_signal_view[raw_sig] = {
+                "personal_baseline": round(float(base_value), 2),
+                "session_value": round(float(sess_value), 2),
+                "delta": round(delta, 2),
+                "direction": direction,
+                "within_tolerance_band": within_band,
+                "tolerance_band": band or None,
+            }
+
+        sessions_since = max(0, int(cal.get("session_count") or 0))
+        calibration_adjusted = {
+            "is_complete": True,
+            "calibration_version": cal.get("calibration_version"),
+            "sessions_since_calibration": sessions_since,
+            "baseline_confidence": cal.get("baseline_confidence"),
+            "camera_anxiety_detected": bool(cal.get("camera_anxiety_detected")),
+            "camera_anxiety_delta": cal.get("camera_anxiety_delta"),
+            "blend_ratio": cal.get("blend_ratio"),
+            "reliable_signals": cal.get("reliable_signals") or [],
+            "provisional_signals": cal.get("provisional_signals") or [],
+            "per_signal": per_signal_view,
+        }
+
     # Fix 11: session-level Whisper transcript-confidence — mean of
     # per-word probabilities (above the 0.05 accent-fairness cutoff)
     # across the whole session. Surfaced as a transcript-quality
@@ -746,6 +840,10 @@ def generate_post_session_report(
         "signal_baseline_adjusted": signal_baseline_adjusted,
         "user_baseline": user_baseline,
         "baseline_note": baseline_note,
+        # Phase 6 — calibration-adjusted view. Empty when the user
+        # hasn't completed Personal Setup yet. Frontend reads this
+        # for the "How this compares to your natural style" panel.
+        "calibration_adjusted": calibration_adjusted,
         "signal_stderrs": signal_stderrs,
         "signal_reasons": signal_reasons,
         "weakest_signal": sorted_signals[0][0] if sorted_signals else "unknown",

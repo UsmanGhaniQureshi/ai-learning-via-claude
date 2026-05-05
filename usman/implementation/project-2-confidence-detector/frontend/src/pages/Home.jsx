@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom'
 import ProgressChart from '../components/ProgressChart'
+import CalibrationStatusBadge from '../components/CalibrationStatusBadge'
 
 const MODES = [
   {
@@ -31,6 +32,13 @@ const MODES = [
 export default function Home() {
   return (
     <>
+      {/* First-timer onboarding banner — only renders for users who
+          have not calibrated AND have no sessions yet AND have not
+          explicitly skipped. Disappears entirely once any of those
+          conditions flips. This is THE place a brand-new user
+          discovers the personal-setup flow. */}
+      <CalibrationStatusBadge variant="prominent" />
+
       {/* Hero */}
       <section className="text-center py-20 space-y-6">
         <div className="inline-flex items-center gap-2 px-3 py-1
@@ -80,6 +88,14 @@ export default function Home() {
             </span>
           </Link>
         ))}
+      </section>
+
+      {/* Quiet calibration nudge for users who already have sessions
+          but never finished personal setup. Returns null for
+          first-timers (they see the prominent banner above the hero)
+          and for users who completed setup. Dismissible. */}
+      <section className="mt-8">
+        <CalibrationStatusBadge variant="quiet" />
       </section>
 
       {/* Progress strip */}

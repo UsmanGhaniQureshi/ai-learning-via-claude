@@ -8,5 +8,6 @@ from .media import Media
 from .segment import MediaSegment
 from .user import User
 from .comment import Comment
+from .calibration_profile import CalibrationProfile
 
-__all__ = ["Media", "MediaSegment", "User", "Comment"]
+__all__ = ["Media", "MediaSegment", "User", "Comment", "CalibrationProfile"]

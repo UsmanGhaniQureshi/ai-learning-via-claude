@@ -163,6 +163,10 @@ class FaceEngine:
         # of video, which is reasonable for a minimum clip.
         self.baseline = None
         self.calibration_frames = []
+        # Step 13: per-user calibration profile (10-emotion face set).
+        # None until `set_calibration_profile` is called. When set,
+        # `process_frame` adds `expression_calibrated` to its return.
+        self._calibration_emotion_faces = None
         self.CALIBRATION_COUNT = 90  # ~3 seconds at 30fps
         # Bug B (Apr 2026): if the user is still moving during the 3s
         # calibration window, the resulting baseline is contaminated and
@@ -679,7 +683,59 @@ class FaceEngine:
         except Exception:
             pose_landmarks = None
 
-        return self._compute_signals(fl, blendshapes, pose_landmarks, w, h, timestamp)
+        result = self._compute_signals(fl, blendshapes, pose_landmarks, w, h, timestamp)
+
+        # Step 13: surface raw blendshapes + run the calibration
+        # matcher when a profile has been attached to this engine.
+        # ALL OF THIS IS ADDITIVE — pre-existing fields in `result`
+        # are not touched.
+        if result is not None:
+            try:
+                from calibration_engine import match_emotion_to_profile
+                # Raw blendshapes — used by the calibration emotion-
+                # capture endpoint to average across frames. Only
+                # emit name+score (drop MediaPipe internal fields)
+                # so the dict stays JSON-serialisable.
+                result["blendshapes_raw"] = [
+                    {
+                        "category_name": getattr(bs, "category_name", None),
+                        "score": float(getattr(bs, "score", 0.0)),
+                    }
+                    for bs in (blendshapes or [])
+                    if getattr(bs, "category_name", None) is not None
+                ]
+                # Personal-baseline emotion match. Only fires when a
+                # CalibrationProfile.emotion_faces blob has been
+                # attached via `set_calibration_profile`. Returns
+                # `expression_calibrated=None` otherwise so callers
+                # can detect "no personal baseline yet".
+                profile = getattr(self, "_calibration_emotion_faces", None)
+                if profile:
+                    match = match_emotion_to_profile(blendshapes, profile)
+                    result["expression_calibrated"] = match.get("matched_emotion")
+                    result["expression_calibrated_similarity"] = match.get("similarity")
+                else:
+                    result["expression_calibrated"] = None
+                    result["expression_calibrated_similarity"] = None
+            except Exception:
+                # Never break the existing result on a calibration
+                # error — calibration is a non-critical add-on.
+                result.setdefault("blendshapes_raw", [])
+                result.setdefault("expression_calibrated", None)
+                result.setdefault("expression_calibrated_similarity", None)
+
+        return result
+
+    def set_calibration_profile(self, emotion_faces: dict | None) -> None:
+        """Attach (or detach) a per-user calibration profile so that
+        every subsequent `process_frame` call also runs the cosine-
+        similarity emotion matcher and surfaces `expression_calibrated`.
+
+        Pass `None` to detach. Safe to call mid-session — the next
+        frame picks up the new profile. The matcher is purely
+        additive; no existing field on the result dict is changed.
+        """
+        self._calibration_emotion_faces = emotion_faces or None
 
     def close(self):
         """Shut down the MediaPipe-call thread pool. Safe to call

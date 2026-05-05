@@ -50,7 +50,12 @@ from slowapi.util import get_remote_address
 import re
 
 from db import SessionLocal, engine as _db_engine
-from models import Media, MediaSegment, User, Comment
+from models import Media, MediaSegment, User, Comment, CalibrationProfile
+from calibration_prompts import EMOTION_PROMPTS, VOICE_PROMPTS
+from calibration_engine import (
+    match_emotion_to_profile,
+    average_blendshapes,
+)
 from log_config import configure_logging, get_logger
 
 # Install the JSON formatter as early as possible so every subsequent
@@ -306,7 +311,136 @@ def _fetch_user_baseline(
             "std": round(ps_var ** 0.5, 2),
             "n": len(pitch_std_vals),
         }
+
+    # Phase 6 — Personal Calibration blend.
+    # When the user has completed Personal Setup, blend the
+    # calibration-derived baseline with the session-derived baseline
+    # we computed above. The blend ratio drifts toward session data
+    # as the user accumulates more practice runs:
+    #   session_count <  3:  100% calibration
+    #   session_count 3–9:    60% calibration / 40% sessions
+    #   session_count >= 10:  40% calibration / 60% sessions
+    # Provisional signals (per CalibrationProfile.provisional_signals)
+    # additionally blend 50/50 with universal thresholds — the report
+    # layer applies that final 50/50 step because it knows the
+    # universal anchor for each signal.
+    try:
+        with SessionLocal() as db:
+            cp = db.get(CalibrationProfile, _calib_id(user_id))
+            if cp is not None and cp.is_complete:
+                sc = int(cp.session_count or 0)
+                if sc < 3:
+                    cal_w, sess_w = 1.0, 0.0
+                elif sc < 10:
+                    cal_w, sess_w = 0.6, 0.4
+                else:
+                    cal_w, sess_w = 0.4, 0.6
+
+                # Map calibration column → existing signal name.
+                cal_means = {
+                    "voice_steadiness": cp.voice_steadiness_baseline,
+                    "speech_pace": _wpm_to_score(cp.voice_wpm_mean) if cp.voice_wpm_mean else None,
+                    "filler_words": _filler_rate_to_score(cp.voice_filler_rate_baseline)
+                        if cp.voice_filler_rate_baseline is not None else None,
+                    "vocal_variety": cp.vocal_variety_baseline,
+                }
+                # Tolerance bands (mean ± 1.5 σ on the RAW signal —
+                # WPM, filler rate, etc.). Surface them so the report
+                # builder can flag whether a session value sits
+                # inside the user's normal range.
+                out["calibration"] = {
+                    "is_complete": True,
+                    "calibration_version": cp.calibration_version,
+                    "session_count": sc,
+                    "blend_ratio": {"calibration": cal_w, "session": sess_w},
+                    "baseline_confidence": cp.baseline_confidence,
+                    "tolerance_bands": cp.tolerance_bands or {},
+                    "rolling_baseline": cp.rolling_baseline or {},
+                    "reliable_signals": cp.reliable_signals or [],
+                    "provisional_signals": cp.provisional_signals or [],
+                    "camera_anxiety_detected": bool(cp.camera_anxiety_detected),
+                    "camera_anxiety_delta": cp.camera_anxiety_delta or {},
+                    "emotion_mix_baseline": cp.emotion_mix_baseline,
+                    "raw_baselines": {
+                        "wpm":          cp.voice_wpm_mean,
+                        "pitch_mean":   cp.voice_pitch_mean_baseline,
+                        "pitch_std":    cp.voice_pitch_std_baseline,
+                        "rms":          cp.voice_rms_baseline,
+                        "filler_rate":  cp.voice_filler_rate_baseline,
+                        "jitter_pct":   cp.voice_jitter_baseline,
+                        "shimmer_pct":  cp.voice_shimmer_baseline,
+                        "voice_steadiness": cp.voice_steadiness_baseline,
+                        "vocal_variety":    cp.vocal_variety_baseline,
+                    },
+                }
+
+                # Blend each per-signal mean. Out-shape stays the
+                # same so generate_post_session_report doesn't need
+                # changes for the existing baseline_adjusted block.
+                for sig, cal_mean in cal_means.items():
+                    if cal_mean is None:
+                        continue
+                    sess_entry = out.get(sig)
+                    sess_mean = sess_entry["mean"] if sess_entry else None
+                    sess_std  = sess_entry["std"]  if sess_entry else None
+                    if sess_mean is None:
+                        # No session data yet — calibration carries.
+                        out[sig] = {
+                            "mean": round(float(cal_mean), 1),
+                            "std": 1.0,  # floor — no per-signal std avail
+                            "n": max(sc, 6),
+                        }
+                    else:
+                        blended = cal_w * float(cal_mean) + sess_w * float(sess_mean)
+                        out[sig] = {
+                            "mean": round(blended, 1),
+                            "std": float(sess_std or 1.0),
+                            "n": (sess_entry or {}).get("n", sc),
+                            "calibration_blend": {
+                                "calibration_mean": round(float(cal_mean), 1),
+                                "session_mean":     round(float(sess_mean), 1),
+                                "weights": [cal_w, sess_w],
+                            },
+                        }
+                # Mark the whole baseline ready even if n_sessions<3,
+                # because calibration provides the missing data.
+                out["ready"] = True
+    except Exception as e:
+        # Never let a calibration lookup break report generation —
+        # fall back to the session-only baseline.
+        log.warning("calibration.baseline_blend_failed",
+                    extra={"user_id": user_id, "error": str(e)})
+
     return out
+
+
+# Helpers used by the calibration blend above. Keep them near
+# `_fetch_user_baseline` so future maintainers see the relationship.
+
+def _wpm_to_score(wpm: float | None) -> float | None:
+    """Mirror scoring_engine._wpm_to_score (which lives in another
+    module) without an import-time circular: 100 at WPM=150, gentle
+    falloff. Used to express a calibration WPM as a 0-100 baseline
+    that lines up with `signal_averages.speech_pace`."""
+    if wpm is None or wpm <= 0:
+        return None
+    import math as _math
+    if wpm <= 150:
+        s = 100 * (wpm / 150) ** 0.5
+    else:
+        s = 100 * _math.exp(-0.003 * (wpm - 150))
+    return round(max(0.0, min(100.0, s)), 1)
+
+
+def _filler_rate_to_score(rate_per_100w: float | None) -> float | None:
+    """Mirror SignalScorer.filler_words shape on the per-100-words
+    rate path: smooth exponential decay. Returns the equivalent
+    0-100 score for a baseline filler-rate."""
+    if rate_per_100w is None or rate_per_100w < 0:
+        return None
+    import math as _math
+    s = 100.0 * _math.exp(-rate_per_100w / 3.0)
+    return round(max(0.0, min(100.0, s)), 1)
 
 
 # ── Path-traversal guard ────────────────────────────────────────────────
@@ -5730,6 +5864,966 @@ def delete_media(
             pass
 
     return {"status": "deleted", "media_id": media_id, "removed": removed}
+
+
+# ============================================================
+# PERSONAL CALIBRATION SYSTEM (Phase 6)
+#
+# Six endpoints power the one-shot Personal Setup flow:
+#   POST   /api/calibration/start         — create or reset profile
+#   POST   /api/calibration/emotion/{lbl} — 10-second face capture
+#   POST   /api/calibration/voice         — 60-second voice capture
+#   POST   /api/calibration/complete      — aggregate + tolerance bands
+#   GET    /api/calibration/status        — progress / next step
+#   PATCH  /api/calibration/baseline      — internal EWMA rolling update
+#
+# All gated by Depends(get_current_user). The user_id → profile
+# mapping is UNIQUE — one row per user, mutated in place across
+# /start (reset bumps `calibration_version`) and /complete.
+# ============================================================
+
+# Population clamps from the Data Scientist requirements. Values
+# outside these are flagged as bad-recording rather than stored.
+CALIBRATION_CLAMPS = {
+    "wpm":          (80.0, 220.0),
+    "pitch_std":    (5.0, 60.0),
+    "filler_rate":  (0.0, 15.0),
+    "jitter_pct":   (0.0, 2.0),
+    "shimmer_pct":  (0.0, 6.0),
+}
+
+
+def _calib_id(user_id: str) -> str:
+    """Deterministic profile id derived from user_id so /start is
+    truly idempotent (re-runs hit the same row).
+    """
+    return f"calib_{user_id}"
+
+
+def _get_or_create_calibration(db, user_id: str) -> CalibrationProfile:
+    """Fetch the user's calibration profile; create a fresh one if
+    absent. Caller commits."""
+    cid = _calib_id(user_id)
+    profile = db.get(CalibrationProfile, cid)
+    if profile is None:
+        profile = CalibrationProfile(
+            id=cid,
+            user_id=user_id,
+            is_complete=False,
+            calibration_version=1,
+            emotion_faces={},
+            calibration_recordings=[],
+        )
+        db.add(profile)
+        db.flush()
+    return profile
+
+
+def _calibration_status_summary(p: CalibrationProfile) -> dict:
+    """Shape used by GET /api/calibration/status."""
+    emotions_captured = list((p.emotion_faces or {}).keys())
+    recs = p.calibration_recordings or []
+    video_done = sum(1 for r in recs if (r or {}).get("mode") == "video")
+    audio_done = sum(1 for r in recs if (r or {}).get("mode") == "audio")
+    target_emotions = len(EMOTION_PROMPTS)
+    target_voice = len(VOICE_PROMPTS)
+    if not emotions_captured:
+        next_step = "emotion_capture"
+    elif len(emotions_captured) < target_emotions:
+        next_step = "emotion_capture"
+    elif video_done < target_voice:
+        next_step = "voice_video"
+    elif audio_done < target_voice:
+        next_step = "voice_audio"
+    elif not p.is_complete:
+        next_step = "complete"
+    else:
+        next_step = "done"
+    return {
+        "is_complete": bool(p.is_complete),
+        "emotions_captured": emotions_captured,
+        "voice_recordings_done": video_done,
+        "audio_recordings_done": audio_done,
+        "next_step": next_step,
+        "baseline_confidence": p.baseline_confidence,
+        "calibration_version": p.calibration_version,
+        "session_count": p.session_count,
+        # Target counts let the frontend display "X of Y" without
+        # mirroring the prompt-file constants. Single source of truth.
+        "target_emotions": target_emotions,
+        "target_voice": target_voice,
+    }
+
+
+def _emotion_quality_check(face_results: list, frames_total: int) -> dict:
+    """Validate a per-emotion face capture meets the requirements:
+        - face detected in >= 8 frames
+        - face_turned_away < 30% of frames
+        - calibration_quality average > 0.5
+
+    Returns a dict {ok, reason, quality_score, frames_used}.
+    """
+    detected = [r for r in face_results if r is not None]
+    if not detected:
+        return {
+            "ok": False,
+            "reason": "We could not see a face. Make sure the camera is on and well-lit.",
+            "quality_score": 0.0,
+            "frames_used": 0,
+        }
+    if len(detected) < 8:
+        return {
+            "ok": False,
+            "reason": f"Only saw a face in {len(detected)} frames — need at least 8. Try again with the camera centred.",
+            "quality_score": round(len(detected) / max(frames_total, 1), 2),
+            "frames_used": len(detected),
+        }
+    turned_away = sum(1 for r in detected if r.get("face_turned_away"))
+    turned_pct = turned_away / len(detected)
+    if turned_pct >= 0.30:
+        return {
+            "ok": False,
+            "reason": "Your face was turned away too often — please look toward the camera.",
+            "quality_score": round(1.0 - turned_pct, 2),
+            "frames_used": len(detected),
+        }
+    qual_vals: list[float] = []
+    for r in detected:
+        cq = r.get("calibration_quality")
+        if isinstance(cq, (int, float)):
+            qual_vals.append(float(cq))
+        else:
+            # Use a sensible proxy — the per-frame face_confidence
+            # — when calibration_quality wasn't set yet. The
+            # FaceEngine sets calibration_quality only after its own
+            # 90-frame baseline finishes.
+            fc = r.get("confidence_score")
+            if isinstance(fc, (int, float)):
+                qual_vals.append(float(fc) / 100.0)
+    avg_q = sum(qual_vals) / len(qual_vals) if qual_vals else 0.0
+    if avg_q < 0.5:
+        return {
+            "ok": False,
+            "reason": "Image quality was low — try better lighting and a still camera.",
+            "quality_score": round(avg_q, 2),
+            "frames_used": len(detected),
+        }
+    return {
+        "ok": True,
+        "reason": None,
+        "quality_score": round(avg_q, 2),
+        "frames_used": len(detected),
+    }
+
+
+def _voice_quality_check(snapshots: list) -> dict:
+    """Validate a 60 s voice recording against the ML-engineer
+    requirements before it's accepted into the baseline:
+        - voiced_s > 20
+        - word_count > 40
+        - >= 5 pitch-valid chunks (voiced_f0 frames >= 15)
+        - jitter not NaN
+    """
+    if not snapshots:
+        return {"ok": False, "reason": "No audio captured."}
+    voiced_s = sum(float((s.get("raw") or {}).get("voiced_s") or 0) for s in snapshots)
+    word_count = sum(len((s.get("transcript_words") or [])) for s in snapshots)
+    pitch_valid = sum(
+        1 for s in snapshots
+        if (((s.get("raw") or {}).get("pitch") or {}).get("std_hz") or 0) > 0
+    )
+    jitter_vals: list[float] = []
+    for s in snapshots:
+        j = ((s.get("raw") or {}).get("trembling") or {}).get("jitter_pct")
+        if isinstance(j, (int, float)):
+            jitter_vals.append(float(j))
+    jitter_ok = len(jitter_vals) > 0 and all(
+        not (isinstance(j, float) and j != j) for j in jitter_vals  # NaN check
+    )
+    if voiced_s <= 20:
+        return {
+            "ok": False,
+            "reason": (
+                f"Only {round(voiced_s, 1)} s of speech detected — please "
+                "speak for at least the full 60 seconds."
+            ),
+        }
+    if word_count <= 40:
+        return {
+            "ok": False,
+            "reason": (
+                f"Only {word_count} words transcribed — please speak more "
+                "fluently this time."
+            ),
+        }
+    if pitch_valid < 5:
+        return {
+            "ok": False,
+            "reason": (
+                "Voice pitch could not be measured reliably. Speak a bit "
+                "louder and try again."
+            ),
+        }
+    if not jitter_ok:
+        return {
+            "ok": False,
+            "reason": "Could not measure voice stability. Please try again.",
+        }
+    return {"ok": True, "reason": None}
+
+
+def _voice_signal_preview(snapshots: list) -> dict:
+    """Per-recording mean signals — stored in calibration_recordings
+    and surfaced briefly in /voice response so the UI can show a
+    "got it" preview before moving on.
+    """
+    if not snapshots:
+        return {}
+    voiced_s = sum(float((s.get("raw") or {}).get("voiced_s") or 0) for s in snapshots)
+    word_count = sum(len((s.get("transcript_words") or [])) for s in snapshots)
+    wpm = (word_count / max(voiced_s, 0.01)) * 60 if voiced_s > 0 else 0
+    pitches = [
+        float(((s.get("raw") or {}).get("pitch") or {}).get("mean_hz") or 0)
+        for s in snapshots
+        if (((s.get("raw") or {}).get("pitch") or {}).get("mean_hz") or 0) > 0
+    ]
+    pitch_stds = [
+        float(((s.get("raw") or {}).get("pitch") or {}).get("std_hz") or 0)
+        for s in snapshots
+        if (((s.get("raw") or {}).get("pitch") or {}).get("std_hz") or 0) > 0
+    ]
+    rms_vals = [float((s.get("raw") or {}).get("rms") or 0) for s in snapshots]
+    rms_std_vals = [float((s.get("raw") or {}).get("rms_std") or 0) for s in snapshots]
+    fillers = sum(
+        int((s.get("raw") or {}).get("lexical_filler_count") or 0)
+        + int((s.get("raw") or {}).get("acoustic_filler_count_deduped") or 0)
+        for s in snapshots
+    )
+    filler_rate = (fillers / max(word_count, 1)) * 100 if word_count else 0
+    jitters = [
+        float(((s.get("raw") or {}).get("trembling") or {}).get("jitter_pct") or 0)
+        for s in snapshots
+    ]
+    shimmers = [
+        float(((s.get("raw") or {}).get("trembling") or {}).get("shimmer_pct") or 0)
+        for s in snapshots
+    ]
+    voice_steady = [
+        s.get("scores", {}).get("voice_steadiness")
+        for s in snapshots
+        if isinstance(s.get("scores", {}).get("voice_steadiness"), (int, float))
+    ]
+    vocal_var = [
+        s.get("scores", {}).get("vocal_variety")
+        for s in snapshots
+        if isinstance(s.get("scores", {}).get("vocal_variety"), (int, float))
+    ]
+    # Aggregated per-chunk emotion mix.
+    try:
+        from emotion_detector import aggregate_emotion_mixes
+        emix = aggregate_emotion_mixes([s.get("emotion") for s in snapshots if s.get("emotion")])
+    except Exception:
+        emix = {"mix": None, "dominant": None, "dominant_pct": None}
+    return {
+        "voiced_s": round(voiced_s, 2),
+        "word_count": int(word_count),
+        "wpm": round(wpm, 1),
+        "pitch_mean": round(sum(pitches) / len(pitches), 1) if pitches else 0.0,
+        "pitch_std":  round(sum(pitch_stds) / len(pitch_stds), 2) if pitch_stds else 0.0,
+        "rms":        round(sum(rms_vals) / max(len(rms_vals), 1), 4),
+        "rms_std":    round(sum(rms_std_vals) / max(len(rms_std_vals), 1), 4),
+        "filler_rate": round(filler_rate, 2),
+        "jitter_pct":  round(sum(jitters) / max(len(jitters), 1), 3),
+        "shimmer_pct": round(sum(shimmers) / max(len(shimmers), 1), 3),
+        "voice_steadiness": round(sum(voice_steady) / max(len(voice_steady), 1), 1) if voice_steady else None,
+        "vocal_variety":    round(sum(vocal_var) / max(len(vocal_var), 1), 1) if vocal_var else None,
+        "emotion_mix": emix.get("mix"),
+    }
+
+
+def _aggregate_voice_baselines(recordings: list) -> dict:
+    """Aggregate per-signal mean / std / min / max across all
+    accepted voice recordings. Returns a flat dict keyed by signal
+    name; the /complete endpoint uses this to populate the baseline
+    columns on CalibrationProfile.
+    """
+    if not recordings:
+        return {}
+    sigs = ("wpm", "pitch_mean", "pitch_std", "rms", "rms_std",
+            "filler_rate", "jitter_pct", "shimmer_pct",
+            "voice_steadiness", "vocal_variety")
+    out: dict = {}
+    for s in sigs:
+        vals = [
+            float(r.get(s)) for r in recordings
+            if isinstance(r.get(s), (int, float))
+        ]
+        if not vals:
+            continue
+        n = len(vals)
+        mean = sum(vals) / n
+        var = sum((v - mean) ** 2 for v in vals) / max(n - 1, 1)
+        std = var ** 0.5
+        out[s] = {
+            "mean": round(mean, 3),
+            "std": round(std, 3),
+            "min": round(min(vals), 3),
+            "max": round(max(vals), 3),
+            "n": n,
+        }
+    return out
+
+
+def _compute_tolerance_bands(stats: dict) -> dict:
+    """Per-signal tolerance bands (mean ± 1.5 σ). Stored as JSONB on
+    the profile and used at scoring time to flag whether a session
+    value sits inside the user's normal range.
+    """
+    bands: dict = {}
+    for sig, s in stats.items():
+        mean = s.get("mean")
+        std = s.get("std", 0.0)
+        if mean is None:
+            continue
+        bands[sig] = {
+            "lower": round(mean - 1.5 * std, 3),
+            "upper": round(mean + 1.5 * std, 3),
+        }
+    return bands
+
+
+def _baseline_confidence(stats: dict) -> float:
+    """Mean of (1 - cv) across signals where cv = std / mean.
+    Clamped to [0, 1]. Returned in /complete + /status."""
+    cvs: list[float] = []
+    for s in stats.values():
+        mean = s.get("mean")
+        std = s.get("std")
+        if not isinstance(mean, (int, float)) or not isinstance(std, (int, float)):
+            continue
+        if mean <= 0:
+            continue
+        cv = std / mean
+        cvs.append(max(0.0, min(1.0, 1.0 - cv)))
+    if not cvs:
+        return 0.0
+    return round(sum(cvs) / len(cvs), 3)
+
+
+def _classify_signal_reliability(stats: dict) -> tuple[list[str], list[str]]:
+    """Return (reliable, provisional). A signal is reliable when
+    std/mean < 0.3 AND n >= 3 — see the Data Scientist spec."""
+    reliable: list[str] = []
+    provisional: list[str] = []
+    for sig, s in stats.items():
+        mean = s.get("mean")
+        std = s.get("std", 0.0)
+        n = s.get("n", 0)
+        if mean and mean > 0 and (std / mean) < 0.3 and n >= 3:
+            reliable.append(sig)
+        else:
+            provisional.append(sig)
+    return reliable, provisional
+
+
+def _camera_anxiety_delta(recordings: list) -> tuple[dict, bool]:
+    """Compare video-mode vs audio-mode recordings for camera anxiety
+    detection. Triggers when |wpm_delta| > 20 OR |filler_rate_delta| > 3.
+    """
+    video = [r for r in recordings if r.get("mode") == "video"]
+    audio = [r for r in recordings if r.get("mode") == "audio"]
+    if not video or not audio:
+        return {}, False
+
+    def _avg(items, key):
+        vals = [float(r.get(key)) for r in items if isinstance(r.get(key), (int, float))]
+        return (sum(vals) / len(vals)) if vals else None
+
+    wpm_v, wpm_a = _avg(video, "wpm"), _avg(audio, "wpm")
+    pst_v, pst_a = _avg(video, "pitch_std"), _avg(audio, "pitch_std")
+    fr_v, fr_a   = _avg(video, "filler_rate"), _avg(audio, "filler_rate")
+    vs_v, vs_a   = _avg(video, "voice_steadiness"), _avg(audio, "voice_steadiness")
+
+    def _d(a, b):
+        if a is None or b is None:
+            return None
+        return round(a - b, 2)
+
+    delta = {
+        "wpm_delta":         _d(wpm_v, wpm_a),
+        "pitch_std_delta":   _d(pst_v, pst_a),
+        "filler_rate_delta": _d(fr_v, fr_a),
+        "steadiness_delta":  _d(vs_v, vs_a),
+    }
+    detected = False
+    if isinstance(delta["wpm_delta"], (int, float)) and abs(delta["wpm_delta"]) > 20:
+        detected = True
+    if isinstance(delta["filler_rate_delta"], (int, float)) and abs(delta["filler_rate_delta"]) > 3:
+        detected = True
+    return delta, detected
+
+
+def _check_population_clamps(stats: dict) -> list[str]:
+    """Return a list of clamp-violating signals. Empty list = all OK.
+    Used by /complete to refuse to mark a profile complete when an
+    extreme value would make all future scoring meaningless.
+    """
+    violations: list[str] = []
+    for sig, (lo, hi) in CALIBRATION_CLAMPS.items():
+        s = stats.get(sig)
+        if s is None:
+            continue
+        mean = s.get("mean")
+        if mean is None:
+            continue
+        if mean < lo or mean > hi:
+            violations.append(
+                f"{sig}={round(mean, 2)} outside expected [{lo}, {hi}]"
+            )
+    return violations
+
+
+# ── Calibration endpoints ──────────────────────────────────────
+
+@app.post("/api/calibration/start")
+@limiter.limit("10/hour")
+async def calibration_start(
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """Create or RESET the user's calibration profile. Idempotent on
+    the row identity (`calib_<user_id>`) so callers can safely retry.
+    Returns the per-user shuffled emotion order + all prompt copy
+    so the frontend doesn't need to mirror it.
+    """
+    import random
+    emotions = list(EMOTION_PROMPTS.keys())
+    random.shuffle(emotions)
+
+    with SessionLocal() as db:
+        p = _get_or_create_calibration(db, user.id)
+        # Reset everything except the row identity. Bump the
+        # version so cached reports referencing an older
+        # calibration can detect they are stale.
+        p.calibration_version = (p.calibration_version or 1) + (1 if p.is_complete else 0)
+        p.is_complete = False
+        p.emotion_order = emotions
+        p.emotion_faces = {}
+        p.calibration_recordings = []
+        p.voice_wpm_mean = None
+        p.voice_wpm_std = None
+        p.voice_wpm_min = None
+        p.voice_wpm_max = None
+        p.voice_pitch_mean_baseline = None
+        p.voice_pitch_std_baseline = None
+        p.voice_pitch_std_variability = None
+        p.voice_rms_baseline = None
+        p.voice_filler_rate_baseline = None
+        p.voice_filler_rate_std = None
+        p.voice_jitter_baseline = None
+        p.voice_shimmer_baseline = None
+        p.voice_steadiness_baseline = None
+        p.vocal_variety_baseline = None
+        p.emotion_mix_baseline = None
+        p.tolerance_bands = None
+        p.baseline_confidence = None
+        p.camera_anxiety_delta = None
+        p.camera_anxiety_detected = False
+        p.rolling_baseline = None
+        p.reliable_signals = None
+        p.provisional_signals = None
+        # session_count NOT reset — that's a lifetime metric
+        db.commit()
+        cid = p.id
+
+    return {
+        "calibration_id": cid,
+        "calibration_version": (p.calibration_version),
+        "emotion_order": emotions,
+        "emotion_prompts": EMOTION_PROMPTS,
+        "voice_prompts": VOICE_PROMPTS,
+    }
+
+
+@app.post("/api/calibration/emotion/{emotion_label}")
+@limiter.limit("60/hour")
+async def calibration_emotion(
+    request: Request,
+    emotion_label: str,
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """Receive a 10-second video clip for a single emotion, sample
+    frames at ~5 fps, run them through FaceEngine, average blendshapes
+    + per-frame metrics, apply quality gate, save to
+    `emotion_faces[emotion_label]`.
+    """
+    if emotion_label not in EMOTION_PROMPTS:
+        return JSONResponse({"error": "Unknown emotion label"}, status_code=400)
+
+    # Save the uploaded blob to a temp file so cv2.VideoCapture can
+    # read it. Use a per-user prefix and include the emotion label so
+    # the on-disk artefact is traceable during debugging.
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(
+        prefix=f"calib_emotion_{user.id}_{emotion_label}_",
+        suffix=".webm", delete=False,
+    )
+    try:
+        size = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 25 * 1024 * 1024:  # 25 MB hard cap on a 10 s clip
+                tmp.close()
+                os.unlink(tmp.name)
+                return JSONResponse({"error": "Clip too large (max 25 MB)."}, status_code=413)
+            tmp.write(chunk)
+        tmp.close()
+
+        # Decode + run face engine at ~5 fps. The shipped frame-loop
+        # cadence trick from the upload pipeline does the same thing;
+        # we just don't need the cv2.VideoWriter side here.
+        cap = cv2.VideoCapture(tmp.name)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        process_every = max(1, int(round(fps / 5.0)))
+        face_engine = FaceEngine()
+        per_frame_blendshapes: list = []
+        per_frame_results: list = []
+        frame_count = 0
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_count += 1
+                if frame_count % process_every != 0:
+                    continue
+                ts = frame_count / max(fps, 1.0)
+                r = face_engine.process_frame(frame, ts)
+                if r is not None:
+                    per_frame_results.append(r)
+                    if r.get("blendshapes_raw"):
+                        # Re-construct objects with category_name +
+                        # score so `average_blendshapes` (which uses
+                        # attribute access) can consume them.
+                        class _Bs:
+                            def __init__(self, bs):
+                                self.category_name = bs.get("category_name")
+                                self.score = bs.get("score", 0.0)
+                        per_frame_blendshapes.append(
+                            [_Bs(bs) for bs in r["blendshapes_raw"]]
+                        )
+        finally:
+            try: cap.release()
+            except Exception: pass
+            try: face_engine.close()
+            except Exception: pass
+
+        sampled_frames = max(1, frame_count // process_every)
+        gate = _emotion_quality_check(per_frame_results, sampled_frames)
+        if not gate["ok"]:
+            return {
+                "emotion_label": emotion_label,
+                "quality_ok": False,
+                "reason": gate["reason"],
+                "quality_score": gate["quality_score"],
+            }
+
+        avg_bs = average_blendshapes(per_frame_blendshapes)
+        # Per-frame numerics (eye_contact, tension, blink_rate) —
+        # average over the detected frames only.
+        def _avg_field(key):
+            vals = [
+                float(r.get(key)) for r in per_frame_results
+                if isinstance(r.get(key), (int, float))
+            ]
+            return (sum(vals) / len(vals)) if vals else None
+        face_record = {
+            "blendshapes_avg": avg_bs,
+            "eye_contact_pct": _avg_field("eye_contact_pct"),
+            "tension_score": _avg_field("tension_score"),
+            "blink_rate": _avg_field("blink_rate"),
+            "calibration_quality": gate["quality_score"],
+            "frames_used": gate["frames_used"],
+        }
+        # Most-common gaze_direction (categorical).
+        from collections import Counter
+        gazes = [r.get("gaze_direction") for r in per_frame_results if r.get("gaze_direction")]
+        if gazes:
+            face_record["gaze_direction"] = Counter(gazes).most_common(1)[0][0]
+
+        with SessionLocal() as db:
+            p = _get_or_create_calibration(db, user.id)
+            faces = dict(p.emotion_faces or {})
+            faces[emotion_label] = face_record
+            p.emotion_faces = faces
+            db.commit()
+
+        return {
+            "emotion_label": emotion_label,
+            "quality_ok": True,
+            "quality_score": gate["quality_score"],
+            "frames_used": gate["frames_used"],
+        }
+    finally:
+        try: os.unlink(tmp.name)
+        except OSError: pass
+
+
+@app.post("/api/calibration/voice")
+@limiter.limit("60/hour")
+async def calibration_voice(
+    request: Request,
+    file: UploadFile = File(...),
+    mode: str = Form(...),
+    prompt_index: int = Form(...),
+    user: User = Depends(get_current_user),
+):
+    """Receive a 60 s recording (video or audio) for one voice prompt.
+    Runs the full AudioPipeline, applies the voice quality gate, and
+    appends to `calibration_recordings`.
+    """
+    if mode not in ("video", "audio"):
+        return JSONResponse({"error": "mode must be 'video' or 'audio'"}, status_code=400)
+    if prompt_index not in (0, 1, 2):
+        return JSONResponse({"error": "prompt_index must be 0, 1, or 2"}, status_code=400)
+
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(
+        prefix=f"calib_voice_{user.id}_{mode}{prompt_index}_",
+        suffix=".webm", delete=False,
+    )
+    try:
+        size = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > 100 * 1024 * 1024:
+                tmp.close()
+                os.unlink(tmp.name)
+                return JSONResponse({"error": "Recording too large (max 100 MB)."}, status_code=413)
+            tmp.write(chunk)
+        tmp.close()
+
+        # Stream audio through ffmpeg → AudioPipeline.process_chunk per
+        # 3-second window. Same shape the existing analyzer-audio path
+        # uses; we don't need the cv2 frame loop here even when mode=video
+        # because calibration only needs voice signals (face is handled
+        # by the emotion-capture endpoint).
+        chunk_samples = 16000 * 3
+        chunk_bytes = chunk_samples * 2
+        pipeline = AudioPipeline()
+        snapshots: list[dict] = []
+        proc = subprocess.Popen(
+            [FFMPEG,
+             '-err_detect', 'crccheck+bitstream',
+             '-fflags', '+discardcorrupt',
+             '-i', tmp.name,
+             '-af', 'dynaudnorm=p=0.9:m=8',
+             '-ar', '16000', '-ac', '1',
+             '-f', 's16le', '-', '-loglevel', 'error'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            leftover = b""
+            while True:
+                need = chunk_bytes - len(leftover)
+                data = proc.stdout.read(need) if need > 0 else b""
+                if not data:
+                    break
+                buf = leftover + data
+                while len(buf) >= chunk_bytes:
+                    piece = buf[:chunk_bytes]
+                    buf = buf[chunk_bytes:]
+                    arr = np.frombuffer(piece, dtype=np.int16).astype(np.float32) / 32768.0
+                    result = pipeline.process_chunk(arr, sr=16000)
+                    snapshots.append(result)
+                leftover = buf
+            try: proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        finally:
+            try: proc.stdout.close()
+            except Exception: pass
+            try: proc.stderr.close()
+            except Exception: pass
+
+        # Reject a non-English recording immediately — calibration is
+        # English-only same as the rest of the app.
+        unsupported = next(
+            (s.get("unsupported_language") for s in snapshots if s.get("unsupported_language")),
+            None,
+        )
+        if unsupported:
+            return {
+                "quality_ok": False,
+                "reason": (
+                    "This recording was not in English. The app currently "
+                    "supports English only — please record again in English."
+                ),
+            }
+
+        gate = _voice_quality_check(snapshots)
+        if not gate["ok"]:
+            return {"quality_ok": False, "reason": gate["reason"]}
+
+        preview = _voice_signal_preview(snapshots)
+
+        # Apply the same population clamps before storing — values
+        # outside [80, 220] WPM, etc., suggest a bad recording.
+        for sig, (lo, hi) in CALIBRATION_CLAMPS.items():
+            v = preview.get(sig)
+            if isinstance(v, (int, float)) and (v < lo or v > hi):
+                return {
+                    "quality_ok": False,
+                    "reason": (
+                        f"Recording produced an unusual {sig} value "
+                        f"({round(v, 1)}) — please re-record naturally."
+                    ),
+                }
+
+        record_entry = {
+            "mode": mode,
+            "prompt_index": int(prompt_index),
+            **preview,
+        }
+        with SessionLocal() as db:
+            p = _get_or_create_calibration(db, user.id)
+            recs = list(p.calibration_recordings or [])
+            # Replace any prior recording for this (mode, prompt_index)
+            # so retries cleanly overwrite.
+            recs = [
+                r for r in recs
+                if not (r.get("mode") == mode and r.get("prompt_index") == int(prompt_index))
+            ]
+            recs.append(record_entry)
+            p.calibration_recordings = recs
+            db.commit()
+
+        return {
+            "quality_ok": True,
+            "mode": mode,
+            "prompt_index": int(prompt_index),
+            "signal_preview": preview,
+        }
+    finally:
+        try: os.unlink(tmp.name)
+        except OSError: pass
+
+
+@app.post("/api/calibration/complete")
+@limiter.limit("10/hour")
+async def calibration_complete(
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """Final aggregation step. Validates that the required emotion
+    captures and voice recordings (counts derived from EMOTION_PROMPTS
+    and VOICE_PROMPTS in calibration_prompts.py) are present,
+    computes per-signal baselines,
+    tolerance bands, baseline_confidence, camera_anxiety_delta, and
+    classifies signals as reliable vs provisional. Refuses to mark
+    complete if any baseline falls outside the population clamps.
+    """
+    with SessionLocal() as db:
+        p = _get_or_create_calibration(db, user.id)
+        emotions = list((p.emotion_faces or {}).keys())
+        recs = list(p.calibration_recordings or [])
+
+        target_emotions = len(EMOTION_PROMPTS)
+        target_voice = len(VOICE_PROMPTS)
+        if len(emotions) < target_emotions:
+            missing = [k for k in EMOTION_PROMPTS if k not in emotions]
+            return {
+                "complete": False,
+                "reason": f"Missing emotion captures: {', '.join(missing)}.",
+                "missing_emotions": missing,
+            }
+        video_done = sum(1 for r in recs if r.get("mode") == "video")
+        audio_done = sum(1 for r in recs if r.get("mode") == "audio")
+        if video_done < target_voice or audio_done < target_voice:
+            return {
+                "complete": False,
+                "reason": (
+                    f"Voice recordings incomplete: {video_done}/{target_voice} video, "
+                    f"{audio_done}/{target_voice} audio."
+                ),
+                "video_recordings_done": video_done,
+                "audio_recordings_done": audio_done,
+            }
+
+        stats = _aggregate_voice_baselines(recs)
+        clamp_violations = _check_population_clamps(stats)
+        if clamp_violations:
+            return {
+                "complete": False,
+                "reason": "One or more signals are outside expected human range.",
+                "clamp_violations": clamp_violations,
+            }
+
+        bands = _compute_tolerance_bands(stats)
+        confidence = _baseline_confidence(stats)
+        reliable, provisional = _classify_signal_reliability(stats)
+        cam_delta, cam_detected = _camera_anxiety_delta(recs)
+
+        # Persist the per-signal baselines as their own columns for
+        # cheap query access by report_generator + _fetch_user_baseline.
+        def _m(sig: str) -> float | None:
+            s = stats.get(sig) or {}
+            return s.get("mean")
+        def _sd(sig: str) -> float | None:
+            s = stats.get(sig) or {}
+            return s.get("std")
+        def _mn(sig: str) -> float | None:
+            s = stats.get(sig) or {}
+            return s.get("min")
+        def _mx(sig: str) -> float | None:
+            s = stats.get(sig) or {}
+            return s.get("max")
+
+        p.voice_wpm_mean = _m("wpm")
+        p.voice_wpm_std = _sd("wpm")
+        p.voice_wpm_min = _mn("wpm")
+        p.voice_wpm_max = _mx("wpm")
+        p.voice_pitch_mean_baseline = _m("pitch_mean")
+        p.voice_pitch_std_baseline = _m("pitch_std")
+        p.voice_pitch_std_variability = _sd("pitch_std")
+        p.voice_rms_baseline = _m("rms")
+        p.voice_filler_rate_baseline = _m("filler_rate")
+        p.voice_filler_rate_std = _sd("filler_rate")
+        p.voice_jitter_baseline = _m("jitter_pct")
+        p.voice_shimmer_baseline = _m("shimmer_pct")
+        p.voice_steadiness_baseline = _m("voice_steadiness")
+        p.vocal_variety_baseline = _m("vocal_variety")
+
+        # Aggregate emotion mix across recordings.
+        try:
+            from emotion_detector import aggregate_emotion_mixes
+            agg = aggregate_emotion_mixes([{"mix": r.get("emotion_mix")} for r in recs if r.get("emotion_mix")])
+            p.emotion_mix_baseline = agg.get("mix")
+        except Exception:
+            p.emotion_mix_baseline = None
+
+        p.tolerance_bands = bands
+        p.baseline_confidence = confidence
+        p.camera_anxiety_delta = cam_delta
+        p.camera_anxiety_detected = bool(cam_detected)
+        p.reliable_signals = reliable
+        p.provisional_signals = provisional
+        # Initialise the rolling baseline to the just-computed
+        # static baseline. Subsequent /baseline PATCH calls will
+        # drift this with EWMA.
+        p.rolling_baseline = {sig: s.get("mean") for sig, s in stats.items()}
+        p.is_complete = True
+        db.commit()
+
+        return {
+            "complete": True,
+            "calibration_version": p.calibration_version,
+            "baseline_summary": {sig: s.get("mean") for sig, s in stats.items()},
+            "reliable_signals": reliable,
+            "provisional_signals": provisional,
+            "baseline_confidence": confidence,
+            "tolerance_bands": bands,
+            "camera_anxiety_detected": bool(cam_detected),
+            "camera_anxiety_delta": cam_delta,
+        }
+
+
+@app.get("/api/calibration/status")
+def calibration_status(
+    user: User = Depends(get_current_user),
+):
+    """Lightweight status poll the UI uses to decide what screen to
+    render and resume mid-calibration."""
+    with SessionLocal() as db:
+        p = db.get(CalibrationProfile, _calib_id(user.id))
+        if p is None:
+            return {
+                "is_complete": False,
+                "emotions_captured": [],
+                "voice_recordings_done": 0,
+                "audio_recordings_done": 0,
+                "next_step": "start",
+                "baseline_confidence": None,
+                "calibration_version": 0,
+                "session_count": 0,
+            }
+        return _calibration_status_summary(p)
+
+
+@app.patch("/api/calibration/baseline")
+async def calibration_baseline_internal(
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """Internal endpoint — called from session finalize to update
+    `rolling_baseline` via EWMA against the just-finished session's
+    per-signal averages.
+
+    Body: { signal_values: { wpm: float, pitch_mean: float, ... } }
+    Outlier rejection: skip a signal if the new value is outside
+    3 σ of the static baseline (an unusually bad/good day).
+    """
+    payload = await request.json()
+    signal_values = payload.get("signal_values") or {}
+    if not isinstance(signal_values, dict):
+        return JSONResponse({"error": "signal_values must be a dict"}, status_code=400)
+
+    with SessionLocal() as db:
+        p = db.get(CalibrationProfile, _calib_id(user.id))
+        if p is None or not p.is_complete:
+            return JSONResponse(
+                {"error": "No calibration profile to update"},
+                status_code=404,
+            )
+        rolling = dict(p.rolling_baseline or {})
+        bands = p.tolerance_bands or {}
+        # Reconstitute static-baseline std from tolerance bands so
+        # we can do the 3-σ outlier check.
+        applied = []
+        skipped = []
+        for sig, new_val in signal_values.items():
+            if not isinstance(new_val, (int, float)):
+                continue
+            old = rolling.get(sig)
+            band = bands.get(sig)
+            if old is None:
+                rolling[sig] = float(new_val)
+                applied.append(sig)
+                continue
+            if band:
+                # σ ≈ (upper - lower) / 3 since band = mean ± 1.5 σ
+                sigma = (band.get("upper", 0) - band.get("lower", 0)) / 3.0
+                if sigma > 0 and abs(new_val - old) > 3 * sigma:
+                    skipped.append({"signal": sig, "value": new_val, "reason": "outside_3_sigma"})
+                    continue
+            # EWMA: new = 0.8 * old + 0.2 * session
+            rolling[sig] = round(0.8 * float(old) + 0.2 * float(new_val), 3)
+            applied.append(sig)
+        p.rolling_baseline = rolling
+        p.session_count = (p.session_count or 0) + 1
+
+        # Re-classify reliability given the now-larger sample.
+        # session_count contributes more "data points" to the
+        # reliability heuristic — once session_count >= 10 every
+        # signal is considered reliable.
+        if (p.session_count or 0) >= 10:
+            p.reliable_signals = list(rolling.keys())
+            p.provisional_signals = []
+        db.commit()
+
+        return {
+            "applied": applied,
+            "skipped": skipped,
+            "session_count": p.session_count,
+            "rolling_baseline": rolling,
+        }
 
 
 if __name__ == "__main__":

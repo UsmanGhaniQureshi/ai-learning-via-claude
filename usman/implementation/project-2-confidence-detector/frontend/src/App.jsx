@@ -9,9 +9,12 @@ import History from './pages/History'
 import Login from './pages/Login'
 import Register from './pages/Register'
 import HowItWorks from './pages/HowItWorks'
+import Calibration from './pages/Calibration'
+import CalibrationProfile from './pages/CalibrationProfile'
 import ErrorBoundary from './components/ErrorBoundary'
 import { AuthProvider, useAuth } from './auth/AuthContext'
 import RequireAuth from './auth/RequireAuth'
+import RequireCalibration from './auth/RequireCalibration'
 
 function App() {
   return (
@@ -48,6 +51,7 @@ function AppShell() {
           <nav className="flex items-center gap-1">
             <NavLink to="/" end className={navLinkClass}>Home</NavLink>
             <NavLink to="/library" className={navLinkClass}>Library</NavLink>
+            <NavLink to="/calibration/profile" className={navLinkClass}>Profile</NavLink>
             <NavLink to="/how-it-works" className={navLinkClass}>How it Works</NavLink>
           </nav>
 
@@ -73,9 +77,11 @@ function AppShell() {
               <Route path="/how-it-works" element={<RequireAuth><HowItWorks /></RequireAuth>} />
 
               <Route path="/" element={<RequireAuth><Home /></RequireAuth>} />
-              <Route path="/live" element={<RequireAuth><LiveSession /></RequireAuth>} />
-              <Route path="/upload" element={<RequireAuth><Upload /></RequireAuth>} />
-              <Route path="/analyzer" element={<RequireAuth><Analyzer /></RequireAuth>} />
+              <Route path="/calibration" element={<RequireAuth><Calibration /></RequireAuth>} />
+              <Route path="/calibration/profile" element={<RequireAuth><CalibrationProfile /></RequireAuth>} />
+              <Route path="/live" element={<RequireAuth><RequireCalibration><LiveSession /></RequireCalibration></RequireAuth>} />
+              <Route path="/upload" element={<RequireAuth><RequireCalibration><Upload /></RequireCalibration></RequireAuth>} />
+              <Route path="/analyzer" element={<RequireAuth><RequireCalibration><Analyzer /></RequireCalibration></RequireAuth>} />
               <Route path="/library" element={<RequireAuth><History /></RequireAuth>} />
               <Route path="/result/:id" element={<RequireAuth><Result /></RequireAuth>} />
 

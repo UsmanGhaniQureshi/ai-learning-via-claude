@@ -111,6 +111,7 @@ export default function SessionReport({
     quiet_recording: quietRecording,
     naturally_narrow_pitch: naturallyNarrowPitch,
     multiple_speakers_suspected: multipleSpeakers,
+    calibration_adjusted: calibrationAdjusted,
   } = report
 
   // Title-vs-transcript mismatch banner. The llm_coach module flags
@@ -470,6 +471,41 @@ export default function SessionReport({
         emotion={emotionSummary}
       />
 
+      {/* Phase 6 — How this session compares to the user's
+          personal calibration baseline. Renders only when a
+          completed CalibrationProfile exists; otherwise
+          calibration_adjusted is null. */}
+      {calibrationAdjusted?.is_complete && calibrationAdjusted.per_signal && (
+        <div className="glass-card p-5 space-y-4">
+          <div className="flex items-baseline justify-between flex-wrap gap-2">
+            <h3 className="m-0">How this compares to your natural style</h3>
+            <span className="text-xs text-text-muted">
+              Profile v{calibrationAdjusted.calibration_version}
+              {calibrationAdjusted.sessions_since_calibration > 0
+                ? ` · ${calibrationAdjusted.sessions_since_calibration} sessions since setup`
+                : ''}
+              {calibrationAdjusted.camera_anxiety_detected && ' · camera-effect calibrated'}
+            </span>
+          </div>
+
+          <div className="space-y-2">
+            {Object.entries(calibrationAdjusted.per_signal).map(([sig, info]) => (
+              <CalibrationSignalRow key={sig} signal={sig} info={info} />
+            ))}
+          </div>
+
+          {Array.isArray(calibrationAdjusted.provisional_signals)
+            && calibrationAdjusted.provisional_signals.length > 0 && (
+            <p className="text-xs text-text-muted">
+              <strong className="text-text-secondary">Note:</strong>{' '}
+              {calibrationAdjusted.provisional_signals.length} signal(s) are
+              still provisional and partly blended with universal
+              thresholds — they will tighten as you complete more sessions.
+            </p>
+          )}
+        </div>
+      )}
+
       {/* Score timeline */}
       {graphHistory.length > 2 && (
         <div className="glass-card p-5">
@@ -659,4 +695,59 @@ function formatDuration(seconds) {
   const m = Math.floor(seconds / 60)
   const s = Math.floor(seconds % 60)
   return `${m}:${String(s).padStart(2, '0')}`
+}
+
+// Phase 6 — single-row renderer for the calibration comparison panel.
+// `info` shape:
+//   { personal_baseline, session_value, delta, direction,
+//     within_tolerance_band, tolerance_band }
+function CalibrationSignalRow({ signal, info }) {
+  if (!info) return null
+  const within = info.within_tolerance_band
+  // Colour coding per spec:
+  //   within tolerance → amber (normal range)
+  //   above + signal where higher is better → green
+  //   below + signal where higher is better → red
+  // For "lower is better" signals (filler_rate, jitter, shimmer)
+  // the polarity flips.
+  const lowerIsBetter = (signal === 'filler_rate'
+    || signal === 'jitter_pct'
+    || signal === 'shimmer_pct')
+  let toneClass = 'text-warning'
+  if (within === false) {
+    const above = info.delta > 0
+    const better = lowerIsBetter ? !above : above
+    toneClass = better ? 'text-success' : 'text-danger'
+  } else if (within === true) {
+    toneClass = 'text-warning'
+  }
+  const label = humaniseSignal(signal)
+  return (
+    <div className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-3 text-sm">
+      <span className="text-text-secondary">{label}</span>
+      <span className="text-text-muted text-xs tabular-nums">
+        baseline {info.personal_baseline}
+      </span>
+      <span className="text-text-primary tabular-nums">
+        session {info.session_value}
+      </span>
+      <span className={`font-semibold tabular-nums ${toneClass}`}>
+        {info.delta > 0 ? '+' : ''}{info.delta}
+      </span>
+    </div>
+  )
+}
+
+function humaniseSignal(sig) {
+  return ({
+    wpm: 'Speech pace (WPM)',
+    pitch_mean: 'Pitch mean (Hz)',
+    pitch_std: 'Pitch variation (Hz)',
+    rms: 'Loudness (RMS)',
+    filler_rate: 'Filler rate (%)',
+    jitter_pct: 'Voice jitter (%)',
+    shimmer_pct: 'Voice shimmer (%)',
+    voice_steadiness: 'Voice steadiness',
+    vocal_variety: 'Vocal variety',
+  }[sig] || sig)
 }
