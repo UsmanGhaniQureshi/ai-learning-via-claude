@@ -16,6 +16,95 @@ _BASELINE_SIGNALS = (
 )
 
 
+# Calibration signals compared in build_calibration_adjusted. Order
+# preserved so the per-signal panel renders consistently across
+# pipelines.
+_CALIB_SIGNALS = (
+    "wpm", "pitch_mean", "pitch_std", "rms",
+    "filler_rate", "jitter_pct", "shimmer_pct",
+    "voice_steadiness", "vocal_variety",
+)
+
+
+def build_calibration_adjusted(user_baseline, session_raw_values):
+    """Build the `calibration_adjusted` block.
+
+    Pure function — no I/O, no closures. Used by both
+    `generate_post_session_report` (live + audio paths) and the
+    upload-video pipeline at main.py:_run_upload_pipeline_sync, so
+    every entry point produces the same shape.
+
+    Returns None when the user has not completed Personal Setup
+    (`user_baseline` lacks a `calibration` block) — the caller
+    surfaces None as `calibration_adjusted` so the frontend renders
+    no panel.
+
+    Args:
+        user_baseline: dict from main.py:_fetch_user_baseline. When
+            calibration is complete this contains a `calibration`
+            sub-dict with tolerance_bands, rolling_baseline,
+            raw_baselines, baseline_confidence, etc.
+        session_raw_values: dict mapping calibration signal names to
+            this session's measured raw value. Keys (any subset):
+            wpm, pitch_mean, pitch_std, rms, filler_rate, jitter_pct,
+            shimmer_pct, voice_steadiness, vocal_variety. Missing or
+            None values are simply skipped in the per-signal panel.
+    """
+    if not isinstance(user_baseline, dict):
+        return None
+    cal = user_baseline.get("calibration")
+    # Match the original inline truthy-check semantics: None, missing,
+    # OR an empty dict all skip the block. An empty dict shouldn't
+    # occur in practice (`_fetch_user_baseline` either sets the full
+    # block or omits the key entirely) but guard regardless.
+    if not cal or not isinstance(cal, dict):
+        return None
+
+    bands = cal.get("tolerance_bands") or {}
+    rolling = cal.get("rolling_baseline") or {}
+    raw_baselines = cal.get("raw_baselines") or {}
+
+    per_signal_view: dict = {}
+    for raw_sig in _CALIB_SIGNALS:
+        base_value = (
+            rolling.get(raw_sig)
+            if raw_sig in rolling else raw_baselines.get(raw_sig)
+        )
+        sess_value = session_raw_values.get(raw_sig)
+        if base_value is None or sess_value is None:
+            continue
+        band = bands.get(raw_sig) or {}
+        delta = float(sess_value) - float(base_value)
+        within_band = None
+        if band:
+            within_band = bool(
+                band.get("lower", float("-inf")) <= sess_value <= band.get("upper", float("inf"))
+            )
+        direction = "above" if delta > 0 else "below" if delta < 0 else "equal"
+        per_signal_view[raw_sig] = {
+            "personal_baseline": round(float(base_value), 2),
+            "session_value": round(float(sess_value), 2),
+            "delta": round(delta, 2),
+            "direction": direction,
+            "within_tolerance_band": within_band,
+            "tolerance_band": band or None,
+        }
+
+    sessions_since = max(0, int(cal.get("session_count") or 0))
+    return {
+        "is_complete": True,
+        "calibration_version": cal.get("calibration_version"),
+        "sessions_since_calibration": sessions_since,
+        "baseline_confidence": cal.get("baseline_confidence"),
+        "camera_anxiety_detected": bool(cal.get("camera_anxiety_detected")),
+        "camera_anxiety_delta": cal.get("camera_anxiety_delta"),
+        "blend_ratio": cal.get("blend_ratio"),
+        "reliable_signals": cal.get("reliable_signals") or [],
+        "provisional_signals": cal.get("provisional_signals") or [],
+        "per_signal": per_signal_view,
+    }
+
+
 # Canonical grade table — single source of truth for backend AND frontend.
 # Each tuple is (min_score_inclusive, letter, label). Iterated in descending
 # threshold order. The frontend at frontend/src/pages/Result.jsx mirrors
@@ -315,9 +404,9 @@ def generate_post_session_report(
     # ── Session pitch-std median + naturally-narrow-pitch disclosure ──
     # Structural Fix 1: a speaker with a naturally narrow pitch range
     # gets penalised by the absolute pitch_std-based vocal_variety
-    # scorer and the "monotone" emotion label. We don't re-score
-    # per-chunk (would require plumbing per-user baselines through
-    # all four pipelines); instead we surface:
+    # scorer and the "flat" emotion label. We don't re-score per-chunk
+    # (would require plumbing per-user baselines through all four
+    # pipelines); instead we surface:
     #   * `session_pitch_std_median` — this session's median chunk
     #     pitch_std in Hz, available as an input to the user
     #     baseline computed by main.py:_fetch_user_baseline.
@@ -325,7 +414,7 @@ def generate_post_session_report(
     #     historical pitch_std median below 8 Hz across their last
     #     ≥3 sessions (Praat's "narrow pitch" tier). The frontend
     #     renders an explainer so the user understands their
-    #     monotone / vocal_variety reading is calibrated information,
+    #     flat / vocal_variety reading is calibrated information,
     #     not a value judgement.
     chunk_pitch_stds = [
         float(r.get("pitch", {}).get("std_hz") or 0.0)
@@ -544,16 +633,23 @@ def generate_post_session_report(
         )
 
     # Dominant-emotion insight. Skipped when the mix is None (silent
-    # session) or the dominant label is benign (calm/confident at low
-    # confidence wouldn't be useful for the user to see).
+    # session) or the dominant label is benign (confident / engaged /
+    # authoritative at low confidence wouldn't be useful for the
+    # user to see).
     em_mix = (emotion_summary or {}).get("mix")
     em_dom = (emotion_summary or {}).get("dominant")
     em_pct = (emotion_summary or {}).get("dominant_pct")
     if em_mix and em_dom and em_pct is not None and em_pct >= 40:
-        if em_dom in ("nervous", "hesitant", "monotone"):
+        if em_dom in ("nervous", "hesitant"):
             insights.append(
                 f"Tone read as {em_dom} for ~{em_pct}% of the session. "
                 "Mix in confident phrasing and steady pacing to balance it."
+            )
+        elif em_dom == "flat":
+            insights.append(
+                f"Delivery was uninflected for ~{em_pct}% of the session. "
+                "Vary your pitch on key words — even a small lift makes the "
+                "audience lean in."
             )
         elif em_dom == "excited":
             insights.append(
@@ -561,11 +657,11 @@ def generate_post_session_report(
                 "audience can keep up — drop into measured pacing for the "
                 "key points."
             )
-        elif em_dom == "bored":
+        elif em_dom == "disconnected":
             insights.append(
-                f"Energy was flat for ~{em_pct}% of the session. Add "
-                "audience cues — questions, contrasts, varied pace — to "
-                "keep them with you."
+                f"Energy was low and pace slow for ~{em_pct}% of the session. "
+                "Add audience cues — questions, contrasts, varied pace — to "
+                "re-engage."
             )
         elif em_dom == "sad":
             insights.append(
@@ -578,12 +674,12 @@ def generate_post_session_report(
                 "softening delivery on contentious points unless the "
                 "heat is intentional."
             )
-        # `engaged` and `confident` are positive labels — no insight,
-        # the headline + signal bars already say "good job".
+        # `engaged`, `confident`, `authoritative` are positive labels —
+        # no insight, the headline + signal bars already say "good job".
 
     if signal_avgs["vocal_variety"] is not None and signal_avgs["vocal_variety"] < 50:
         insights.append(
-            "Delivery was monotone. Vary your pitch to stay engaging."
+            "Delivery was flat / uninflected. Vary your pitch to stay engaging."
         )
 
     # Find worst confidence dip with timestamp. Skip if any per-chunk
@@ -718,91 +814,33 @@ def generate_post_session_report(
     # calibration profile exists. Only built when the caller's
     # `user_baseline` carries a `calibration` block (set by
     # main.py:_fetch_user_baseline when a complete profile exists).
-    calibration_adjusted = None
-    if isinstance(user_baseline, dict) and user_baseline.get("calibration"):
-        cal = user_baseline["calibration"]
-        bands = cal.get("tolerance_bands") or {}
-        rolling = cal.get("rolling_baseline") or {}
-        raw_baselines = cal.get("raw_baselines") or {}
+    # The build_calibration_adjusted helper at the top of this file
+    # is also called directly from the upload-video pipeline (which
+    # bypasses generate_post_session_report) so the calibration
+    # block reaches every report consistently.
+    _pitch_mean_session = None
+    _pitch_means = [
+        (r.get("pitch") or {}).get("mean_hz") or 0
+        for r in all_raw
+    ]
+    _pitch_means_nonzero = [p for p in _pitch_means if p > 0]
+    if _pitch_means_nonzero:
+        _pitch_mean_session = sum(_pitch_means_nonzero) / len(_pitch_means_nonzero)
 
-        # Map session-side signal name → calibration-side raw signal
-        # name + value. Some calibration baselines are RAW measurements
-        # (WPM, filler_rate %) while session_averages holds the 0-100
-        # SCORE; we report both.
-        per_signal_view: dict = {}
-        for raw_sig in (
-            "wpm", "pitch_mean", "pitch_std", "rms",
-            "filler_rate", "jitter_pct", "shimmer_pct",
-            "voice_steadiness", "vocal_variety",
-        ):
-            base_value = (
-                rolling.get(raw_sig)
-                if raw_sig in rolling else raw_baselines.get(raw_sig)
-            )
-            band = bands.get(raw_sig) or {}
-            # Try to find the session value for this raw signal.
-            # WPM, filler_rate, jitter, shimmer come straight from
-            # `pace`/`trembling_summary`/aggregated raw stats; the
-            # 0-100 scores live in signal_avgs.
-            sess_value = None
-            if raw_sig == "wpm":
-                sess_value = pace.get("avg_wpm")
-            elif raw_sig == "filler_rate":
-                sess_value = filler_rate_pct
-            elif raw_sig == "pitch_mean":
-                sess_value = (
-                    sum(p for p in (
-                        r.get("pitch", {}).get("mean_hz") or 0
-                        for r in all_raw
-                    ) if p > 0)
-                    / max(1, sum(1 for r in all_raw if (r.get("pitch") or {}).get("mean_hz")))
-                    if any((r.get("pitch") or {}).get("mean_hz") for r in all_raw) else None
-                )
-            elif raw_sig == "pitch_std":
-                sess_value = session_pitch_std_median
-            elif raw_sig == "rms":
-                sess_value = median_chunk_rms
-            elif raw_sig == "jitter_pct":
-                sess_value = trembling_summary.get("avg_jitter_pct")
-            elif raw_sig == "shimmer_pct":
-                sess_value = trembling_summary.get("avg_shimmer_pct")
-            elif raw_sig == "voice_steadiness":
-                sess_value = signal_avgs.get("voice_steadiness")
-            elif raw_sig == "vocal_variety":
-                sess_value = signal_avgs.get("vocal_variety")
-
-            if base_value is None or sess_value is None:
-                continue
-
-            delta = float(sess_value) - float(base_value)
-            within_band = None
-            if band:
-                within_band = bool(
-                    band.get("lower", float("-inf")) <= sess_value <= band.get("upper", float("inf"))
-                )
-            direction = "above" if delta > 0 else "below" if delta < 0 else "equal"
-            per_signal_view[raw_sig] = {
-                "personal_baseline": round(float(base_value), 2),
-                "session_value": round(float(sess_value), 2),
-                "delta": round(delta, 2),
-                "direction": direction,
-                "within_tolerance_band": within_band,
-                "tolerance_band": band or None,
-            }
-
-        sessions_since = max(0, int(cal.get("session_count") or 0))
-        calibration_adjusted = {
-            "is_complete": True,
-            "calibration_version": cal.get("calibration_version"),
-            "sessions_since_calibration": sessions_since,
-            "baseline_confidence": cal.get("baseline_confidence"),
-            "camera_anxiety_detected": bool(cal.get("camera_anxiety_detected")),
-            "camera_anxiety_delta": cal.get("camera_anxiety_delta"),
-            "blend_ratio": cal.get("blend_ratio"),
-            "reliable_signals": cal.get("reliable_signals") or [],
-            "provisional_signals": cal.get("provisional_signals") or [],
-            "per_signal": per_signal_view,
-        }
+    calibration_adjusted = build_calibration_adjusted(
+        user_baseline,
+        {
+            "wpm": pace.get("avg_wpm"),
+            "pitch_mean": _pitch_mean_session,
+            "pitch_std": session_pitch_std_median,
+            "rms": median_chunk_rms,
+            "filler_rate": filler_rate_pct,
+            "jitter_pct": trembling_summary.get("avg_jitter_pct"),
+            "shimmer_pct": trembling_summary.get("avg_shimmer_pct"),
+            "voice_steadiness": signal_avgs.get("voice_steadiness"),
+            "vocal_variety": signal_avgs.get("vocal_variety"),
+        },
+    )
 
     # Fix 11: session-level Whisper transcript-confidence — mean of
     # per-word probabilities (above the 0.05 accent-fairness cutoff)

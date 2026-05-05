@@ -2385,6 +2385,30 @@ def _run_upload_pipeline_sync(
         # to the 30-120s video processing that follows.
         face_engine = FaceEngine()
 
+        # Phase 6 plumbing fix: feed the user's per-emotion face
+        # profile into FaceEngine so the cosine-similarity matcher
+        # can label expressions against the user's own baseline.
+        # No-op if the user has not completed Personal Setup —
+        # set_calibration_profile accepts None / empty dict.
+        try:
+            with SessionLocal() as _calib_db:
+                _calib_profile = _calib_db.get(
+                    CalibrationProfile, _calib_id(user_id),
+                )
+                if (
+                    _calib_profile is not None
+                    and _calib_profile.is_complete
+                    and _calib_profile.emotion_faces
+                ):
+                    face_engine.set_calibration_profile(
+                        _calib_profile.emotion_faces,
+                    )
+        except Exception as e:
+            log.warning(
+                "upload.face_calibration_load_failed",
+                extra={"upload_id": upload_id, "error": str(e)},
+            )
+
         # The frame loop is the single biggest blocking cost in the
         # upload pipeline — MediaPipe + cv2 writes for a 60-s clip run
         # 30-120 s of pure CPU. Run it inside a worker thread via
@@ -3371,6 +3395,40 @@ def _run_upload_pipeline_sync(
         response_payload['wins'] = list(_wins)
         response_payload['improvements'] = list(_imps)
 
+        # ── Calibration-adjusted block (Phase 6 plumbing fix) ────────
+        # The upload pipeline bypasses generate_post_session_report
+        # (see comment further below), so without this block users
+        # who completed Personal Setup would never see their
+        # personal baseline reflected in upload-video reports. We
+        # call the same build_calibration_adjusted helper used by
+        # generate_post_session_report so the shape is identical
+        # across all four pipelines.
+        from report_generator import build_calibration_adjusted
+        _upload_pitch_means_nonzero = [
+            float(((s.get("raw") or {}).get("pitch") or {}).get("mean_hz") or 0)
+            for s in snapshots
+            if float(((s.get("raw") or {}).get("pitch") or {}).get("mean_hz") or 0) > 0
+        ]
+        _upload_pitch_mean_session = (
+            sum(_upload_pitch_means_nonzero) / len(_upload_pitch_means_nonzero)
+            if _upload_pitch_means_nonzero else None
+        )
+        _calib_block = build_calibration_adjusted(
+            _upload_user_baseline,
+            {
+                "wpm": ss.get("average_wpm"),
+                "pitch_mean": _upload_pitch_mean_session,
+                "pitch_std": _upload_pitch_std_median,
+                "rms": _upload_median_rms,
+                "filler_rate": fillers_per_min,
+                "jitter_pct": voice_trembling_summary.get("avg_jitter_pct"),
+                "shimmer_pct": voice_trembling_summary.get("avg_shimmer_pct"),
+                "voice_steadiness": final_scores.get("voiceSteadiness"),
+                "vocal_variety": final_scores.get("vocalVariety"),
+            },
+        )
+        response_payload["calibration_adjusted"] = _calib_block
+
         # ── LLM coaching for video uploads ───────────────────────────
         # The upload pipeline doesn't go through generate_post_session_report
         # (it uses ScoringEngine directly), so we call llm_coach here with
@@ -3783,6 +3841,31 @@ async def session_ws(ws: WebSocket, session_id: str):
     # cheap enough to leave for symmetry.
     from face_engine import FaceEngine as _FaceEngine
     live_face_engine = _FaceEngine(load_mp_models=False)
+
+    # Phase 6 plumbing fix: feed the user's per-emotion face profile
+    # into the live FaceEngine so the cosine-similarity matcher can
+    # label expressions against the user's own baseline. No-op if
+    # the user has not completed Personal Setup. Same pattern as
+    # the upload-video pipeline (see _run_upload_pipeline_sync).
+    try:
+        with SessionLocal() as _calib_db:
+            _live_calib_profile = _calib_db.get(
+                CalibrationProfile, _calib_id(ws_user_id),
+            )
+            if (
+                _live_calib_profile is not None
+                and _live_calib_profile.is_complete
+                and _live_calib_profile.emotion_faces
+            ):
+                live_face_engine.set_calibration_profile(
+                    _live_calib_profile.emotion_faces,
+                )
+    except Exception as e:
+        log.warning(
+            "live.face_calibration_load_failed",
+            extra={"session_id": session_id, "error": str(e)},
+        )
+
     # One-shot calibration-state announcements to the client so the
     # UI can render a "Calibrating…" badge during the first ~13 s
     # (90 frames at 6.7 Hz) and clear it when calibration finishes.

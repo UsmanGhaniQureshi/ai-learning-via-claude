@@ -385,7 +385,7 @@ export default function SessionReport({
               </div>
               <p className="text-xs text-text-muted mt-1">
                 Your natural pitch range is narrower than typical. The
-                Vocal Variety score and any "monotone" emotion reading
+                Vocal Variety score and any "flat" emotion reading
                 reflect that personal pattern rather than today's
                 delivery. Detected from your prior sessions.
               </p>

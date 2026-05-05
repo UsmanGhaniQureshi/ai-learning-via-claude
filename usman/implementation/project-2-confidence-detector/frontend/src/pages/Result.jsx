@@ -633,8 +633,22 @@ function UploadedMediaResult({
             </section>
           )}
 
-          <details className="details-section">
-            <summary>Detailed Breakdown</summary>
+          {/* Detailed Breakdown — collapsed by default. The chevron
+              and hint text are critical: previous version rendered as
+              a plain heading and users didn't know it was expandable.
+              The pattern matches the Transcript drawer below so users
+              learn it once. */}
+          <details className="details-section group">
+            <summary className="flex items-center justify-between gap-3 select-none">
+              <span className="flex items-center gap-2">
+                <span className="transition-transform group-open:rotate-180 text-text-accent">▾</span>
+                <span>Detailed Breakdown</span>
+              </span>
+              <span className="text-xs font-normal text-text-muted">
+                <span className="group-open:hidden">Click to expand · signals, technicals, frame review</span>
+                <span className="hidden group-open:inline">Click to collapse</span>
+              </span>
+            </summary>
             <div className="mt-5 space-y-6">
               {signalBarScores && (
                 <div>
@@ -906,19 +920,22 @@ const UploadedMediaPlayer = forwardRef(function UploadedMediaPlayer(
   return (
     <div className="space-y-4">
       {mode === 'video' ? (
-        // Wrap the <video> in a relative container so the ResultHUD
-        // overlay can `absolute`-position over it without disturbing
-        // the native controls underneath. The HUD itself is
-        // `pointer-events-none` so clicks fall through to the
-        // <video controls>.
-        <div className="relative">
+        // Fixed 16:9 box so the player always renders at a consistent
+        // size regardless of the source video's intrinsic aspect ratio.
+        // Portrait phone recordings letterbox inside the same frame as
+        // landscape webcam clips — no jumping layout. `object-contain`
+        // preserves the source aspect without cropping. The wrapper is
+        // `relative` so the ResultHUD overlay can `absolute`-position
+        // on top of the video; the HUD is `pointer-events-none` so
+        // clicks fall through to the native <video controls>.
+        <div className="relative aspect-video bg-black rounded-md overflow-hidden max-w-3xl mx-auto w-full">
           <video
             ref={mediaRef}
             src={src}
             controls
             playsInline
             preload="metadata"
-            className="w-full rounded-md bg-black"
+            className="absolute inset-0 w-full h-full object-contain"
           />
           <ResultHUD
             liveHudTimeline={liveHudTimeline}

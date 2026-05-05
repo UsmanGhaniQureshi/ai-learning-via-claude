@@ -13,25 +13,31 @@ Both dicts are imported by:
   - the frontend (mirrored copy in calibration UI components — kept
     in sync by reading from `/api/calibration/start`)
 
-Note: the set was reduced from 10 emotions and 3 voice prompts to
-5 emotions and 1 voice prompt to keep total setup time under
-~4 minutes. Coverage is still good — the kept emotions span the
-presentation-relevant range (calm/confident/excited on the positive
-side, nervous/engaged for the cognitive-load side). Voice signals
-are well-characterised from a single 60-second sample.
+Note: the set was reduced to 5 face-elicitable emotions and 1
+voice prompt to keep total setup time under ~4 minutes. The 5
+emotions cover the presentation-relevant face range
+(authoritative/confident/excited on the positive side,
+nervous/engaged for the cognitive-load side).
+
+The full detector LABELS tuple in `emotion_detector.py` includes
+prosody-only labels (disconnected, flat, hesitant, sad, angry) that
+have no recall-able facial signature, so they intentionally do NOT
+appear here. The cosine-similarity matcher only needs face profiles
+for the 5 labels users actively perform.
 """
 from __future__ import annotations
 
 
 # Per-emotion prompts shown to the user during the face capture phase.
-# The keys must match `emotion_detector.LABELS` so the downstream
-# cosine-similarity matcher in `calibration_engine.py` can use the
-# same label space.
+# The keys must match labels in `emotion_detector.LABELS` so the
+# downstream cosine-similarity matcher in `calibration_engine.py`
+# can use the same label space.
 EMOTION_PROMPTS: dict[str, str] = {
-    "calm": (
-        "Close your eyes for a moment. Think about a place where you "
-        "feel completely at ease — somewhere quiet, familiar, safe. "
-        "Open your eyes and hold that feeling."
+    "authoritative": (
+        "Imagine you are standing in front of a room and you are the "
+        "person everyone is here to listen to. You know the material "
+        "cold. Take that posture, that grounded expression, and let "
+        "it show."
     ),
     "confident": (
         "Remember a specific moment when you felt completely in "

@@ -75,10 +75,10 @@ export const SIGNAL_DEFS = {
     key: 'vocal_variety',
     label: 'Vocal Variety',
     short:
-      'Pitch range across the session. Higher = more expressive; very low = monotone.',
+      'Pitch range across the session. Higher = more expressive; very low = flat.',
     detail:
-      'Measured as the standard deviation of your pitch (in Hz) across each chunk, then averaged over the session. Below 5 Hz means you\'re basically reading at one note (monotone, hard to listen to). 15-50 Hz is normal expressive speech. Above 50 Hz is animated / theatrical delivery.',
-    good: 'Pitch SD 15-50 Hz = animated and engaging. Below 5 Hz = monotone, audience switches off.',
+      'Measured as the standard deviation of your pitch (in Hz) across each chunk, then averaged over the session. Below 5 Hz means you\'re basically reading at one note (flat / uninflected, hard to listen to). 15-50 Hz is normal expressive speech. Above 50 Hz is animated / theatrical delivery.',
+    good: 'Pitch SD 15-50 Hz = animated and engaging. Below 5 Hz = flat delivery, audience switches off.',
     limits:
       'Tonal-language speakers (Mandarin, Vietnamese, Cantonese, etc.) speaking English often have higher pitch variation as a residual habit, which makes their vocal_variety scores look great even when they don\'t feel particularly expressive — fair to them, but not directly comparable across language backgrounds.',
     anchor: 'vocal-variety',
@@ -176,7 +176,11 @@ export const FAQ = [
   },
   {
     q: 'My emotion mix says 55% nervous + 20% confident + 15% hesitant. Which one am I?',
-    a: 'All three, weighted. The mix is a probability distribution that always sums to 100% — there is no single "winning" label. Read it as "the dominant tone was nervous, but you also showed real confident moments and some hesitancy". Use it diagnostically: a teacher should land near engaged + calm; an apology should read sad-not-angry; a sales pitch can use some excited.',
+    a: 'All three, weighted. The mix is a probability distribution that always sums to 100% — there is no single "winning" label. Read it as "the dominant tone was nervous, but you also showed real confident moments and some hesitancy". Use it diagnostically: a teacher should land near engaged + authoritative; a stand-up briefing reads strong on authoritative; an apology should read sad-not-angry; a sales pitch can use some excited.',
+  },
+  {
+    q: 'What\'s the difference between authoritative, confident, flat, and disconnected?',
+    a: 'They sit on a spectrum of "control + presence". AUTHORITATIVE = audible energy + steady moderate pitch range (15-25 Hz SD) + WPM 120-150 + lots of declarative tokens ("we will", "the answer is"). It\'s the "stand-and-declare" tone. CONFIDENT is broader — steady delivery with moderate variety, but doesn\'t require the audible energy or the declarative lexicon. FLAT = monotone delivery (pitch SD < 10 Hz) at any speed and any volume — present but uninflected. DISCONNECTED = flat pitch PLUS low energy PLUS slow rate; the speaker has checked out. Disconnected is gated on BOTH low pitch range AND low loudness, so a flat-but-loud delivery reads as flat, not disconnected.',
   },
   {
     q: 'How is the emotion mix different from the face Expression signal?',

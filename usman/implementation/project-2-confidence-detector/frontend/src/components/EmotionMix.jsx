@@ -14,34 +14,42 @@ import { memo } from 'react'
  * fixed across the app so the same emotion always reads the same
  * colour.
  */
+// 10-label colour palette — every label has a distinct Tailwind
+// hue so adjacent segments on the stacked bar are visually
+// distinguishable. Keep these in sync with TEXT_BY_LABEL below.
+//
+// Reds:    angry (red-600) vs nervous (rose-500) — angry is deeper.
+// Greens:  confident (emerald-500) vs engaged (teal-500) — emerald
+//          is warm-cool, teal is cooler.
+// Blues:   sad (indigo-500) vs flat (sky-500) — indigo is darker.
+// Neutrals: disconnected (zinc-500) — desaturated, "absent".
+// Warm-neutral: authoritative (violet-600) — "commanding presence".
+// Yellow/orange: excited (amber-500). Pink: hesitant (fuchsia-500).
 const COLOR_BY_LABEL = {
-  nervous: 'bg-rose-500',
   confident: 'bg-emerald-500',
-  excited: 'bg-amber-500',
-  calm: 'bg-sky-500',
-  hesitant: 'bg-fuchsia-500',
-  monotone: 'bg-slate-500',
-  // New labels — Tailwind-only palette so no theme colours change.
-  // angry uses red-600 (deeper than nervous's rose-500) to keep the
-  // two visually distinguishable on the stacked bar.
+  nervous: 'bg-rose-500',
   engaged: 'bg-teal-500',
-  bored: 'bg-zinc-500',
-  angry: 'bg-red-600',
+  disconnected: 'bg-zinc-500',
+  authoritative: 'bg-violet-600',
+  hesitant: 'bg-fuchsia-500',
+  excited: 'bg-amber-500',
+  flat: 'bg-sky-500',
   sad: 'bg-indigo-500',
+  angry: 'bg-red-600',
   other: 'bg-slate-400',
 }
 
 const TEXT_BY_LABEL = {
-  nervous: 'text-rose-500',
   confident: 'text-emerald-500',
-  excited: 'text-amber-500',
-  calm: 'text-sky-500',
-  hesitant: 'text-fuchsia-500',
-  monotone: 'text-slate-500',
+  nervous: 'text-rose-500',
   engaged: 'text-teal-500',
-  bored: 'text-zinc-500',
-  angry: 'text-red-600',
+  disconnected: 'text-zinc-500',
+  authoritative: 'text-violet-600',
+  hesitant: 'text-fuchsia-500',
+  excited: 'text-amber-500',
+  flat: 'text-sky-500',
   sad: 'text-indigo-500',
+  angry: 'text-red-600',
   other: 'text-slate-400',
 }
 

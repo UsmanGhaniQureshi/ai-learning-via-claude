@@ -113,7 +113,7 @@ export default function HowItWorks() {
           Alongside the score, the report shows an <strong>emotion mix</strong> — a probability distribution over 10 labels that always sums to 100%. It answers &quot;how did the speaker actually sound?&quot; rather than &quot;how high did they score?&quot;.
         </p>
         <p>
-          The detector combines <strong>lexical signals</strong> (filler density, hedge phrases, assertive phrases, repetition rate, excited / calm / angry / sad token density, audience-direct verbs) with <strong>prosodic signals</strong> (pitch mean and SD, speech rate, RMS, RMS variation, pitch tremor, jitter %, shimmer %). Each of the 10 labels accumulates a raw score, then a softmax (temperature 2.0) converts those into the visible mix. Runner-ups are kept visible — a typical chunk reads as something like &quot;55% nervous, 20% hesitant, 12% confident, …&quot; rather than collapsing to one label.
+          The detector combines <strong>lexical signals</strong> (filler density, hedge phrases, assertive phrases, declarative structures, generic-filler tokens, repetition rate, excited / angry / sad / engaged token density) with <strong>prosodic signals</strong> (pitch mean and SD, speech rate, RMS, RMS variation, pitch tremor, jitter %, shimmer %). Each of the 10 labels accumulates a raw score, then a softmax (temperature 2.0) converts those into the visible mix. Runner-ups are kept visible — a typical chunk reads as something like &quot;55% nervous, 20% hesitant, 12% confident, …&quot; rather than collapsing to one label.
         </p>
         <p>The 10 labels:</p>
         <table className="w-full text-sm my-3">
@@ -125,16 +125,16 @@ export default function HowItWorks() {
           </thead>
           <tbody>
             {[
-              ['nervous', 'Fillers, hedges, raised pitch, tremor / jitter / shimmer.'],
               ['confident', 'Assertive phrases, low fillers, WPM near 145, steady pitch, varied delivery.'],
-              ['excited', 'Excited tokens, fast WPM, high pitch SD, loud variable energy.'],
-              ['calm', 'Calm-marker tokens, low pitch arousal, slow rate, no tremor (with some pitch life).'],
-              ['hesitant', 'Many fillers + hedges + slow WPM + repetition.'],
-              ['monotone', 'Very low pitch SD and / or very flat RMS variation.'],
+              ['nervous', 'Fillers, hedges, raised pitch, tremor / jitter / shimmer.'],
               ['engaged', 'Audience-direct verbs (imagine / picture / look), good variety, centred WPM, audible energy variation.'],
-              ['bored', 'Low pitch SD AND (low RMS or slow WPM) AND flat energy. Compound — pitch flatness alone is monotone, not bored.'],
-              ['angry', 'Sharp negatives (wrong / never / ridiculous), loud RMS, raised pitch, fast WPM. Penalised when energy is low.'],
+              ['disconnected', 'BOTH low pitch SD AND low RMS AND slow / zero WPM. Gated — flat pitch with normal energy is "flat", not disconnected.'],
+              ['authoritative', 'Declarative structures ("we will", "the answer is"), assertive tokens, audible RMS, pitch SD 15-25 Hz, WPM 120-150, low fillers / jitter / shimmer.'],
+              ['hesitant', 'Many fillers + hedges + slow WPM + repetition.'],
+              ['excited', 'Excited tokens, fast WPM, high pitch SD, loud variable energy.'],
+              ['flat', 'Pitch SD < 10 Hz. Energy and rate can be anywhere — "uninflected" delivery, not necessarily quiet or slow.'],
               ['sad', 'Subdued tokens (unfortunately / sorry / wish), low pitch mean, slow WPM, quiet energy.'],
+              ['angry', 'Sharp negatives (wrong / never / ridiculous), loud RMS, raised pitch, fast WPM. Penalised when energy is low.'],
             ].map(([label, evidence]) => (
               <tr key={label} className="border-b border-border/40">
                 <td className="py-2 px-2 font-semibold text-text-primary">{label}</td>
@@ -144,7 +144,7 @@ export default function HowItWorks() {
           </tbody>
         </table>
         <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">What good looks like</h4>
-        <p>This isn&apos;t a pass/fail signal — it&apos;s diagnostic. A teacher delivering a lesson should land near &quot;engaged&quot; and &quot;calm&quot;; a sales pitch might want some &quot;excited&quot; in the mix; an apology should read sad-not-angry. Use it to confirm your delivery matched your intent.</p>
+        <p>This isn&apos;t a pass/fail signal — it&apos;s diagnostic. A teacher delivering a lesson should land near &quot;engaged&quot; and &quot;authoritative&quot;; a sales pitch might want some &quot;excited&quot; in the mix; an apology should read sad-not-angry. Use it to confirm your delivery matched your intent.</p>
         <h4 className="text-text-primary text-base font-semibold mt-3 mb-1">Known limitations</h4>
         <p className="opacity-85">The token lists are English-only and intentionally small to avoid false positives. The prosodic mappings (pitch arousal, WPM ramp) are coarse and not per-speaker calibrated. Treat percentages as relative weights, not ground-truth probabilities.</p>
       </Section>

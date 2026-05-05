@@ -256,7 +256,7 @@ class SignalScorer:
         which made small differences inside the plateau invisible.
 
         Returns None on a silent chunk (voiced_s < 0.5) so a silent
-        speaker isn't labelled "monotone".
+        speaker isn't labelled "flat".
         """
         if voiced_s is not None and voiced_s < 0.5:
             return None
