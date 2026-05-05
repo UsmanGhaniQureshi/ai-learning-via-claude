@@ -27,4 +27,8 @@ RUN mkdir -p /app/uploads
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# --workers 4 matches a 4-core VPS (one worker per core). Each worker
+# loads its own Whisper + MediaPipe model (~250 MB RSS each) so size
+# this against your box's RAM as well as core count. Tune via the
+# UVICORN_WORKERS env if you want to override at runtime.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-4}"]

@@ -1,0 +1,46 @@
+# Production secrets — NEVER commit. Use .env.production.example as
+# the template and keep the filled-in .env on the deploy host only.
+.env
+.env.local
+.env.production
+
+# But DO commit the example template so operators know what to fill in.
+!.env.production.example
+!.env.example
+
+# Python build artefacts
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Persisted user data — must not leak into the repo via local dev
+backend/uploads/
+backend/recordings/
+backend/_snapshots/
+data/uploads/
+
+# Frontend build output and node_modules
+frontend/dist/
+frontend/node_modules/
+frontend/.vite/
+
+# Vite + npm caches
+node_modules/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local model cache (downloaded by scripts/download_models.sh into /app/models)
+backend/models/
+*.task
+*.pt
+*.onnx

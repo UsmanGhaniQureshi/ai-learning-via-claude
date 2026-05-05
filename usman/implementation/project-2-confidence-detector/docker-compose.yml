@@ -8,9 +8,35 @@ services:
     ports:
       - "${PORT:-8000}:8000"
     volumes:
+      # Whisper / MediaPipe model cache — re-used across container
+      # restarts so we don't re-download the ~166 MB Whisper weights
+      # every deploy.
       - model-cache:/app/models
-      - ./backend/uploads:/app/uploads
+      # User uploads + processed videos. Bound to a NAMED volume in
+      # production (uploads-data) so they survive `docker-compose up
+      # --force-recreate`. The previous bind-mount to ./backend/uploads
+      # made dev easy but was wiped on container rebuild — fine for
+      # dev, fragile for prod.
+      - uploads-data:/data/uploads
+    environment:
+      # UPLOAD_DIR is hardcoded here because it's tied to the volume
+      # mount path above — overriding it via .env would store user
+      # uploads on the ephemeral container filesystem, defeating the
+      # named volume.
+      UPLOAD_DIR: /data/uploads
     env_file:
+      # All other config (ENV, JWT_SECRET, MEDIA_URL_SECRET, DB_*,
+      # UVICORN_WORKERS, MAX_LIVE_SESSIONS, MAX_CONCURRENT_*,
+      # WHISPER_MODEL, GEMINI_API_KEY, etc.) comes from .env.
+      #
+      # ENV must be set to `production` here for prod deploys —
+      # without it, the JWT secret enforcement at auth.py:45-56 falls
+      # back to a documented dev secret, and signed-URL enforcement
+      # falls back too. See .env.production.example for the full
+      # template.
+      #
+      # NEVER commit the filled-in .env file. It's in .gitignore and
+      # .dockerignore by default.
       - .env
     restart: unless-stopped
     healthcheck:
@@ -29,5 +55,14 @@ services:
       - backend
     restart: unless-stopped
 
+  # NOTE: TLS termination is NOT included here. Browsers require HTTPS
+  # to grant microphone / camera permission, so a production deploy
+  # MUST sit behind nginx, Caddy, Cloudflare Tunnel, or similar.
+  # Easiest path: run Caddy on the host with a single auto-HTTPS line
+  # in Caddyfile pointing at this compose file's exposed ports.
+
 volumes:
   model-cache:
+  # Named volume for user uploads. `docker volume inspect uploads-data`
+  # shows the host path; back it up like any other persistent data.
+  uploads-data:

@@ -32,24 +32,31 @@ DATABASE_URL = _build_database_url()
 
 # echo=False keeps SQL out of stdout by default. Flip to True for debugging.
 #
-# Pool tuning:
+# Pool tuning (env-configurable so a small dev box can stay tight and
+# a production box can size up without code changes):
 #   pool_pre_ping=True   — validate each checkout so a restarted Postgres
 #                          produces a reconnect, not a 500 on next query.
-#   pool_size=20         — default 5 was tight: upload + WS + face POSTs +
-#                          /api/report all want connections concurrently,
-#                          so 5 ran hot fast.
-#   max_overflow=20      — short bursts (e.g. WS disconnect storm) get
-#                          temporary slots above pool_size without failing.
+#   DB_POOL_SIZE=50      — comfortable for ~100 concurrent users mixing
+#                          live WS + uploads + library browsing. The
+#                          previous 10 saturated under modest load.
+#   DB_POOL_MAX_OVERFLOW=100 — short bursts (e.g. WS disconnect storm,
+#                          login spike) get temporary slots above
+#                          pool_size without raising "no more connections".
+#                          Tune your Postgres `max_connections` to be
+#                          larger than (workers × (pool_size + overflow)).
 #   pool_recycle=1800    — recycle connections every 30 min so long-lived
 #                          idle sockets don't get dropped by the network
 #                          or by Postgres's own idle-transaction timeout.
+_DB_POOL_SIZE = int(os.environ.get("DB_POOL_SIZE", "50"))
+_DB_POOL_MAX_OVERFLOW = int(os.environ.get("DB_POOL_MAX_OVERFLOW", "100"))
+
 engine = create_engine(
     DATABASE_URL,
     echo=False,
     future=True,
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=10,
+    pool_size=_DB_POOL_SIZE,
+    max_overflow=_DB_POOL_MAX_OVERFLOW,
     pool_recycle=1800,
 )
 

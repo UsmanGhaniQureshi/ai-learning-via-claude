@@ -1558,10 +1558,45 @@ def _rate_limit_key(request: Request) -> str:
 
 limiter = Limiter(
     key_func=_rate_limit_key,
-    default_limits=["120/minute"],
+    # Default rate limit applies to anything not explicitly capped by
+    # @limiter.limit(...) on the route. Per-endpoint decorators
+    # already gate the hot routes (auth, upload, calibration, live);
+    # this is a backstop for everything else (status pings,
+    # debug endpoints, etc.). Tune via RATE_LIMIT_DEFAULT env.
+    default_limits=[os.environ.get("RATE_LIMIT_DEFAULT", "120/minute")],
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# ── Global exception handler (production safety net) ────────────────
+# Without this, an unhandled exception inside a route would surface
+# the raw Uvicorn traceback to the client (verbose, leaks file paths,
+# unhelpful for the frontend). The handler:
+#   - logs the full traceback at ERROR with the request method + path
+#     so structured-log aggregators can alert on the spike;
+#   - returns a sanitised JSON 500 the frontend can parse uniformly.
+# FastAPI/Starlette HTTPException and slowapi's RateLimitExceeded keep
+# their dedicated handlers — those are CONTROLLED errors, not bugs.
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    log.error(
+        "unhandled_exception",
+        extra={
+            "method": request.method,
+            "path": str(request.url.path),
+            "exc_type": type(exc).__name__,
+            "exc": str(exc),
+        },
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_server_error",
+            "message": "Something went wrong. The team has been notified.",
+        },
+    )
 
 
 # NOTE: FaceEngine is instantiated per-request inside upload_video — the
@@ -1604,7 +1639,7 @@ def _get_upload_semaphore() -> asyncio.Semaphore:
 
 _active_sessions = 0
 _active_sessions_lock = asyncio.Lock()
-MAX_LIVE_SESSIONS = int(os.environ.get("MAX_LIVE_SESSIONS", "6"))
+MAX_LIVE_SESSIONS = int(os.environ.get("MAX_LIVE_SESSIONS", "30"))
 
 
 # ── Per-media progress tracking (Fix 7) ─────────────────────────────
