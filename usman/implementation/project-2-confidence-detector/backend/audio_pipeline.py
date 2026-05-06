@@ -518,7 +518,22 @@ def compute_voice_trembling(audio, sr=16000, vad_segments=None,
         if len(peaks) < 4:
             continue
         mean_A = float(np.mean(peaks))
+        # Reject windows that are too quiet to measure shimmer reliably.
+        # On near-silent audio the cycle-peak-to-peak ratio is dominated
+        # by noise, not real voice shimmer — and the user-visible
+        # artefact is shimmer values 5-10× the physiological maximum,
+        # which then inflates `instability` and the `nervous` emotion
+        # label. A clean recording from a quiet speaker (peak ~0.04+)
+        # passes this gate; only sub-noise-floor windows get skipped.
+        # The cap on `shimmer_local` is a second-line defence: real
+        # human voice shimmer rarely exceeds ~10%, so anything above
+        # 15 is noise artifact and shouldn't drive the score upward.
+        MIN_PEAK_AMP = 0.01
+        SHIMMER_PHYS_MAX = 15.0
+        if mean_A < MIN_PEAK_AMP:
+            continue
         shimmer_local = float(np.mean(np.abs(np.diff(peaks)))) / mean_A * 100.0
+        shimmer_local = min(shimmer_local, SHIMMER_PHYS_MAX)
 
         jitters.append(jitter_local)
         shimmers.append(shimmer_local)

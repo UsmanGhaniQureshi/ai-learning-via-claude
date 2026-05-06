@@ -370,14 +370,22 @@ def detect_emotion_mix(
 
     # --- Prosodic contribution ---
     if has_prosody:
-        # Tremor / jitter / shimmer all push nervous.
-        nervous += tremor * 4.0
-        nervous += min(jitter, 4.0) * 0.5
-        nervous += min(shimmer, 12.0) * 0.18
-        nervous += instability * 2.0
+        # Tremor / jitter / shimmer / instability push nervous, but ONLY
+        # above a normal-voice baseline. Without `max(0, x - baseline)`,
+        # every clean voice picks up 1-3 raw nervous points from the
+        # always-on components of these measurements (Praat-normal
+        # jitter ~0.5%, shimmer ~2%, instability ~0.1, _pitch_arousal
+        # ~0.5 at 200 Hz) — which then dominates softmax against
+        # confident's positive-evidence-only contributions.
+        nervous += max(0.0, tremor - 0.15) * 4.0
+        nervous += max(0.0, min(jitter, 4.0) - 0.5) * 0.5      # Praat normal floor
+        nervous += max(0.0, min(shimmer, 12.0) - 2.0) * 0.18   # Praat normal floor
+        nervous += max(0.0, instability - 0.20) * 2.0
 
-        # Raised pitch under stress → nervous.
-        nervous += pitch_arousal_v * 1.3
+        # Raised pitch under stress → nervous, but only above the
+        # 200 Hz midpoint where _pitch_arousal() returns 0.5 for a
+        # neutral adult voice.
+        nervous += max(0.0, pitch_arousal_v - 0.5) * 1.3
 
         # Fast WPM with high arousal → excited.
         excited += wpm_arousal_v * 2.0
@@ -391,7 +399,13 @@ def detect_emotion_mix(
         wpm_centeredness = max(0.0, 1.0 - abs(wpm - 145.0) / 70.0)
         confident += steadiness * 1.6
         confident += wpm_centeredness * 1.5
-        if 12.0 <= pitch_std <= 60.0 and tremor < 0.25:
+        # Band intentionally loosened from 12 to 10 Hz at the bottom:
+        # a "natural variety" voice sits at 15-50, but the 10-12 Hz
+        # borderline band shouldn't be penalised — a borderline-monotone
+        # speaker with otherwise solid steadiness/WPM/low-tremor still
+        # reads as confident, not nervous. True monotone (<10) loses
+        # the bonus, which is the right call.
+        if 10.0 <= pitch_std <= 60.0 and tremor < 0.25:
             confident += 1.0
 
         # Slow WPM + many fillers → hesitant prosody too.
