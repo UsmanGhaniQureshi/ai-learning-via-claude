@@ -7,6 +7,7 @@ main.py at process start). Assembles a DSN in the psycopg3 dialect that
 SQLAlchemy understands.
 """
 import os
+from urllib.parse import quote_plus
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -17,15 +18,27 @@ def _build_database_url() -> str:
     Done here rather than in .env so the file stays readable (separate
     fields instead of one noisy URL) and so the password can be changed
     without touching the URL format.
+
+    `user` and `password` are URL-encoded via `quote_plus` so passwords
+    containing URL-reserved characters (@, :, /, ?, #, &, =, space)
+    don't break the DSN parser. Without this, a password like
+    `abc@123f.com` produced
+    `postgresql+psycopg://cd_app:abc@123f.com@postgres:5432/...`
+    and psycopg split at the first `@`, treating `123f.com@postgres`
+    as the host and failing DNS resolution. The postgres container
+    receives the unencoded password via the POSTGRES_PASSWORD env
+    var, so authentication still works on the wire.
     """
     host = os.environ.get("DB_HOST", "localhost")
     port = os.environ.get("DB_PORT", "5432")
     name = os.environ.get("DB_NAME", "confidence_detector_app")
     user = os.environ.get("DB_USER", "postgres")
     password = os.environ.get("DB_PASSWORD", "postgres")
+    user_q = quote_plus(user)
+    password_q = quote_plus(password)
     # postgresql+psycopg tells SQLAlchemy to use the psycopg3 driver we
     # installed, not the default psycopg2 (which is NOT in requirements).
-    return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{name}"
+    return f"postgresql+psycopg://{user_q}:{password_q}@{host}:{port}/{name}"
 
 
 DATABASE_URL = _build_database_url()
