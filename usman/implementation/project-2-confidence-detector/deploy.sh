@@ -82,16 +82,16 @@ if grep -qE '^(JWT_SECRET|MEDIA_URL_SECRET|DB_PASSWORD)=__' .env; then
   exit 1
 fi
 
-# Read .env values used downstream. Keep this minimal — we don't
-# want to source the whole file (which could mask shell semantics).
-DB_USER=$(grep -E '^DB_USER=' .env | head -1 | cut -d= -f2 || true)
-DB_USER="${DB_USER:-cd_app}"
-DB_NAME=$(grep -E '^DB_NAME=' .env | head -1 | cut -d= -f2 || true)
-DB_NAME="${DB_NAME:-confidence_detector_app}"
+# Postgres credentials are NOT parsed here in bash. Compose reads
+# `.env` with its own parser (which correctly strips inline `#`
+# comments when whitespace precedes the `#`) and exports them to
+# the postgres container as `$POSTGRES_USER` / `$POSTGRES_DB`.
+# Every `psql` / `pg_isready` call below runs INSIDE that container
+# so it picks up those vars directly — no host-side bash parsing
+# of `.env` to get wrong.
 
 note "compose file present"
 note ".env present, no placeholders"
-note "DB_USER=$DB_USER  DB_NAME=$DB_NAME"
 
 # ── Build images ────────────────────────────────────────────────────
 BUILD_FLAGS=""
@@ -126,7 +126,7 @@ docker compose up -d --remove-orphans   # ensure postgres + caddy are also up
 # ── Wait for postgres to accept connections ─────────────────────────
 green "==> Waiting for postgres to be ready"
 for i in $(seq 1 30); do
-  if docker compose exec -T postgres pg_isready -U "$DB_USER" >/dev/null 2>&1; then
+  if docker compose exec -T postgres bash -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1; then
     note "postgres ready"
     break
   fi
@@ -196,9 +196,13 @@ fi
 # fooled us). Re-run it. This is cheap and idempotent — alembic skips
 # already-applied migrations.
 green "==> Verifying DB schema"
+# Run psql INSIDE the postgres container so it picks up
+# `$POSTGRES_USER` / `$POSTGRES_DB` from the env Compose set on it.
+# Avoids host-side bash parsing of `.env` (which mishandled inline
+# `#` comments and produced a false "column missing" alarm).
+PROBE_PROCESSING_PROGRESS='psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT 1 FROM information_schema.columns WHERE table_name='\''media'\'' AND column_name='\''processing_progress'\''"'
 HAS_PROCESSING_PROGRESS=$(
-  docker compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -tAc \
-    "SELECT 1 FROM information_schema.columns WHERE table_name='media' AND column_name='processing_progress'" \
+  docker compose exec -T postgres bash -c "$PROBE_PROCESSING_PROGRESS" \
     2>/dev/null | tr -d '[:space:]' || echo ""
 )
 if [ "$HAS_PROCESSING_PROGRESS" != "1" ]; then
@@ -207,8 +211,7 @@ if [ "$HAS_PROCESSING_PROGRESS" != "1" ]; then
   docker compose exec -T backend alembic upgrade head
   # Re-probe — if it's still missing, fail loudly.
   HAS_PROCESSING_PROGRESS=$(
-    docker compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -tAc \
-      "SELECT 1 FROM information_schema.columns WHERE table_name='media' AND column_name='processing_progress'" \
+    docker compose exec -T postgres bash -c "$PROBE_PROCESSING_PROGRESS" \
       2>/dev/null | tr -d '[:space:]' || echo ""
   )
   if [ "$HAS_PROCESSING_PROGRESS" != "1" ]; then
