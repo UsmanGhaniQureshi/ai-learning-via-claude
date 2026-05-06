@@ -2,16 +2,26 @@ FROM python:3.11-slim
 
 # System dependencies for OpenCV, MediaPipe, and FFmpeg.
 #
-# `libgl1` is the actual OpenGL runtime library OpenCV needs.
-# Previously this Dockerfile listed `libgl1-mesa-glx`, which was only
-# ever a transitional metapackage that pointed at libgl1. Debian 13
-# (trixie) — what `python:3.11-slim` ships on as of 2025 — dropped
-# the transitional package entirely, breaking the build with
-# "Package 'libgl1-mesa-glx' has no installation candidate".
-# `libgl1` works on Debian 11 / 12 / 13 alike, so it's strictly
-# better.
+# OpenGL stack required by MediaPipe's GPU-capable backends:
+#   libgl1     — desktop OpenGL (libGL.so.1) for OpenCV image ops
+#   libgles2   — OpenGL ES 2.0 (libGLESv2.so.2) for MediaPipe's
+#                face_landmarker / pose_landmarker; without this,
+#                the pipeline raises
+#                "OSError: libGLESv2.so.2: cannot open shared object
+#                 file" at FaceEngine init and the upload pipeline
+#                hangs silently
+#   libegl1    — EGL (libEGL.so.1), required to bind the GLES
+#                context. Sister-library to libgles2; missing it
+#                produces a similar OSError on first frame.
+#
+# Note on history: this file previously listed `libgl1-mesa-glx`,
+# which was a Debian 11/12 transitional metapackage. Debian 13
+# (trixie — what `python:3.11-slim` now ships on) dropped that
+# alias entirely, so we use the canonical package names instead.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
+    libgles2 \
+    libegl1 \
     libglib2.0-0 \
     ffmpeg \
     wget \
