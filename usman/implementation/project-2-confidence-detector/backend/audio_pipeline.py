@@ -41,7 +41,16 @@ _vad_call_lock = threading.Lock()
 
 
 def get_vad():
-    """Load Silero VAD model (once). Thread-safe."""
+    """Load Silero VAD model (once). Thread-safe.
+
+    Uses the `silero-vad` PyPI package (pinned in requirements.txt),
+    which bundles the model weights — no `torch.hub.load(...)` trip
+    to GitHub at runtime. The hub path was fragile in production:
+    a partial download leaves `~/.cache/torch/hub/snakers4_silero-vad_master/`
+    on disk but missing `hubconf.py`, after which every subsequent
+    load fails with FileNotFoundError until the cache dir is wiped.
+    The PyPI loader has no filesystem cache and no network call.
+    """
     global _vad_model
     # Fast path: already loaded
     if _vad_model is not None:
@@ -49,12 +58,8 @@ def get_vad():
     with _vad_lock:
         # Re-check inside lock (double-checked locking)
         if _vad_model is None:
-            import torch
-            _vad_model, _ = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                trust_repo=True,
-            )
+            from silero_vad import load_silero_vad
+            _vad_model = load_silero_vad()
     return _vad_model
 
 
