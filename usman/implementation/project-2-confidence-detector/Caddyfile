@@ -1,15 +1,15 @@
 # ─────────────────────────────────────────────────────────────────────
 # Caddy reverse-proxy + auto-HTTPS for the confidence-detector app.
 #
-# Usage:
-#   1. Replace `example.com` below with your real domain (or a
-#      subdomain like `practice.yourdomain.com`).
-#   2. Point a DNS A record for that domain at this VPS's IPv4 address
-#      (and AAAA for IPv6 if you have one).
-#   3. `docker-compose up -d` will start Caddy, which automatically
-#      requests + renews Let's Encrypt certificates for the domain
-#      you set here. First start can take 30-60 seconds while LE
-#      validates and issues the cert.
+# Pinned to confidence-detector.logicsbay.com on the deployment
+# branch. To redeploy somewhere else, change the bare-domain line
+# below (around line 35) and add a matching A record at the
+# registrar.
+#
+# `docker compose up -d` starts Caddy, which automatically requests
+# + renews Let's Encrypt certificates for the domain set below.
+# First start can take 30-60 seconds while LE validates and issues
+# the cert.
 #
 # Architecture (two-hop reverse proxy):
 #
@@ -29,9 +29,10 @@
 # frontend container.
 # ─────────────────────────────────────────────────────────────────────
 
-# Replace this with your real domain. Multiple domains are allowed,
-# space-separated: `example.com www.example.com`.
-example.com {
+# Production domain for the confidence-detector deployment. Set
+# the matching A record at the registrar for this exact subdomain
+# pointing at the Contabo VPS IPv4 (and AAAA for IPv6 if available).
+confidence-detector.logicsbay.com {
     # Forward ALL traffic (HTML, static assets, /api, /ws, /health)
     # to the frontend container. Caddy auto-detects WebSocket
     # upgrades and tunnels them through the same proxy without
@@ -64,9 +65,6 @@ example.com {
     }
 }
 
-# Optional: if you also want www.example.com to redirect to the
-# canonical domain, uncomment:
-#
-#     www.example.com {
-#         redir https://example.com{uri} permanent
-#     }
+# No www redirect — the deployment uses a subdomain
+# (`confidence-detector.logicsbay.com`), so there's no
+# `www.confidence-detector.logicsbay.com` variant to redirect from.
