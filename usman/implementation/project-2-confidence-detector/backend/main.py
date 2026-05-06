@@ -1066,8 +1066,74 @@ def _ffmpeg_input_has_audio(filepath: str) -> bool:
     return b"Audio:" in (proc.stderr or b"")
 
 
+def _probe_duration_seconds(filepath: str) -> float | None:
+    """Probe the source's container duration via ffprobe.
+
+    Returns None on any probe failure — callers fall back to running
+    without duration-aware clamping, which is the previous behaviour.
+    Cheap (~50ms); safe to call before any trim operation.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        out = (proc.stdout or b"").decode("utf-8", errors="ignore").strip()
+        d = float(out) if out else 0.0
+        return d if d > 0 else None
+    except ValueError:
+        return None
+
+
+def _clamp_segments_to_duration(
+    segments: list[tuple[float, float]],
+    duration_s: float | None,
+    *,
+    min_segment_s: float = 0.5,
+) -> list[tuple[float, float]]:
+    """Clamp each (start, end) to [0, duration_s] and drop empty/tiny
+    segments.
+
+    Without this defence, a segment whose end exceeds the source's
+    actual duration silently emits zero video frames from
+    `[0:v]trim=...`; the concat filter then produces a near-zero-
+    duration output and ffmpeg's encoder reports the iconic
+    `kb/s:79848000.00 | Qavg: nan | Conversion failed!` summary
+    instead of the real cause. The validator at `_parse_trim_segments`
+    can't catch this on its own — it has no filepath access.
+
+    If `duration_s` is None (probe failed), the segments pass through
+    unchanged so behaviour matches the legacy code path. Empty input
+    list returns empty.
+    """
+    if duration_s is None or duration_s <= 0:
+        return list(segments)
+    out: list[tuple[float, float]] = []
+    for s, e in segments:
+        # Drop segments that start at or past the end of media.
+        if s >= duration_s:
+            continue
+        # Clamp the end to the source duration.
+        ee = min(e, duration_s)
+        # Drop windows that collapsed to less than min_segment_s.
+        if ee - s < min_segment_s:
+            continue
+        out.append((s, ee))
+    return out
+
+
 def _apply_trim_segments(
-    filepath: str, safe_ext: str, segments: list[tuple[float, float]],
+    filepath: str, segments: list[tuple[float, float]],
 ) -> None:
     """Concatenate the given segments of `filepath` in place.
 
@@ -1084,6 +1150,19 @@ def _apply_trim_segments(
     Raises RuntimeError on ffmpeg failure; the caller maps that to a
     'failed' processing_status with the error text.
     """
+    # Defence: clamp segments against the actual source duration so a
+    # window that runs past the end of the clip doesn't silently
+    # produce a zero-frame output (which surfaces as
+    # `kb/s:79848000.00 | Qavg: nan | Conversion failed!`).
+    duration_s = _probe_duration_seconds(filepath)
+    segments = _clamp_segments_to_duration(segments, duration_s)
+    if not segments:
+        raise RuntimeError(
+            "No valid trim window within the clip's duration "
+            f"({duration_s:.1f}s)." if duration_s
+            else "Trim segments are invalid for this clip."
+        )
+
     has_audio = _ffmpeg_input_has_audio(filepath)
     n = len(segments)
     parts: list[str] = []
@@ -1099,11 +1178,29 @@ def _apply_trim_segments(
         parts.append(f"{labels}concat=n={n}:v=1:a=0[outv]")
     filter_str = ";".join(parts)
 
-    tmp_path = filepath + ".trim.tmp" + safe_ext
+    # The trim output is ALWAYS written into an MP4 muxer regardless
+    # of the source container. WebM only accepts VP8/VP9/AV1 + Vorbis/
+    # Opus — writing libx264 + aac into a `.webm` tmp file fails with
+    # "Only VP8 or VP9 or AV1 video and Vorbis or Opus audio ... are
+    # supported for WebM ... Could not write header (incorrect codec
+    # parameters?)".
+    #
+    # We keep the on-disk filename's original extension (so the DB's
+    # stored_path stays valid) but the bytes inside become MP4. The
+    # downstream pipeline reads the file via ffmpeg, which sniffs
+    # content rather than trusting the extension, so no callsite
+    # changes are needed. The rare case where the extension matters
+    # downstream is browser-Content-Type — that path serves the
+    # `processed_<id>.mp4` overlay file, not this raw original.
+    tmp_path = filepath + ".trim.tmp.mp4"
     cmd = [
         FFMPEG, "-y", "-i", filepath,
         "-filter_complex", filter_str,
         "-map", "[outv]",
+        # Force the MP4 muxer explicitly so the .mp4 tmp extension is
+        # interpreted unambiguously, even if ffmpeg's auto-detection
+        # ever changes.
+        "-f", "mp4",
     ]
     if has_audio:
         cmd += ["-map", "[outa]", "-c:a", "aac"]
@@ -1122,7 +1219,11 @@ def _apply_trim_segments(
             and os.path.getsize(tmp_path) > 0
         )
         if not ok:
-            tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
+            # Tail enough lines that the actual error survives — the
+            # last 3 lines are usually ffmpeg's harmless `kb/s:` /
+            # `Qavg:` / `Conversion failed!` summary, which hides the
+            # root cause printed above.
+            tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-20:]
             raise RuntimeError("ffmpeg trim/concat failed: " + " | ".join(tail))
         os.replace(tmp_path, filepath)
     finally:
@@ -1146,6 +1247,17 @@ def _apply_trim_segments_audio(
     Returns the new on-disk path (extension may differ from input).
     The caller updates `saved_name` / `playback_path` accordingly.
     """
+    # Same defence as the video path: clamp against probed duration so
+    # an over-shot trim window doesn't produce a zero-frame output.
+    duration_s = _probe_duration_seconds(filepath)
+    segments = _clamp_segments_to_duration(segments, duration_s)
+    if not segments:
+        raise RuntimeError(
+            "No valid trim window within the clip's duration "
+            f"({duration_s:.1f}s)." if duration_s
+            else "Trim segments are invalid for this clip."
+        )
+
     n = len(segments)
     parts = []
     for i, (s, e) in enumerate(segments):
@@ -1174,7 +1286,7 @@ def _apply_trim_segments_audio(
             and os.path.getsize(tmp_path) > 0
         )
         if not ok:
-            tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-3:]
+            tail = (proc.stderr or b"").decode("utf-8", errors="ignore").splitlines()[-20:]
             raise RuntimeError("ffmpeg trim/concat failed: " + " | ".join(tail))
         # Original input file may share the new path (same .m4a ext) or
         # differ; either way os.replace handles it. If the extension
@@ -1291,8 +1403,25 @@ SILENT_INPUT_THRESHOLD_DB = float(os.environ.get('SILENT_INPUT_THRESHOLD_DB', '-
 # chunks (≈30 s at 3-second cadence) with cumulative voiced_s below
 # `_EARLY_BAIL_VOICED_S`, abort the rest of the upload to avoid
 # running Whisper / cv2 / MediaPipe over silent or near-silent audio.
-_EARLY_BAIL_AFTER_CHUNKS = 10
-_EARLY_BAIL_VOICED_S = 1.5
+#
+# History: voiced threshold was tightened to 1.5 s (5 % voiced ratio
+# in 30 s) on the assumption that any real speaker hits 5 % easily.
+# That bar was too strict for two real cases:
+#   - speakers who pause 10-15 s at the start to read the prompt,
+#     take a breath, then begin
+#   - quiet mics where Silero VAD hovers just below its own 0.5
+#     activation threshold even after `dynaudnorm` lifts the signal
+# Loosened to 0.5 s (~1.7 % voiced ratio in 30 s) so the bail only
+# fires on TRULY silent / non-speech input. The upfront
+# `_probe_mean_volume_db` check still catches mic-muted / no-audio-
+# track files in <1 s — this VAD bail is the second line of defence
+# for "audio is present but no speech" (background music, ambient
+# noise) and only needs to catch the obvious cases.
+#
+# Both knobs are env-configurable so operators can re-tighten on
+# noisy deployments without a code change.
+_EARLY_BAIL_AFTER_CHUNKS = int(os.environ.get('EARLY_BAIL_AFTER_CHUNKS', '10'))
+_EARLY_BAIL_VOICED_S = float(os.environ.get('EARLY_BAIL_VOICED_S', '0.5'))
 
 
 # ── Structural Fix 3: WS reconnect via on-disk snapshot persistence ──
@@ -2093,7 +2222,7 @@ def _run_upload_pipeline_sync(
         # produce the wrong report.
         if trim_segments:
             try:
-                _apply_trim_segments(filepath, safe_ext, trim_segments)
+                _apply_trim_segments(filepath, trim_segments)
             except FileNotFoundError:
                 raise RuntimeError("ffmpeg binary not found on the server.")
             except subprocess.TimeoutExpired:

@@ -19,6 +19,55 @@ const SORT_LABELS = {
   duration_asc: 'Shortest first',
 }
 
+// ── Failed-row error sanitisation ──────────────────────────────────
+//
+// `Media.processing_error` on the backend stores the raw exception /
+// ffmpeg-stderr tail for debug reasons. Rendering it verbatim leaks
+// strings like `[libx264 @ 000001e440b557c0] kb/s:103584000.00 |
+// Qavg: nan | Conversion failed!` into the Library, which is useless
+// and alarming to users. `status_message` (when present) is already
+// user-friendly because the backend writes it that way for the cases
+// where the failure is recoverable (silent input, no transcript,
+// unsupported language, etc.).
+//
+// `humanizeProcessingError` pattern-matches the raw error against
+// the known stderr shapes and returns a short, action-oriented
+// message. `isLikelyTechnicalError` flags raw-stderr-shaped strings
+// so we can offer a collapsed "Technical details" disclosure for
+// power users / support tickets without leading with the dump.
+function isLikelyTechnicalError(text) {
+  if (!text) return false
+  // Square-bracketed module tags ([libx264 @ ...], [aac @ ...]) or
+  // ffmpeg summary fragments are dead giveaways for raw stderr.
+  return /\[(?:libx264|aac|libvpx|webm|fc#|out#|x265|libopus|svc)\b/i.test(text)
+      || /\b(?:kb\/s:|Qavg:|Conversion failed|Invalid argument)\b/.test(text)
+}
+
+function humanizeProcessingError(rawError) {
+  if (!rawError) return null
+  const e = String(rawError).trim()
+
+  if (/ffmpeg trim\/concat failed/i.test(e)) {
+    return "We couldn't trim this clip. The trim window may have been outside the video, or the format wasn't supported. Re-upload to try again."
+  }
+  if (/ffmpeg .*(?:not found|binary)/i.test(e)) {
+    return 'Server tools are misconfigured. Contact support.'
+  }
+  if (/could not decode audio/i.test(e)) {
+    return "We couldn't read the audio in this file. Re-upload to try again."
+  }
+  if (/(whisper.*not.*loaded|model.*not.*ready)/i.test(e)) {
+    return 'The server was still loading models. Wait a minute and try again.'
+  }
+  // Generic ffmpeg / encoder stderr that didn't match a known prefix.
+  if (isLikelyTechnicalError(e)) {
+    return "We couldn't process this clip. The format may not be supported. Re-upload to try again."
+  }
+  // Unknown short error — pass through, but cap so a runaway
+  // exception doesn't blow up the card.
+  return e.length > 240 ? 'Processing failed. Re-upload to try again.' : e
+}
+
 function buildQuery(state, extra = {}) {
   const params = new URLSearchParams()
   if (state.q) params.set('q', state.q)
@@ -423,9 +472,19 @@ function LibraryCard({ recording, onDelete, deleting, formatDate, formatDuration
       </div>
 
       {status.note && (
-        <p className="mt-3 text-xs leading-relaxed text-text-secondary">
-          {status.note}
-        </p>
+        <div className="mt-3 text-xs leading-relaxed text-text-secondary space-y-1">
+          <p>{status.note}</p>
+          {status.rawTechnicalDetails && (
+            <details className="group">
+              <summary className="cursor-pointer text-text-muted hover:text-text-secondary select-none">
+                Technical details
+              </summary>
+              <pre className="mt-1 max-h-32 overflow-auto rounded border border-border bg-elevated/40 p-2 text-[11px] text-text-muted whitespace-pre-wrap break-words">
+                {status.rawTechnicalDetails}
+              </pre>
+            </details>
+          )}
+        </div>
       )}
 
       {recording.tags && recording.tags.length > 0 && (
@@ -498,7 +557,18 @@ function LibraryCard({ recording, onDelete, deleting, formatDate, formatDuration
 }
 
 function getRecordingStatus(recording) {
-  const note = recording.status_message || recording.processing_error || null
+  // status_message (when set by the backend) is already user-friendly
+  // — pass through. processing_error is raw stderr / exception text
+  // and gets humanised. The raw text only travels to rawTechnicalDetails
+  // when it actually looks like stderr, so single-line errors like
+  // "Pipeline error" don't trigger an empty disclosure.
+  const note = recording.status_message
+    || humanizeProcessingError(recording.processing_error)
+    || null
+  const rawTechnicalDetails = (
+    !recording.status_message
+    && isLikelyTechnicalError(recording.processing_error)
+  ) ? recording.processing_error : null
 
   if (recording.processing_status === 'pending' || recording.processing_status === 'processing') {
     return {
@@ -507,6 +577,7 @@ function getRecordingStatus(recording) {
       badgeClass: 'badge badge-warning',
       cardClass: 'is-processing',
       note: 'Analysis is still running. Open the result to follow progress.',
+      rawTechnicalDetails: null,
     }
   }
 
@@ -517,6 +588,7 @@ function getRecordingStatus(recording) {
       badgeClass: 'badge badge-warning',
       cardClass: 'is-unscoreable',
       note,
+      rawTechnicalDetails,
     }
   }
 
@@ -527,6 +599,7 @@ function getRecordingStatus(recording) {
       badgeClass: 'badge badge-danger',
       cardClass: 'is-failed',
       note,
+      rawTechnicalDetails,
     }
   }
 
