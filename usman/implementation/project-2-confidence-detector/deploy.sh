@@ -108,11 +108,20 @@ green "==> Pulling pinned images"
 docker compose pull postgres caddy 2>/dev/null || true
 
 # ── Bring up / restart the stack ────────────────────────────────────
-# `up -d` only restarts containers whose image / config changed.
+# `--force-recreate` ALWAYS recreates the backend + frontend containers
+# from the freshly-built images, even if Compose thinks the image
+# hash didn't change. Defensive: protects against the failure mode
+# where Docker's BuildKit reuses a cached layer that yields an
+# image with the same hash, so plain `up -d` thinks nothing changed
+# and the running container keeps the old code. Postgres + caddy
+# don't get force-recreated because they're pinned images and
+# recreating them costs a few seconds for no reason.
 # `--remove-orphans` cleans up any container we no longer reference
 # in compose.yml. It does NOT remove volumes.
-green "==> Bringing the stack up"
-docker compose up -d --remove-orphans
+green "==> Bringing the stack up (force-recreate backend + frontend)"
+docker compose up -d --remove-orphans \
+    --force-recreate --no-deps backend frontend
+docker compose up -d --remove-orphans   # ensure postgres + caddy are also up
 
 # ── Wait for postgres to accept connections ─────────────────────────
 green "==> Waiting for postgres to be ready"
