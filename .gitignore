@@ -49,3 +49,11 @@ detector_env/
 dist/
 # Added by code-review-graph
 .code-review-graph/
+
+# Local tooling state — never deploy. .claude/ holds chat memory and
+# settings, .cursor/ holds IDE config, .kiro/ holds AI-agent steering.
+# None are needed by the running app and they leak personal data /
+# clutter into deployment pulls.
+.claude/
+.cursor/
+.kiro/

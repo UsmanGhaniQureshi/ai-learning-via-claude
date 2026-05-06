@@ -1,0 +1,61 @@
+# Docker build-context exclusions for the backend image.
+#
+# The backend Dockerfile uses `context: .` (this directory). Anything
+# kept here ends up in the build daemon's tarball and increases build
+# time + image size. Exclude everything the backend doesn't need.
+#
+# Note: the four IDE/tooling dirs the user is concerned about
+# (.claude/, .cursor/, .kiro/, .code-review-graph/) live at the
+# REPO ROOT (one level up), so they're already outside this build
+# context. Listed below anyway for defence-in-depth.
+
+# Frontend source — built separately by frontend/Dockerfile.
+frontend/
+
+# Test / dev artefacts — not used at runtime.
+tests/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Local user-data dirs (named volumes mount over these in production,
+# but the build context shouldn't bake in dev contents).
+backend/uploads/
+backend/recordings/
+backend/_snapshots/
+data/
+
+# Documentation — not needed inside the running container.
+*.md
+DEPLOYMENT.md
+CHANGES.md
+SCORING_ACCURACY_AUDIT.md
+
+# Environment / secrets — must NEVER end up in an image.
+.env
+.env.local
+.env.production
+.env.production.example
+
+# Git metadata (huge — .git can be hundreds of MB).
+.git/
+.gitignore
+.dockerignore
+.gitattributes
+
+# IDE / editor state (defence-in-depth — outside context anyway).
+.vscode/
+.idea/
+.claude/
+.cursor/
+.kiro/
+
+# Build outputs from running locally outside Docker.
+node_modules/
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
