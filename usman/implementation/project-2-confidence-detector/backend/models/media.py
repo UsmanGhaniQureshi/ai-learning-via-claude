@@ -60,6 +60,17 @@ class Media(Base):
     )
     processing_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Per-media pipeline progress (0..100). NULL while the row is
+    # waiting to be processed, 0 once total_frames is known, then
+    # stepped up to 100 as the frame loop advances. Read by the
+    # SSE endpoint /api/media/{id}/progress-stream so all uvicorn
+    # workers see the same value (the previous in-memory dict
+    # was per-process and only ~25% of polling requests landed
+    # on the worker that was actually doing the work).
+    processing_progress: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+
     # User-supplied metadata for Library organisation. All nullable so
     # existing rows stay valid; new rows can pre-fill `topic` from the
     # practice-setup choice (Phase 2) but `title` and `tags` are always

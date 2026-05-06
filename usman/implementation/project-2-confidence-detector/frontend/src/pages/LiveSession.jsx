@@ -13,6 +13,7 @@ import RecordingReview from '../components/RecordingReview'
 import BackgroundPicker from '../components/BackgroundPicker'
 import LiveHUD from '../components/LiveHUD'
 import EmotionMix from '../components/EmotionMix'
+import AnalyzingProgress from '../components/AnalyzingProgress'
 import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import { languageDisplayName } from '../utils/language'
@@ -66,6 +67,7 @@ export default function LiveSession() {
   // Review-screen flags driven from the parent to RecordingReview.
   const [analyzing, setAnalyzing] = useState(false)
   const [analyzeStatus, setAnalyzeStatus] = useState(null)
+  const [analyzeProgress, setAnalyzeProgress] = useState(null)
   const [analyzeError, setAnalyzeError] = useState(null)
 
   useEffect(() => {
@@ -139,9 +141,10 @@ export default function LiveSession() {
 
       setAnalyzeStatus('Analyzing video — face, speech, and confidence…')
       const final = await pollMediaStatus(data.media_id, {
-        onProgress: (s) => {
+        onProgress: (s, payload) => {
           if (s === 'pending') setAnalyzeStatus('Queued — waiting for a worker…')
           if (s === 'processing') setAnalyzeStatus('Analyzing video — face, speech, and confidence…')
+          if (payload?.progress != null) setAnalyzeProgress(payload.progress)
         },
       })
       if (final.status === 'completed') {
@@ -425,13 +428,11 @@ export default function LiveSession() {
 
       {/* ANALYZING — uploading + waiting for the upload pipeline */}
       {sessionState === 'review' && analyzing && (
-        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
-          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
-          <p className="text-text-primary">{analyzeStatus || 'Analyzing recording…'}</p>
-          <p className="text-text-muted text-sm">
-            Running face + speech analysis on the full clip — typically 30–90 seconds.
-          </p>
-        </div>
+        <AnalyzingProgress
+          statusText={analyzeStatus || 'Analyzing recording…'}
+          pct={analyzeProgress}
+          hint="Running face + speech analysis on the full clip — typically 30–90 seconds."
+        />
       )}
 
       {/* STOPPING — brief flicker while the recorder hands us the blob.

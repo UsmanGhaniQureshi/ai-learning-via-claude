@@ -8,6 +8,7 @@ import CountdownOverlay from '../components/CountdownOverlay'
 import PracticeTimer from '../components/PracticeTimer'
 import RecordingReview from '../components/RecordingReview'
 import { pollMediaStatus } from '../utils/mediaStatus'
+import AnalyzingProgress from '../components/AnalyzingProgress'
 import { languageDisplayName } from '../utils/language'
 
 /**
@@ -53,6 +54,7 @@ export default function LiveAnalyzer() {
   const [reviewUrl, setReviewUrl] = useState(null)
   const [analyzing, setAnalyzing] = useState(false)
   const [analyzeStatus, setAnalyzeStatus] = useState(null)
+  const [analyzeProgress, setAnalyzeProgress] = useState(null)
   const [analyzeError, setAnalyzeError] = useState(null)
 
   // Revoke the local blob URL on unmount or when it changes.
@@ -362,9 +364,10 @@ export default function LiveAnalyzer() {
 
       setAnalyzeStatus('Analyzing speech…')
       const final = await pollMediaStatus(data.media_id, {
-        onProgress: (s) => {
+        onProgress: (s, payload) => {
           if (s === 'pending') setAnalyzeStatus('Queued — waiting for a worker…')
           if (s === 'processing') setAnalyzeStatus('Analyzing speech…')
+          if (payload?.progress != null) setAnalyzeProgress(payload.progress)
         },
       })
       if (final.status === 'completed') {
@@ -524,13 +527,11 @@ export default function LiveAnalyzer() {
 
       {/* ANALYZING — uploading + waiting for the analyze pipeline */}
       {state === 'review' && analyzing && (
-        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
-          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
-          <p className="text-text-primary">{analyzeStatus || 'Analyzing recording…'}</p>
-          <p className="text-text-muted text-sm">
-            Running speech analysis on the full clip — typically 20–60 seconds.
-          </p>
-        </div>
+        <AnalyzingProgress
+          statusText={analyzeStatus || 'Analyzing recording…'}
+          pct={analyzeProgress}
+          hint="Running speech analysis on the full clip — typically 20–60 seconds."
+        />
       )}
     </div>
   )

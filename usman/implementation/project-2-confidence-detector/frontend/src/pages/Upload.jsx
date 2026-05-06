@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import RecordingReview from '../components/RecordingReview'
+import AnalyzingProgress from '../components/AnalyzingProgress'
 
 /**
  * Upload — drop / pick a video file → unified RecordingReview step
@@ -11,9 +12,11 @@ import RecordingReview from '../components/RecordingReview'
  * so the trim and title UX is identical across the four entry points.
  */
 /**
- * Fix 7: derive a human-readable stage label from the categorical
- * status + the frames_processed / total_frames fraction the backend
- * already publishes. Mapping (chosen to match the actual pipeline
+ * Derive a human-readable stage label from the categorical status
+ * + the `progress` percentage (0..100) the backend pushes via the
+ * /api/media/{id}/progress-stream SSE endpoint. Mapping below is
+ * chosen to match the actual pipeline phases in
+ * `_run_upload_pipeline_sync`:
  * phases in `_run_upload_pipeline_sync`):
  *
  *   pending                               → "Queued — waiting for a worker…"
@@ -31,22 +34,21 @@ import RecordingReview from '../components/RecordingReview'
 function deriveStageText(status, data) {
   if (status === 'pending') return 'Queued — waiting for a worker…'
   if (status !== 'processing') return null
-  const done = Number(data?.frames_processed ?? 0)
-  const total = Number(data?.total_frames ?? 0)
-  if (!total) {
-    return 'Extracting audio…'
-  }
-  const pct = Math.min(100, (done / total) * 100)
+  // `progress` is now computed server-side and persisted on the
+  // Media row, so all uvicorn workers see the same value. NULL
+  // means "frame loop hasn't started yet" — typically still
+  // extracting audio.
+  const pct = data?.progress
+  if (pct == null) return 'Extracting audio…'
   if (pct < 5) return 'Extracting audio…'
   if (pct < 95) return 'Transcribing speech and analysing video…'
   return 'Analysing confidence signals…'
 }
 
 function progressPct(data) {
-  const done = Number(data?.frames_processed ?? 0)
-  const total = Number(data?.total_frames ?? 0)
-  if (!total) return null
-  return Math.max(0, Math.min(100, Math.round((done / total) * 100)))
+  const pct = data?.progress
+  if (pct == null) return null
+  return Math.max(0, Math.min(100, Math.round(pct)))
 }
 
 export default function Upload() {
@@ -135,10 +137,9 @@ export default function Upload() {
       setProgress(0)
       const final = await pollMediaStatus(data.media_id, {
         onProgress: (s, payload) => {
-          // Fix 7: every poll updates the bar from the
-          // frames_processed / total_frames pair the backend
-          // surfaces (already exists — no backend change needed).
-          // Stage text is derived from the same numbers.
+          // SSE pushes a fresh state event every time the backend
+          // bumps Media.processing_progress (throttled to ~2 %
+          // steps), so the bar moves smoothly without polling.
           const stage = deriveStageText(s, payload)
           if (stage) setStatusText(stage)
           const pct = progressPct(payload)
@@ -210,26 +211,11 @@ export default function Upload() {
       )}
 
       {uploading && (
-        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
-          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
-          <p className="text-text-primary">{statusText || 'Processing video…'}</p>
-          {progress !== null && (
-            // Fix 7: backend already publishes frames_processed and
-            // total_frames on the status response — render a real
-            // progress bar so the user sees the pipeline moving
-            // instead of staring at a categorical spinner.
-            <div className="w-full">
-              <div className="h-2 w-full bg-border rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-accent transition-[width] duration-300 ease-out"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-              <p className="text-text-muted text-xs mt-1">{progress}%</p>
-            </div>
-          )}
-          <p className="text-text-muted text-sm">This may take a moment for longer videos.</p>
-        </div>
+        <AnalyzingProgress
+          statusText={statusText || 'Processing video…'}
+          pct={progress}
+          hint="This may take a moment for longer videos."
+        />
       )}
     </div>
   )

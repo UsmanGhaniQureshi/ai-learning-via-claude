@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { API_BASE, apiFetch } from '../config'
 import { pollMediaStatus } from '../utils/mediaStatus'
 import RecordingReview from '../components/RecordingReview'
+import AnalyzingProgress from '../components/AnalyzingProgress'
 import LiveAnalyzer from './LiveAnalyzer'
 
 const TABS = ['Upload Audio', 'Live Mic']
@@ -15,6 +16,7 @@ export default function Analyzer() {
   const [pickedFile, setPickedFile] = useState(null)
   const [previewUrl, setPreviewUrl] = useState(null)
   const [statusText, setStatusText] = useState(null)
+  const [progress, setProgress] = useState(null)
   const [uploading, setUploading] = useState(false)
   const navigate = useNavigate()
 
@@ -76,9 +78,10 @@ export default function Analyzer() {
       }
       setStatusText('Analyzing speech…')
       const final = await pollMediaStatus(data.media_id, {
-        onProgress: (s) => {
+        onProgress: (s, payload) => {
           if (s === 'pending') setStatusText('Queued — waiting for a worker…')
           if (s === 'processing') setStatusText('Analyzing speech…')
+          if (payload?.progress != null) setProgress(payload.progress)
         },
       })
       if (final.status === 'completed') {
@@ -188,11 +191,11 @@ export default function Analyzer() {
       )}
 
       {uploading && (
-        <div className="glass-card p-12 text-center max-w-md mx-auto space-y-3">
-          <div className="w-10 h-10 mx-auto border-2 border-accent border-t-transparent rounded-full animate-spin" />
-          <p className="text-text-primary">{statusText || 'Analyzing speech…'}</p>
-          <p className="text-text-muted text-sm">Running VAD, pitch analysis, transcription, and scoring.</p>
-        </div>
+        <AnalyzingProgress
+          statusText={statusText || 'Analyzing speech…'}
+          pct={progress}
+          hint="Running VAD, pitch analysis, transcription, and scoring."
+        />
       )}
     </div>
   )

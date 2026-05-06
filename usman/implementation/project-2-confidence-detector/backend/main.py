@@ -1772,44 +1772,105 @@ MAX_LIVE_SESSIONS = int(os.environ.get("MAX_LIVE_SESSIONS", "30"))
 
 
 # ── Per-media progress tracking (Fix 7) ─────────────────────────────
-# In-memory only. The status endpoint reads from this dict so the UI
-# can show a real % done instead of a categorical pending/processing/
-# completed spinner. Cleared when the row flips to completed/failed
-# so finished jobs don't leak entries forever. Multi-process workers
-# (gunicorn -w >1) lose visibility because each process has its own
-# dict; that's an acceptable trade for not adding a DB column.
+# Progress tracking is persisted on `Media.processing_progress`
+# (Integer 0..100, nullable). Writing to the DB lets every uvicorn
+# worker see the same value, which fixes a long-standing bug where
+# a 4-worker setup would have ~75 % of polling requests miss the
+# in-memory dict because the upload pipeline runs on a single
+# worker but polls round-robin across all four.
+#
+# Writes are throttled per-worker via `_progress_throttle` to keep
+# the cost reasonable: at most one DB update per media_id per
+# `_PROGRESS_THROTTLE_PCT` % step or per `_PROGRESS_THROTTLE_S`
+# seconds, whichever fires first. ~20 writes per analysis instead
+# of one per processed frame.
 import threading as _progress_threading
-_media_progress: dict[str, dict] = {}
-_media_progress_lock = _progress_threading.Lock()
+import time as _progress_time
+
+_PROGRESS_THROTTLE_PCT = 2          # write at most every ~2 % step
+_PROGRESS_THROTTLE_S = 1.0          # OR every 1 s, whichever sooner
+_progress_throttle: dict[str, tuple[int, float]] = {}
+_progress_throttle_lock = _progress_threading.Lock()
+# Per-pipeline cache of the total-frame count so _bump_progress can
+# compute pct without reading it from the DB on every call. Keyed
+# by media_id; cleared by _clear_progress on completion.
+_progress_total_frames: dict[str, int] = {}
 
 
 def _set_progress_total(media_id: str, total_frames: int) -> None:
-    """Record the total frame count discovered by ffprobe so the
-    status endpoint can report frames_processed / total_frames."""
-    with _media_progress_lock:
-        entry = _media_progress.setdefault(media_id, {})
-        entry["total_frames"] = int(total_frames)
-        entry.setdefault("frames_processed", 0)
+    """Record total frame count + initialise the row's progress to 0.
+
+    Called once at the start of the frame loop after ffprobe gives
+    us the total. Subsequent _bump_progress calls compute pct
+    against this cached total without re-reading the DB.
+    """
+    if total_frames <= 0:
+        return
+    with _progress_throttle_lock:
+        _progress_total_frames[media_id] = int(total_frames)
+        _progress_throttle.pop(media_id, None)
+    try:
+        with SessionLocal() as db:
+            m = db.get(Media, media_id)
+            if m is not None:
+                m.processing_progress = 0
+                db.commit()
+    except Exception:
+        # Progress tracking is best-effort; never block the pipeline.
+        pass
 
 
 def _bump_progress(media_id: str, frames_done: int) -> None:
-    """Update frames_processed for a media_id. Idempotent on missing."""
-    with _media_progress_lock:
-        entry = _media_progress.setdefault(media_id, {})
-        entry["frames_processed"] = int(frames_done)
+    """Update Media.processing_progress for `media_id`.
+
+    Writes to the DB only when the percentage has advanced by at
+    least `_PROGRESS_THROTTLE_PCT` OR more than `_PROGRESS_THROTTLE_S`
+    seconds have passed since the previous write — cheap on the hot
+    path (most calls return from the throttle check without touching
+    the DB). Cap at 99 so the status endpoint distinguishes "frame
+    loop nearly done" from "post-processing complete" — the post-
+    pipeline aggregation step flips processing_status='completed'
+    and that's what the SSE final event carries.
+    """
+    with _progress_throttle_lock:
+        total = _progress_total_frames.get(media_id)
+    if not total or total <= 0:
+        return
+    pct = min(99, max(0, int(round(100.0 * frames_done / total))))
+    now = _progress_time.monotonic()
+    with _progress_throttle_lock:
+        last = _progress_throttle.get(media_id)
+        if last is not None:
+            last_pct, last_ts = last
+            if (
+                pct - last_pct < _PROGRESS_THROTTLE_PCT
+                and now - last_ts < _PROGRESS_THROTTLE_S
+            ):
+                return
+        _progress_throttle[media_id] = (pct, now)
+    try:
+        with SessionLocal() as db:
+            m = db.get(Media, media_id)
+            if m is not None:
+                m.processing_progress = pct
+                db.commit()
+    except Exception:
+        pass
 
 
 def _clear_progress(media_id: str) -> None:
-    with _media_progress_lock:
-        _media_progress.pop(media_id, None)
+    """Drop in-memory throttle state for a finished pipeline.
 
-
-def _get_progress(media_id: str) -> tuple[int | None, int | None]:
-    with _media_progress_lock:
-        entry = _media_progress.get(media_id)
-        if not entry:
-            return None, None
-        return entry.get("frames_processed"), entry.get("total_frames")
+    The DB row's processing_progress column stays — it ends up at
+    99 (frame loop done) and clients see the SSE final event with
+    status=completed/failed for the actual finish signal. We don't
+    overwrite to 100 explicitly because the upstream caller already
+    flips processing_status, which is the authoritative completion
+    flag.
+    """
+    with _progress_throttle_lock:
+        _progress_throttle.pop(media_id, None)
+        _progress_total_frames.pop(media_id, None)
 
 
 @app.on_event("startup")
@@ -3909,12 +3970,11 @@ def get_media_status(
         m = db.get(Media, media_id)
         if m is None or not media_readable_by(user.id, m):
             return JSONResponse({"error": "Not found"}, status_code=404)
-        # Fix 7: surface in-memory progress alongside the categorical
-        # status. The frontend can compute pct = frames_processed /
-        # total_frames once both are non-null. Either field may be
-        # null — for legacy rows, completed/failed terminal states,
-        # or processes restarted mid-pipeline.
-        frames_done, total_frames = _get_progress(m.id)
+        # `progress` is now persisted directly on the row — visible
+        # to all uvicorn workers, not just the one that ran the
+        # pipeline. NULL means "the pipeline hasn't started writing
+        # progress yet" (very early in processing, or a legacy row);
+        # the frontend renders an indeterminate spinner in that case.
         return {
             "media_id": m.id,
             "status": m.processing_status,
@@ -3923,9 +3983,108 @@ def get_media_status(
             "kind": m.source_kind,
             "title": m.title,
             "has_report": m.report_json is not None,
-            "frames_processed": frames_done,
-            "total_frames": total_frames,
+            "progress": m.processing_progress,
         }
+
+
+@app.get("/api/media/{media_id}/progress-stream")
+async def media_progress_stream(
+    media_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Server-Sent Events stream of pipeline progress for `media_id`.
+
+    Replaces the old client-side polling of /api/media/{id}/status.
+    The frontend opens a single long-lived connection per analysis
+    via `fetch()` (NOT the browser EventSource API — that one can't
+    set custom headers, so it forced JWTs into the URL query
+    string). The server holds the connection open and emits one
+    `data:` SSE frame whenever the row's processing_progress /
+    processing_status / processing_error changes, then closes the
+    stream when the pipeline finishes.
+
+    Auth: standard `Authorization: Bearer <jwt>` header via the
+    same `Depends(get_current_user)` pattern every other API route
+    uses. The frontend consumes the response body as a streaming
+    fetch (`response.body.getReader()`) and parses SSE frames out
+    manually — see `streamMediaProgress` in
+    `frontend/src/utils/mediaStatus.js`.
+
+    Lifecycle:
+      - Server polls the DB every ~1 s internally (single-PK lookup,
+        microseconds — much cheaper than a full HTTP roundtrip per
+        client poll).
+      - Sends a `data:` event ONLY when state changes. A long
+        analysis with mostly steady progress sees ~20 events total.
+      - Closes the stream when `status` reaches a terminal state
+        (`completed` or `failed`).
+      - Caps at 15 minutes (900 ticks) as a safety net so a stuck
+        job doesn't pin a connection forever.
+
+    nginx + Caddy headers in this response (`X-Accel-Buffering: no`,
+    `Cache-Control: no-cache`) prevent reverse-proxy buffering of
+    the event stream — without them clients would see batched
+    events arriving every 60 s instead of in near-real-time.
+    """
+    if not _safe_media_id(media_id):
+        return JSONResponse({"error": "invalid_id"}, status_code=400)
+
+    user_id: str = user.id
+
+    async def event_gen():
+        last_state: dict | None = None
+        # 15-minute cap. Even the largest 1-hour upload finishes in
+        # under that with the Phase 5 cadence + downscale fixes.
+        # `_MAX_PROGRESS_TICKS = 900` × 1 s sleep = 900 s = 15 min.
+        for _tick in range(900):
+            with SessionLocal() as db:
+                m = db.get(Media, media_id)
+                if m is None:
+                    yield f"data: {json.dumps({'error': 'not_found'})}\n\n"
+                    return
+                # Owner-only — same access rule the /status endpoint
+                # already enforces. We don't surface "exists but
+                # forbidden" differently from "doesn't exist" to
+                # avoid leaking media-id existence to other users.
+                if m.user_id != user_id:
+                    yield f"data: {json.dumps({'error': 'forbidden'})}\n\n"
+                    return
+                state = {
+                    "media_id": m.id,
+                    "progress": m.processing_progress,
+                    "status": m.processing_status,
+                    "error": m.processing_error,
+                    "ready": m.processing_status == "completed",
+                    "kind": m.source_kind,
+                    "title": m.title,
+                    "has_report": m.report_json is not None,
+                }
+            # Push only when something changed — saves bandwidth and
+            # avoids re-rendering the UI on identical state.
+            if state != last_state:
+                yield f"data: {json.dumps(state)}\n\n"
+                last_state = state
+            if state["status"] in ("completed", "failed"):
+                return
+            await asyncio.sleep(1.0)
+        # Cap reached — emit a synthetic "still processing" final
+        # event so the client falls back to polling /status if it
+        # cares to keep watching. The pipeline itself isn't killed.
+        yield f"data: {json.dumps({'status': 'processing', 'timeout': True})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Tell nginx (frontend container) NOT to buffer this
+            # response — it must stream chunks straight to the
+            # client. Without this, events get batched and the bar
+            # arrives in big jumps every 60 s instead of smoothly.
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ============================================================
@@ -4790,6 +4949,20 @@ def _run_analyzer_pipeline_sync(
             except OSError: pass
             return
 
+    # Surface fine-grained progress on the row so the SSE endpoint
+    # /api/media/{id}/progress-stream can stream % updates to the
+    # frontend. Total = ceil(duration / 3 s chunk). Re-probed AFTER
+    # the trim (if any) so the chunk count matches the actual file
+    # the chunk loop will iterate; otherwise the bar would saturate
+    # at "row flips to completed" before reaching 100 %.
+    _post_trim_duration = (
+        _probe_media_duration(str(saved_path))
+        if trim_segments else _duration_s
+    )
+    _est_chunks = max(1, int(round((_post_trim_duration or 0) / 3.0))) if _post_trim_duration else 0
+    if _est_chunks > 0:
+        _set_progress_total(media_id, _est_chunks)
+
     try:
         # Same hardening flags as upload_video — input-side only. No
         # -max_muxing_queue_size on raw-PCM pipes (see that handler's
@@ -4857,6 +5030,10 @@ def _run_analyzer_pipeline_sync(
                         result, {}, 0.0, hud_total_history,
                     )
                     snapshots.append(result)
+                    # Surface progress to the SSE stream — throttled
+                    # internally to ~2 % steps + ~1 s minimum, so this
+                    # is essentially free on the hot path.
+                    _bump_progress(media_id, len(snapshots))
 
                     # Streaming early-bail (mirrors upload_video). After
                     # _EARLY_BAIL_AFTER_CHUNKS chunks (~30 s) of
