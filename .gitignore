@@ -1,0 +1,51 @@
+# Virtual environments
+examguard_env/
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model files (large, downloaded automatically)
+*.pt
+*.task
+*.onnx
+
+# Test/temp images
+test_photo.jpg
+test_photo_detected.jpg
+evidence/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Temp files
+*.tmp
+~$*
+
+# Node (if any)
+node_modules/
+package-lock.json
+
+# Secrets
+.env
+vosk-model/
+vosk-model-small-backup/
+uploads/
+detector_env/
+dist/
+# Added by code-review-graph
+.code-review-graph/

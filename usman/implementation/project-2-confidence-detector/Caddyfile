@@ -1,0 +1,72 @@
+# ─────────────────────────────────────────────────────────────────────
+# Caddy reverse-proxy + auto-HTTPS for the confidence-detector app.
+#
+# Usage:
+#   1. Replace `example.com` below with your real domain (or a
+#      subdomain like `practice.yourdomain.com`).
+#   2. Point a DNS A record for that domain at this VPS's IPv4 address
+#      (and AAAA for IPv6 if you have one).
+#   3. `docker-compose up -d` will start Caddy, which automatically
+#      requests + renews Let's Encrypt certificates for the domain
+#      you set here. First start can take 30-60 seconds while LE
+#      validates and issues the cert.
+#
+# Architecture (two-hop reverse proxy):
+#
+#   Browser  ─https─►  Caddy (this file, 443)
+#                       │
+#                       │ http (compose network)
+#                       ▼
+#                     frontend (nginx, port 80)
+#                       │
+#                       │ http (compose network)
+#                       ▼
+#                     backend (uvicorn, port 8000)
+#
+# The frontend container's own nginx (frontend/nginx.conf) routes
+# /api/* and /ws/* to the backend, so Caddy doesn't need to know
+# about the API layout — it just forwards everything to the
+# frontend container.
+# ─────────────────────────────────────────────────────────────────────
+
+# Replace this with your real domain. Multiple domains are allowed,
+# space-separated: `example.com www.example.com`.
+example.com {
+    # Forward ALL traffic (HTML, static assets, /api, /ws, /health)
+    # to the frontend container. Caddy auto-detects WebSocket
+    # upgrades and tunnels them through the same proxy without
+    # explicit configuration.
+    reverse_proxy frontend:80
+
+    # Larger upload limit for video files. The default is 1 MB;
+    # raise to 500 MB so users can submit longer recordings.
+    request_body {
+        max_size 500MB
+    }
+
+    # Sensible production defaults.
+    encode zstd gzip
+
+    # Security headers. Browsers won't grant mic/camera permission
+    # over HTTP at all, so HSTS is just belt-and-braces.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Permissions-Policy intentionally unset — the app NEEDS
+        # microphone + camera access on the practice routes.
+    }
+
+    # Log to Caddy's stderr (visible via `docker-compose logs caddy`).
+    log {
+        output stdout
+        format console
+    }
+}
+
+# Optional: if you also want www.example.com to redirect to the
+# canonical domain, uncomment:
+#
+#     www.example.com {
+#         redir https://example.com{uri} permanent
+#     }

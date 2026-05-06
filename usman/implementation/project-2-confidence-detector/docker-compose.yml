@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # ── Caddy: TLS terminator + reverse proxy ─────────────────────────
+  # Listens on 80/443 publicly. Auto-issues + renews Let's Encrypt
+  # certificates based on the domain in Caddyfile. Forwards everything
+  # to the frontend container; the frontend's own nginx then routes
+  # /api/* and /ws/* to the backend container.
+  #
+  # Mic / camera permission in browsers REQUIRES HTTPS, so this
+  # service is non-optional for production.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"          # HTTP/3 / QUIC
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data        # cert cache — survives restarts so LE rate limits aren't hit
+      - caddy-config:/config
+    depends_on:
+      - frontend
+      - backend
+
+  # ── Postgres: app database ────────────────────────────────────────
+  # 16 is the current LTS line. Data lives on a named volume so
+  # `docker-compose down` doesn't wipe it. Healthcheck blocks the
+  # backend from starting until pg_isready returns success.
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      # MUST match the DB_* values in .env (the backend connects via
+      # those). NOT exposed to the host network — only the backend
+      # service can reach this container.
+      POSTGRES_DB: ${DB_NAME:-confidence_detector_app}
+      POSTGRES_USER: ${DB_USER:-cd_app}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No `ports:` mapping — Postgres is internal-only. If you need to
+    # connect from your laptop for debugging, use:
+    #   docker-compose exec postgres psql -U cd_app
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # UPLOAD_DIR is hardcoded here because it's tied to the volume
+      # mount path below — overriding via .env would store user
+      # uploads on the ephemeral container filesystem.
+      UPLOAD_DIR: /data/uploads
+      # Backend connects to the postgres SERVICE name, not localhost.
+      # Override DB_HOST in .env to use an external Postgres.
+      DB_HOST: ${DB_HOST:-postgres}
+    env_file:
+      # All other config (ENV, JWT_SECRET, MEDIA_URL_SECRET,
+      # DB_USER/PASSWORD/NAME, UVICORN_WORKERS, MAX_LIVE_SESSIONS,
+      # MAX_CONCURRENT_*, WHISPER_MODEL, GEMINI_API_KEY, etc.) comes
+      # from .env. ENV must be set to `production` for prod deploys.
+      # See .env.production.example for the full template.
+      - .env
+    volumes:
+      # Whisper / MediaPipe model cache — re-used across container
+      # restarts so we don't re-download the ~166 MB Whisper weights
+      # every deploy.
+      - model-cache:/app/models
+      # User uploads + processed videos. Named volume so they survive
+      # `docker-compose up --force-recreate`.
+      - uploads-data:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # No `ports:` mapping — backend is reachable by the frontend
+    # container at http://backend:8000 over the compose network.
+    # Caddy → frontend → backend (the frontend's own nginx proxies
+    # /api and /ws). Bypass requires `docker-compose exec`.
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    # No `ports:` mapping in production — Caddy terminates TLS and
+    # proxies to the frontend container's port 80 over the compose
+    # network. (For local dev you can re-enable `5173:80` to hit it
+    # directly.)
+
+volumes:
+  caddy-data:
+  caddy-config:
+  postgres-data:
+  model-cache:
+  uploads-data:

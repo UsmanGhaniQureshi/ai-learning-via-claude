@@ -1,0 +1,217 @@
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+  /* color-scheme: dark forces native form controls (the <select>'s
+     dropdown menu, <option>s, scrollbars, date pickers, etc.) to
+     render in their dark-theme variant on Chromium / Firefox / Safari.
+     Without this, a dark <select> still spawns a white-on-white
+     dropdown when opened on Windows. */
+  :root { color-scheme: dark; }
+  body {
+    @apply bg-page text-text-primary font-body;
+    margin: 0;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  #root {
+    @apply w-full max-w-full border-0 text-left;
+    min-height: 100vh;
+  }
+  /* Belt-and-braces: explicit colours on <option> for the few
+     environments where color-scheme alone doesn't cascade (some
+     embedded WebViews, older Edge). */
+  option { background: #0a0a0f; color: #f1f0ff; }
+  h1, h2, h3 { @apply font-display tracking-tight; }
+  h1 { @apply text-4xl font-extrabold; }
+  h2 { @apply text-2xl font-bold; }
+  h3 { @apply text-lg font-semibold; }
+}
+
+@layer components {
+
+  /* Glass card */
+  .glass-card {
+    @apply bg-card border border-border rounded-lg
+           backdrop-blur-card transition-all duration-200;
+  }
+  .glass-card:hover {
+    @apply border-border-accent;
+  }
+
+  /* Buttons */
+  .btn {
+    @apply inline-flex items-center gap-2 px-5 py-2.5 rounded-md
+           text-sm font-semibold cursor-pointer border
+           border-transparent transition-all duration-200
+           whitespace-nowrap font-body;
+  }
+  .btn-primary {
+    @apply bg-accent text-white shadow-glow;
+  }
+  .btn-primary:hover {
+    @apply bg-accent-bright -translate-y-px
+           shadow-[0_0_32px_rgba(124,58,237,0.5)];
+  }
+  .btn-secondary {
+    @apply bg-card text-text-primary border-border;
+  }
+  .btn-secondary:hover {
+    @apply bg-elevated border-border-accent;
+  }
+  .btn-danger {
+    @apply bg-transparent text-danger
+           border-[rgba(239,68,68,0.3)];
+  }
+  .btn-danger:hover { @apply bg-[rgba(239,68,68,0.1)]; }
+  .btn-sm  { @apply px-3.5 py-1.5 text-xs; }
+  .btn-lg  { @apply px-7 py-3.5 text-base; }
+  .btn-full{ @apply w-full justify-center; }
+
+  /* Input */
+  .input {
+    @apply w-full bg-[rgba(255,255,255,0.06)] border border-border
+           rounded-md px-4 py-2.5 text-text-primary text-sm
+           outline-none transition-all duration-150 font-body;
+  }
+  .input:focus {
+    @apply border-border-focus
+           shadow-[0_0_0_3px_rgba(124,58,237,0.15)];
+  }
+  .input::placeholder { @apply text-text-muted; }
+
+  /* Badge / pill */
+  .badge {
+    @apply inline-flex items-center gap-1 px-2.5 py-0.5
+           rounded-full text-xs font-semibold;
+  }
+  .badge-success { @apply bg-[rgba(16,185,129,0.15)] text-success; }
+  .badge-warning { @apply bg-[rgba(245,158,11,0.15)] text-warning; }
+  .badge-danger  { @apply bg-[rgba(239,68,68,0.15)]  text-danger;  }
+  .badge-accent  { @apply bg-accent-soft text-text-accent; }
+  .badge-muted   { @apply bg-elevated text-text-muted; }
+
+  /* Toast / banner */
+  .toast {
+    @apply fixed top-16 left-1/2 -translate-x-1/2 z-50
+           flex items-center gap-3 px-5 py-3 rounded-lg
+           border backdrop-blur-card text-sm font-medium
+           shadow-card animate-fade-up;
+  }
+  .toast-warning {
+    @apply bg-[rgba(245,158,11,0.15)] border-[rgba(245,158,11,0.3)]
+           text-warning;
+  }
+  .toast-danger  {
+    @apply bg-[rgba(239,68,68,0.15)] border-[rgba(239,68,68,0.3)]
+           text-danger;
+  }
+  .toast-info    {
+    @apply bg-[rgba(6,182,212,0.15)] border-[rgba(6,182,212,0.3)]
+           text-cyan;
+  }
+
+  /* Page wrapper */
+  .page {
+    @apply max-w-6xl mx-auto px-6 pt-20 pb-12 animate-fade-up;
+  }
+
+  /* Page ambient glow */
+  .page-glow {
+    @apply relative;
+  }
+  .page-glow::before {
+    content: '';
+    @apply fixed top-[-20%] left-[30%] w-[600px] h-[600px]
+           rounded-full pointer-events-none -z-10;
+    background: radial-gradient(circle,
+      rgba(124,58,237,0.08) 0%, transparent 70%);
+  }
+  .page-glow::after {
+    content: '';
+    @apply fixed bottom-[-10%] right-[20%] w-[400px] h-[400px]
+           rounded-full pointer-events-none -z-10;
+    background: radial-gradient(circle,
+      rgba(6,182,212,0.06) 0%, transparent 70%);
+  }
+
+  /* ===== Result-page component classes ===== */
+  /* Moved here from App.css because @apply on a custom class
+     (`@apply glass-card`) only resolves when both the source class
+     and the consumer are processed in the same compilation unit
+     with @tailwind directives. App.css had no @tailwind directives
+     so the build failed. */
+
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 rounded-md border border-transparent bg-transparent px-5 py-2.5 text-sm font-semibold text-text-secondary transition-all duration-200;
+  }
+  .btn-ghost:hover {
+    @apply border-border bg-elevated text-text-primary;
+  }
+
+  .result-hero {
+    @apply glass-card mb-6 grid gap-6 p-6 lg:grid-cols-[1.35fr_minmax(220px,0.9fr)] lg:p-8;
+  }
+  .result-summary-grid {
+    @apply mb-6 grid gap-4 md:grid-cols-3;
+  }
+
+  .coaching-card { @apply glass-card h-full p-5; }
+  .action-items  { @apply glass-card mb-6 p-6; }
+  .media-review-card { @apply glass-card mb-6 p-6; }
+
+  .details-section { @apply glass-card mb-6 p-5; }
+  .details-section > summary {
+    @apply cursor-pointer list-none py-1 text-base font-semibold text-text-primary;
+  }
+  .details-section > summary::-webkit-details-marker { display: none; }
+
+  .result-footer-actions {
+    @apply glass-card mt-8 flex flex-col gap-4 p-5;
+  }
+  .danger-zone {
+    @apply glass-card mt-4 border border-[rgba(239,68,68,0.35)] bg-[rgba(239,68,68,0.05)] p-5;
+  }
+  .result-state-card {
+    @apply glass-card mx-auto max-w-3xl p-8 text-center;
+  }
+  .result-process-steps { @apply mt-6 grid gap-3 text-left; }
+  .result-process-step {
+    @apply flex items-center gap-3 rounded-md border border-border bg-page/50 px-4 py-3;
+  }
+  .result-process-step.is-active {
+    @apply border-border-accent bg-accent-soft;
+  }
+  .result-process-step.is-complete {
+    @apply border-[rgba(16,185,129,0.3)] bg-[rgba(16,185,129,0.08)];
+  }
+  .detail-stat-grid {
+    @apply grid gap-3 sm:grid-cols-2 xl:grid-cols-4;
+  }
+  .detail-stat {
+    @apply rounded-md border border-border bg-page/60 p-4;
+  }
+  .transcript-empty {
+    @apply rounded-md border border-dashed border-border bg-page/40 px-4 py-5 text-sm text-text-muted;
+  }
+
+  .history-card {
+    @apply glass-card p-4 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-accent;
+  }
+  .history-card.is-processing {
+    @apply border-[rgba(245,158,11,0.28)] bg-[rgba(245,158,11,0.04)];
+  }
+  .history-card.is-failed {
+    @apply border-[rgba(239,68,68,0.28)] bg-[rgba(239,68,68,0.04)];
+  }
+  .history-card.is-unscoreable {
+    @apply border-[rgba(245,158,11,0.28)] bg-[rgba(245,158,11,0.03)];
+  }
+  .history-preview {
+    @apply mt-4 rounded-md border border-border bg-page/55 p-3;
+  }
+}
