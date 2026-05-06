@@ -1,8 +1,17 @@
 FROM python:3.11-slim
 
-# System dependencies for OpenCV, MediaPipe, and FFmpeg
+# System dependencies for OpenCV, MediaPipe, and FFmpeg.
+#
+# `libgl1` is the actual OpenGL runtime library OpenCV needs.
+# Previously this Dockerfile listed `libgl1-mesa-glx`, which was only
+# ever a transitional metapackage that pointed at libgl1. Debian 13
+# (trixie) — what `python:3.11-slim` ships on as of 2025 — dropped
+# the transitional package entirely, breaking the build with
+# "Package 'libgl1-mesa-glx' has no installation candidate".
+# `libgl1` works on Debian 11 / 12 / 13 alike, so it's strictly
+# better.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     ffmpeg \
     wget \
