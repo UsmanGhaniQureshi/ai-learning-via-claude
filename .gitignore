@@ -57,3 +57,9 @@ dist/
 .claude/
 .cursor/
 .kiro/
+
+# Vite local dev cache — regenerated on every `npm run dev` /
+# `vite build`. Has nothing to do with the production deploy
+# (the frontend Dockerfile builds inside its own container, with
+# its own Vite cache). Anywhere in the tree.
+.vite/
