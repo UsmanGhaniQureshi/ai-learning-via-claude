@@ -1,29 +1,17 @@
-version: '3.8'
+# ─────────────────────────────────────────────────────────────────────
+# confidence-detector application stack.
+#
+# This stack does NOT terminate TLS or bind host ports 80/443. The
+# shared infra/proxy stack on this VPS runs Caddy and routes
+# `confidence-detector.logicsbay.com` -> the `frontend` container
+# below, over the external docker network `proxy`.
+#
+# Internal services (postgres, backend) stay on the default network
+# and are unreachable from other apps on the box. Only `frontend`
+# joins `proxy` to receive traffic from Caddy.
+# ─────────────────────────────────────────────────────────────────────
 
 services:
-  # ── Caddy: TLS terminator + reverse proxy ─────────────────────────
-  # Listens on 80/443 publicly. Auto-issues + renews Let's Encrypt
-  # certificates based on the domain in Caddyfile. Forwards everything
-  # to the frontend container; the frontend's own nginx then routes
-  # /api/* and /ws/* to the backend container.
-  #
-  # Mic / camera permission in browsers REQUIRES HTTPS, so this
-  # service is non-optional for production.
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"          # HTTP/3 / QUIC
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data        # cert cache — survives restarts so LE rate limits aren't hit
-      - caddy-config:/config
-    depends_on:
-      - frontend
-      - backend
-
   # ── Postgres: app database ────────────────────────────────────────
   # 16 is the current LTS line. Data lives on a named volume so
   # `docker-compose down` doesn't wipe it. Healthcheck blocks the
@@ -85,26 +73,33 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    # No `ports:` mapping — backend is reachable by the frontend
-    # container at http://backend:8000 over the compose network.
-    # Caddy → frontend → backend (the frontend's own nginx proxies
-    # /api and /ws). Bypass requires `docker-compose exec`.
+    # No `ports:` mapping and no `proxy` network — backend is reachable
+    # only by frontend over the default compose network. The shared
+    # Caddy never touches the backend directly.
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    # Caddy reaches us by this name on the `proxy` network.
+    container_name: frontend
     restart: unless-stopped
     depends_on:
       - backend
-    # No `ports:` mapping in production — Caddy terminates TLS and
-    # proxies to the frontend container's port 80 over the compose
-    # network. (For local dev you can re-enable `5173:80` to hit it
-    # directly.)
+    networks:
+      # default = internal compose network, so we can talk to backend.
+      - default
+      # proxy = external shared network, so Caddy can reach us.
+      - proxy
 
 volumes:
-  caddy-data:
-  caddy-config:
   postgres-data:
   model-cache:
   uploads-data:
+
+networks:
+  # Created and owned by the shared infra/proxy stack. Must already
+  # exist before this compose starts — check with `docker network ls`.
+  proxy:
+    external: true
+    name: proxy

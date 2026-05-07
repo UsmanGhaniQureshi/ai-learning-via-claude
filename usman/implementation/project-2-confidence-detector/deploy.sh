@@ -12,30 +12,36 @@
 #     - postgres-data    (your database)
 #     - uploads-data     (user uploads + processed videos)
 #     - model-cache      (Whisper / MediaPipe weights)
-#     - caddy-data       (Let's Encrypt certificates)
-#     - caddy-config     (Caddy state)
 #
-#   The only command that wipes user data is `docker compose down -v`
-#   (note the -v flag). This script does NOT use `down` at all.
+#   Let's Encrypt certificates (caddy-data / caddy-config) live in
+#   the shared infra/proxy stack now and are not touched by this
+#   script. The only command that wipes user data is
+#   `docker compose down -v` (note the -v flag). This script does
+#   NOT use `down` at all.
 #
 # WHAT THE SCRIPT DOES (in order)
-#   1. Pre-flight: confirms compose file + .env exist + .env has no
-#      placeholder values left.
-#   2. Builds backend + frontend images.
-#   3. Pulls pinned postgres + caddy images.
-#   4. Brings the stack up (`up -d --remove-orphans`).
-#   5. Waits for postgres to accept connections.
-#   6. Runs `alembic upgrade head` to apply any pending migrations.
-#   7. SELF-DIAGNOSES the deploy:
-#        a. Hashes key source files on disk vs inside the running
-#           container. If they differ, Docker's build cache served a
-#           stale layer — force a `--no-cache` rebuild + recreate +
-#           re-migrate. Recovers from the "container has old code"
-#           failure mode that's bitten this deploy in the past.
-#        b. Probes the DB for expected columns. If a column is
-#           missing, re-runs the migration. Recovers from "alembic
-#           silently failed but the script kept going" failure modes.
-#   8. Hits /health to confirm Caddy + the backend are responding.
+#    1. Pre-flight: confirms compose file + .env exist + .env has no
+#       placeholder values left.
+#    2. Builds backend + frontend images.
+#    3. Pulls pinned postgres image.
+#    4. Confirms the shared `proxy` docker network exists.
+#    5. Brings the stack up (`up -d --remove-orphans`).
+#    6. Waits for postgres to accept connections.
+#    7. Runs `alembic upgrade head` to apply any pending migrations.
+#    8. SELF-DIAGNOSES the deploy:
+#         a. Hashes key source files on disk vs inside the running
+#            container. If they differ, Docker's build cache served a
+#            stale layer — force a `--no-cache` rebuild + recreate +
+#            re-migrate. Recovers from the "container has old code"
+#            failure mode that's bitten this deploy in the past.
+#         b. Probes the DB for expected columns. If a column is
+#            missing, re-runs the migration. Recovers from "alembic
+#            silently failed but the script kept going" failure modes.
+#    9. Installs caddy/confidence-detector.caddy into the shared
+#       proxy's sites-enabled/ directory.
+#   10. Reloads Caddy (zero downtime) so the fragment takes effect.
+#   11. Hits /health (through the shared Caddy) to confirm the full
+#       chain — Caddy -> frontend nginx -> backend uvicorn — is up.
 #
 # Workflow
 #   1. (you) git pull origin deployment
@@ -103,9 +109,22 @@ else
 fi
 docker compose build $BUILD_FLAGS
 
-# ── Pull pinned images (postgres, caddy) ────────────────────────────
+# ── Pull pinned images (postgres) ───────────────────────────────────
+# Caddy now lives in the shared infra/proxy stack — not pulled here.
 green "==> Pulling pinned images"
-docker compose pull postgres caddy 2>/dev/null || true
+docker compose pull postgres 2>/dev/null || true
+
+# ── Confirm the shared `proxy` network exists ───────────────────────
+# The frontend service joins it as an external network. If the
+# infra/proxy stack hasn't been started, `docker compose up` will
+# fail with "network proxy declared as external, but could not be
+# found". Catch that early with a clearer message.
+if ! docker network ls --format '{{.Name}}' | grep -qx proxy; then
+  red "ERROR: docker network 'proxy' does not exist."
+  red "       Start the shared reverse proxy first:"
+  red "         cd ~/infra/proxy && docker compose up -d"
+  exit 1
+fi
 
 # ── Bring up / restart the stack ────────────────────────────────────
 # `--force-recreate` ALWAYS recreates the backend + frontend containers
@@ -113,15 +132,16 @@ docker compose pull postgres caddy 2>/dev/null || true
 # hash didn't change. Defensive: protects against the failure mode
 # where Docker's BuildKit reuses a cached layer that yields an
 # image with the same hash, so plain `up -d` thinks nothing changed
-# and the running container keeps the old code. Postgres + caddy
-# don't get force-recreated because they're pinned images and
-# recreating them costs a few seconds for no reason.
+# and the running container keeps the old code. Postgres doesn't
+# get force-recreated because it's a pinned image and recreating it
+# costs a few seconds for no reason.
 # `--remove-orphans` cleans up any container we no longer reference
-# in compose.yml. It does NOT remove volumes.
+# in compose.yml (e.g. the now-deleted `caddy` service). It does NOT
+# remove volumes.
 green "==> Bringing the stack up (force-recreate backend + frontend)"
 docker compose up -d --remove-orphans \
     --force-recreate --no-deps backend frontend
-docker compose up -d --remove-orphans   # ensure postgres + caddy are also up
+docker compose up -d --remove-orphans   # ensure postgres is also up
 
 # ── Wait for postgres to accept connections ─────────────────────────
 green "==> Waiting for postgres to be ready"
@@ -223,25 +243,48 @@ if [ "$HAS_PROCESSING_PROGRESS" != "1" ]; then
 fi
 note "OK: media.processing_progress column present"
 
+# ── Install this app's Caddy site fragment ──────────────────────────
+# Drops caddy/confidence-detector.caddy into the shared proxy's
+# sites-enabled/ directory so Caddy will route traffic for our
+# domain. Idempotent: a re-deploy just overwrites the same fragment.
+# Override the proxy location with PROXY_DIR=/somewhere/else ./deploy.sh
+green "==> Installing Caddy site fragment"
+PROXY_DIR="${PROXY_DIR:-$HOME/infra/proxy}"
+if [ ! -d "$PROXY_DIR" ]; then
+  red "ERROR: shared proxy not found at $PROXY_DIR"
+  red "       One-time setup: scp the infra/proxy folder to that path,"
+  red "       then: cd $PROXY_DIR && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$PROXY_DIR/sites-enabled"
+cp caddy/confidence-detector.caddy "$PROXY_DIR/sites-enabled/"
+note "fragment: $PROXY_DIR/sites-enabled/confidence-detector.caddy"
+
+# ── Reload Caddy (zero downtime) ────────────────────────────────────
+# Caddy's reload reloads config without dropping any in-flight
+# connection. If the fragment has a syntax error, reload fails and
+# Caddy keeps running with the previous config — safe.
+green "==> Reloading Caddy"
+docker exec caddy caddy reload --config /etc/caddy/Caddyfile
+note "caddy reloaded — site fragments now active"
+
 # ── Health check ────────────────────────────────────────────────────
-# Caddy needs ~30-60s on first deploy to negotiate Let's Encrypt
-# certs. Subsequent deploys reuse the cached cert and pass instantly.
+# Caddy lives in the shared infra/proxy stack now. On first deploy
+# of a new domain it needs ~30-60s to negotiate Let's Encrypt certs.
+# Subsequent deploys reuse the cached cert and pass instantly.
+# Override the probed domain with `DOMAIN=other.example.com ./deploy.sh`.
+DOMAIN="${DOMAIN:-confidence-detector.logicsbay.com}"
 if [ "$SKIP_HEALTH" = "1" ]; then
   note "SKIP_HEALTH=1 — skipping /health curl"
 else
   green "==> Health check"
   sleep 5
-  # Parse the bare-domain line from Caddyfile (first line that starts
-  # with a lowercase letter and has a `{` — Caddy's site-block syntax).
-  DOMAIN=$(awk '/^[a-z][a-zA-Z0-9.-]+[[:space:]]*\{/ {print $1; exit}' Caddyfile)
-  if [ -z "${DOMAIN:-}" ]; then
-    note "could not parse domain from Caddyfile — skipping HTTPS health check"
-  elif curl -sSf --max-time 10 "https://${DOMAIN}/health" >/dev/null 2>&1; then
+  if curl -sSf --max-time 10 "https://${DOMAIN}/health" >/dev/null 2>&1; then
     note "OK: https://${DOMAIN}/health is responding"
   else
     note "NOT YET RESPONDING: https://${DOMAIN}/health"
-    note "On first deploy, Caddy needs ~30-60s to negotiate Let's Encrypt certs."
-    note "Watch progress with: docker compose logs -f caddy"
+    note "On first deploy of a new domain, Caddy needs ~30-60s for Let's Encrypt."
+    note "Watch progress with: docker logs -f caddy   (the shared proxy container)"
   fi
 fi
 

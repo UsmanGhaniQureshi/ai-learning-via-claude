@@ -1,0 +1,21 @@
+confidence-detector.logicsbay.com {
+    reverse_proxy frontend:80
+
+    request_body {
+        max_size 500MB
+    }
+
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Permissions-Policy intentionally unset — app needs mic + camera.
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}
