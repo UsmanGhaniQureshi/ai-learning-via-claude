@@ -156,16 +156,27 @@ volumes:
     name: caddy-config
 
 networks:
+  # Marked external so a pre-existing `proxy` network (e.g. created
+  # manually with `docker network create proxy`) doesn't trip
+  # compose's "network exists but not labeled by me" check. The
+  # bootstrap below `docker network create`s it if missing — both
+  # cases are handled cleanly.
   proxy:
+    external: true
     name: proxy
 PROXY_COMPOSE
   note "scaffolded $PROXY_DIR/{Caddyfile,docker-compose.yml,sites-enabled/}"
 fi
 
+# Ensure the `proxy` network exists. Idempotent: noop if it's
+# already there from a previous run or a manual `docker network
+# create proxy`.
+docker network create proxy 2>/dev/null || true
+
 if ! docker ps --format '{{.Names}}' | grep -qx caddy; then
   green "==> Starting shared reverse proxy"
   (cd "$PROXY_DIR" && docker compose up -d)
-  # Give Caddy a beat to bind ports + create the network.
+  # Give Caddy a beat to bind ports.
   sleep 2
 fi
 
