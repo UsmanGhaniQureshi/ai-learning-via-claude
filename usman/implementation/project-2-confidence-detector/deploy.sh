@@ -24,7 +24,10 @@
 #       placeholder values left.
 #    2. Builds backend + frontend images.
 #    3. Pulls pinned postgres image.
-#    4. Confirms the shared `proxy` docker network exists.
+#    4. Auto-bootstraps the shared reverse proxy at ~/infra/proxy/
+#       if it doesn't exist yet (scaffolds Caddyfile +
+#       docker-compose.yml + sites-enabled/, then `up -d`). This
+#       is a no-op once the proxy is set up — first run only.
 #    5. Brings the stack up (`up -d --remove-orphans`).
 #    6. Waits for postgres to accept connections.
 #    7. Runs `alembic upgrade head` to apply any pending migrations.
@@ -114,17 +117,64 @@ docker compose build $BUILD_FLAGS
 green "==> Pulling pinned images"
 docker compose pull postgres 2>/dev/null || true
 
-# ── Confirm the shared `proxy` network exists ───────────────────────
-# The frontend service joins it as an external network. If the
-# infra/proxy stack hasn't been started, `docker compose up` will
-# fail with "network proxy declared as external, but could not be
-# found". Catch that early with a clearer message.
+# ── Auto-bootstrap the shared reverse proxy ─────────────────────────
+# If ~/infra/proxy/ doesn't exist yet (fresh VPS, first deploy),
+# scaffold it from the embedded templates below and bring it up.
+# If it already exists but Caddy isn't running, just start it.
+# Idempotent: on a fully-set-up box this is a fast no-op.
+PROXY_DIR="${PROXY_DIR:-$HOME/infra/proxy}"
+if [ ! -d "$PROXY_DIR" ]; then
+  green "==> Bootstrapping shared proxy at $PROXY_DIR (first time on this VPS)"
+  mkdir -p "$PROXY_DIR/sites-enabled"
+  cat > "$PROXY_DIR/Caddyfile" <<'PROXY_CADDYFILE'
+# Shared reverse proxy. Per-app routing lives in sites-enabled/,
+# managed by each app's deploy.sh. Don't edit this file by hand.
+import sites-enabled/*.caddy
+PROXY_CADDYFILE
+  cat > "$PROXY_DIR/docker-compose.yml" <<'PROXY_COMPOSE'
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./sites-enabled:/etc/caddy/sites-enabled:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - proxy
+
+volumes:
+  caddy-data:
+    name: caddy-data
+  caddy-config:
+    name: caddy-config
+
+networks:
+  proxy:
+    name: proxy
+PROXY_COMPOSE
+  note "scaffolded $PROXY_DIR/{Caddyfile,docker-compose.yml,sites-enabled/}"
+fi
+
+if ! docker ps --format '{{.Names}}' | grep -qx caddy; then
+  green "==> Starting shared reverse proxy"
+  (cd "$PROXY_DIR" && docker compose up -d)
+  # Give Caddy a beat to bind ports + create the network.
+  sleep 2
+fi
+
 if ! docker network ls --format '{{.Name}}' | grep -qx proxy; then
-  red "ERROR: docker network 'proxy' does not exist."
-  red "       Start the shared reverse proxy first:"
-  red "         cd ~/infra/proxy && docker compose up -d"
+  red "ERROR: 'proxy' docker network missing despite the proxy stack being up."
+  red "       Inspect: cd $PROXY_DIR && docker compose logs caddy"
   exit 1
 fi
+note "shared proxy is up"
 
 # ── Bring up / restart the stack ────────────────────────────────────
 # `--force-recreate` ALWAYS recreates the backend + frontend containers
@@ -247,15 +297,8 @@ note "OK: media.processing_progress column present"
 # Drops caddy/confidence-detector.caddy into the shared proxy's
 # sites-enabled/ directory so Caddy will route traffic for our
 # domain. Idempotent: a re-deploy just overwrites the same fragment.
-# Override the proxy location with PROXY_DIR=/somewhere/else ./deploy.sh
+# (PROXY_DIR was set + verified during the bootstrap step above.)
 green "==> Installing Caddy site fragment"
-PROXY_DIR="${PROXY_DIR:-$HOME/infra/proxy}"
-if [ ! -d "$PROXY_DIR" ]; then
-  red "ERROR: shared proxy not found at $PROXY_DIR"
-  red "       One-time setup: scp the infra/proxy folder to that path,"
-  red "       then: cd $PROXY_DIR && docker compose up -d"
-  exit 1
-fi
 mkdir -p "$PROXY_DIR/sites-enabled"
 cp caddy/confidence-detector.caddy "$PROXY_DIR/sites-enabled/"
 note "fragment: $PROXY_DIR/sites-enabled/confidence-detector.caddy"
